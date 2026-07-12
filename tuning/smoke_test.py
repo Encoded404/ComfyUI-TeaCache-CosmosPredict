@@ -22,7 +22,8 @@ import torch
 from .config_types import TeacacheConfig, TuningConfig, CalibrationEntry
 from .utils import load_models, sample, get_diffusion_model, QualityMetrics
 from .recorder import make_calibration_forward
-from .forward import teacache_anima_forward, compute_distance, apply_mapping, accumulate_distance, step_schedule_multiplier
+from .forward import teacache_anima_forward
+from .optimize import simulate_config, fit_polynomial_coefficients
 
 
 SMOKE_PROMPT = (
@@ -33,88 +34,10 @@ SMOKE_NEGATIVE = ""
 
 # ── Calibration runs — varied to produce diverse (rel_l1, out_rel) pairs  ──
 SMOKE_RUNS = [
-    {"sampler": "er_sde",       "steps": 30, "cfg": 5.0, "scheduler": "normal", "seed": 42},
-    {"sampler": "dpmpp_2m_sde", "steps": 28, "cfg": 4.5, "scheduler": "simple", "seed": 7},
+    {"sampler": "er_sde",        "steps": 30, "cfg": 5.0, "scheduler": "normal", "seed": 42},
+    {"sampler": "dpmpp_2m_sde",  "steps": 28, "cfg": 4.5, "scheduler": "simple", "seed": 7},
     {"sampler": "euler_a",       "steps": 32, "cfg": 5.5, "scheduler": "normal", "seed": 99},
 ]
-
-
-def _unwrap_simulate(entries, cfg):
-    """Lightweight offline simulation ported from optimize.py.
-
-    Groups entries by (prompt_id, seed, cond, total_steps), replays
-    accumulator logic, returns (skip_rate, avg_error, speedup, quality_proxy).
-    """
-    BLOCK_COST_RATIO = 0.85
-    groups = {}
-    for e in entries:
-        key = (e.prompt_id, e.seed, e.cond, e.total_steps)
-        groups.setdefault(key, []).append(e)
-    for key in groups:
-        groups[key].sort(key=lambda e: e.step)
-
-    total_entries = 0
-    skip_count = 0
-    total_error = 0.0
-
-    for key, group in groups.items():
-        accumulated = 0.0
-        total_entries += len(group)
-        for e in group:
-            # Extract stats for chosen source
-            src_key = e.t_emb if cfg.source == "t_emb" else e.shift
-            if src_key is None:
-                continue
-            stats = {
-                "mean": src_key.mean, "max": src_key.max, "std": src_key.std,
-                "p95": src_key.p95, "median": src_key.median, "min": src_key.min,
-            }
-            distance = compute_distance(stats, cfg.metric_type, cfg.metric_weights)
-            if cfg.signal_scale != 1.0:
-                distance *= cfg.signal_scale
-            predicted = apply_mapping(distance, cfg.mapping_type, cfg.coefficients, cfg.mapping_params)
-            effective = cfg.rel_l1_thresh * step_schedule_multiplier(e.step_fraction, cfg.step_schedule)
-            new_acc, should_calc = accumulate_distance(
-                accumulated, predicted, effective, cfg.accumulation_type, cfg.accumulation_params
-            )
-            accumulated = new_acc
-            if not should_calc:
-                skip_count += 1
-                total_error += e.out_rel if e.out_rel > 0 else e.res_rel
-
-    skip_rate = skip_count / max(total_entries, 1)
-    avg_error = total_error / max(total_entries, 1)
-    quality_proxy = 1.0 / (1.0 + avg_error)
-    speedup = 1.0 / (1.0 - skip_rate * BLOCK_COST_RATIO)
-    return skip_rate, avg_error, speedup, quality_proxy
-
-
-def _fit_poly(entries, cfg, degree=4):
-    """Fit polynomial coefficients for a given config."""
-    xs, ys = [], []
-    for e in entries:
-        src_key = e.t_emb if cfg.source == "t_emb" else e.shift
-        if src_key is None:
-            continue
-        stats = {"mean": src_key.mean, "max": src_key.max, "std": src_key.std,
-                 "p95": src_key.p95, "median": src_key.median, "min": src_key.min}
-        distance = compute_distance(stats, cfg.metric_type, cfg.metric_weights)
-        if cfg.signal_scale != 1.0:
-            distance *= cfg.signal_scale
-        y_val = e.out_rel if e.out_rel > 0 else e.res_rel
-        if y_val <= 0:
-            continue
-        xs.append(distance)
-        ys.append(y_val)
-    if len(xs) < 20:
-        return [0.0, 0.0, 0.0, 1.0, 0.0]
-    import numpy as np
-    xs_a = np.array(xs, dtype=np.float64)
-    ys_a = np.array(ys, dtype=np.float64)
-    mask = np.isfinite(xs_a) & np.isfinite(ys_a) & (xs_a > 0) & (ys_a > 0)
-    if mask.sum() < 20:
-        return [0.0, 0.0, 0.0, 1.0, 0.0]
-    return np.polyfit(xs_a[mask], ys_a[mask], deg=degree).tolist()
 
 
 def _run_calibration(unet, clip, vae, params, prompt_id):
@@ -310,7 +233,7 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
         return False
 
     # ── [4/7] Mini-optimizer ───────────────────────────────────────────
-    print(f"\n[4/7] Mini-optimizer (fitting coefficients)...")
+    print(f"\n[4/7] Mini-optimizer (running optimize.simulate_config)...")
     try:
         candidates = []
         for source in ["first_block_shift", "t_emb"]:
@@ -318,7 +241,8 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
                 for mapping in ["identity", "polynomial"]:
                     cfg = TeacacheConfig(
                         source=source, metric_type=metric_type,
-                        metric_weights={"mean": 0.7, "max": 0.3} if metric_type == "mean_and_max" else {},
+                        metric_weights={"mean": 0.7, "max": 0.3}
+                        if metric_type == "mean_and_max" else {},
                         signal_scale=1.0 if source == "first_block_shift" else 100.0,
                         mapping_type=mapping, coefficients=[],
                         accumulation_type="hard_reset", rel_l1_thresh=0.07,
@@ -326,11 +250,11 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
                         residual_strategy="hard", block_mode="all_or_nothing",
                     )
                     if mapping == "polynomial":
-                        cfg.coefficients = _fit_poly(all_entries, cfg)
-                    skip, err, sp, qp = _unwrap_simulate(all_entries, cfg)
+                        cfg.coefficients = fit_polynomial_coefficients(all_entries, cfg)
+                    skip, err, sp, qp = simulate_config(all_entries, cfg)
                     candidates.append((cfg, skip, err, sp, qp))
 
-        candidates.sort(key=lambda x: x[4] * x[3], reverse=True)  # quality * speedup
+        candidates.sort(key=lambda x: x[4] * x[3], reverse=True)
 
         print(f"  {'source':<22} {'metric':<14} {'map':<12} {'skip':>6} {'speed':>6} {'error':>8} {'score':>6}")
         print(f"  {'─' * 22} {'─' * 14} {'─' * 12} {'─' * 6} {'─' * 6} {'─' * 8} {'─' * 6}")
@@ -345,40 +269,72 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
             print(f"  Coeffs: {[f'{c:.4e}' for c in best_cfg.coefficients]}")
             print(f"  Max |coeff|: {max(abs(c) for c in best_cfg.coefficients):.4e}")
 
-        # Try a quick threshold sweep on the winner
-        best_sweep = []
-        for t in [0.03, 0.05, 0.07, 0.10, 0.15, 0.20, 0.30, 0.50, 0.70, 1.0]:
+        # Sweep thresholds to find quality-tier picks
+        sweep = []
+        for t in sorted(set([0.03, 0.05, 0.07, 0.10, 0.15, 0.20, 0.30, 0.50, 0.70, 1.0])):
             cfg_s = TeacacheConfig.from_dict(best_cfg.to_dict())
             cfg_s.rel_l1_thresh = t
-            skip, err, sp, qp = _unwrap_simulate(all_entries, cfg_s)
-            best_sweep.append((t, sp, qp))
-        best_thresh = max(best_sweep[1:], key=lambda x: x[1] * x[2])  # skip t=0 baseline
-        print(f"  Simulated best threshold: {best_thresh[0]} (speedup={best_thresh[1]:.2f}x, quality={best_thresh[2]:.3f})")
+            skip, err, sp, qp = simulate_config(all_entries, cfg_s)
+            sweep.append((t, sp, qp, skip, err))
+        sweep.sort(key=lambda x: x[0])
 
-        # Use the best found threshold for the TeaCache run
-        best_cfg.rel_l1_thresh = best_thresh[0]
+        # Pick three points on the quality curve: conservative, balanced, aggressive
+        picks = []
+        # Conservative: lowest simulated error (best quality)
+        conservative = min(sweep[1:], key=lambda x: x[4])  # skip t=0
+        # Aggressive: highest speedup
+        aggressive = max(sweep[1:], key=lambda x: x[1])
+        # Balanced: best product
+        balanced = max(sweep[1:], key=lambda x: x[1] * x[2])
+        for label, (t, sp, qp, sk, er) in [
+            ("conservative", conservative), ("balanced", balanced), ("aggressive", aggressive)
+        ]:
+            picks.append({"label": label, "thresh": t, "sim_speedup": sp, "sim_error": er})
+
+        # Deduplicate picks
+        seen = set()
+        picks_unique = []
+        for p in picks:
+            if p["thresh"] not in seen:
+                picks_unique.append(p)
+                seen.add(p["thresh"])
+
+        print(f"\n  Quality comparison picks (simulated):")
+        print(f"  {'':>14} {'thresh':>8} {'speedup':>8} {'error':>8}")
+        for p in picks_unique:
+            print(f"  {p['label']:>14} {p['thresh']:>8.3f} {p['sim_speedup']:>7.2f}x {p['sim_error']:>8.4f}")
     except Exception as e:
         print(f"\n  FAILED mini-optimizer: {e}")
         import traceback; traceback.print_exc()
         return False
 
-    # ── [5/7] TeaCache with tuned coefficients ────────────────────────
-    print(f"\n[5/7] TeaCache with tuned config...")
-    try:
-        img_tc, t_tc = _run_teacache(
-            unet, clip, vae, best_cfg,
-            seed=base_run["seed"], steps=base_run["steps"],
-            sampler=base_run["sampler"], sched=base_run["scheduler"],
-            cfg_val=base_run["cfg"],
-        )
-        su = t_base / max(t_tc, 0.001)
-        print(f"  TeaCache:  {t_tc:.1f}s  (speedup: {su:.2f}x, "
-              f"thresh={best_cfg.rel_l1_thresh:.3f}, "
-              f"src={best_cfg.source}, {best_cfg.metric_type}, {best_cfg.mapping_type})")
-    except Exception as e:
-        print(f"\n  FAILED TeaCache: {e}")
-        import traceback; traceback.print_exc()
-        return False
+    # ── [5/7] Baseline + TeaCache comparison runs ──────────────────────
+    print(f"\n[5/7] TeaCache comparison (3 thresholds) vs baseline...")
+    base_run = SMOKE_RUNS[0]
+
+    comparison = {}
+    # Run baseline once (already done in [2/7])
+    comparison["baseline"] = {"time": t_base, "speedup": 1.0, "thresh": 0.0, "img": img_base}
+
+    for p in picks_unique:
+        label = p["label"]
+        cfg_cmp = TeacacheConfig.from_dict(best_cfg.to_dict())
+        cfg_cmp.rel_l1_thresh = p["thresh"]
+
+        try:
+            img, dt = _run_teacache(
+                unet, clip, vae, cfg_cmp,
+                seed=base_run["seed"], steps=base_run["steps"],
+                sampler=base_run["sampler"], sched=base_run["scheduler"],
+                cfg_val=base_run["cfg"],
+            )
+            su = t_base / max(dt, 0.001)
+            print(f"  {label:>14}: thresh={p['thresh']:.3f}  {dt:.1f}s  speedup={su:.2f}x")
+            comparison[label] = {"time": dt, "speedup": su, "thresh": p["thresh"], "img": img}
+        except Exception as e:
+            print(f"  {label:>14}: FAILED — {e}")
+            import traceback; traceback.print_exc()
+            return False
 
     # ── [6/7] Quality check ────────────────────────────────────────────
     print(f"\n[6/7] Quality check (all 12 metrics, Tier 3)...")
@@ -442,15 +398,40 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
             print(_box_line(row, box_width))
         print(f"  ╚{'═' * (box_width + 2)}╝")
 
-        # ── Scores ──────────────────────────────────────────────────────
+        # ── Scores — key metrics across all comparison runs ──────────────
         if qm.available:
-            scores = qm.measure(img_tc, img_base)
+            # Compute scores for each run vs baseline
+            all_run_scores = {}
+            for label, info in comparison.items():
+                all_run_scores[label] = qm.measure(info["img"], img_base)
+
+            # Print comparison table: speedup + key metrics per run
+            KEY_METRICS = ["lpips_alex", "lpips_vgg", "dists", "ms_ssim", "fsim", "vif"]
+            KEY_DIRS   = {"lpips_alex": "↓", "lpips_vgg": "↓", "dists": "↓",
+                          "ms_ssim": "↑", "fsim": "↑", "vif": "↑"}
+
+            print(f"\n  Comparison vs Baseline (same prompt, seed={base_run['seed']}):\n")
+            header = (f"  {'Run':>14} │ {'thresh':>7} │ {'speedup':>8} │ "
+                      + " │ ".join(f"{m:>8}" for m in KEY_METRICS))
+            print(header)
+            print(f"  {'─' * 14}─┼─{'─' * 7}─┼─{'─' * 8}─┼─" + "─┼─".join("─" * 8 for _ in KEY_METRICS))
+            print(f"  {'baseline':>14} │ {'0':>7} │ {'1.00x':>8} │ "
+                  + " │ ".join(f"{'—':>8}" for _ in KEY_METRICS))
+
+            for label, info in comparison.items():
+                scores = all_run_scores.get(label, {})
+                vals = " │ ".join(f"{scores.get(m, float('nan')):>8.4f}" for m in KEY_METRICS)
+                print(f"  {label:>14} │ {info['thresh']:>7.3f} │ {info['speedup']:>7.2f}x │ {vals}")
+
+            # Detailed breakdown for the balanced config
+            balanced_key = "balanced" if "balanced" in comparison else list(comparison.keys())[0]
+            bal_scores = all_run_scores.get(balanced_key, {})
+            bal_info = comparison.get(balanced_key, {})
 
             excellent = acceptable = poor = 0
             for name, direction, _, good, mid in METRIC_LEGEND:
-                val = scores.get(name, float("nan"))
-                if val != val:
-                    continue
+                val = bal_scores.get(name, float("nan"))
+                if val != val: continue
                 if direction == "↑":
                     if val >= good:   excellent += 1
                     elif val >= mid:  acceptable += 1
@@ -460,22 +441,20 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
                     elif val <= mid:  acceptable += 1
                     else:             poor += 1
 
-            ts = f"thresh={best_cfg.rel_l1_thresh}  speedup={su:.2f}x"
-            print(f"\n  TeaCache vs Baseline  [{ts}]")
+            spd = bal_info.get("speedup", 0)
+            print(f"\n  Detailed breakdown ({balanced_key}, thresh={bal_info.get('thresh', '?'):.3f}, speedup={spd:.2f}x):")
             print(f"    {excellent} ✅ excellent   {acceptable} ✓ acceptable   {poor} ⚠ needs tuning\n")
 
             COL_SCORE = 8
             COL_RATING = 14
-
             def _score_row(metric, dir_str, score_str, rating):
                 return (f"{metric:>{COL_METRIC}}{SPACER}"
                         f"{dir_str:^{COL_DIR}}{SPACER}"
                         f"{score_str:>{COL_SCORE}}{SPACER}"
                         f"{rating:<{COL_RATING}}")
-
             score_rows = []
             for name, direction, _, good, mid in METRIC_LEGEND:
-                val = scores.get(name, float("nan"))
+                val = bal_scores.get(name, float("nan"))
                 score_str = f"  {val:.4f}" if val == val else "    N/A"
                 if direction == "↑":
                     if val >= good:   rating = "✅ EXCELLENT"
@@ -486,19 +465,15 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
                     elif val <= mid:  rating = "✓ acceptable"
                     else:             rating = "⚠ POOR"
                 score_rows.append(_score_row(name, direction, score_str, rating))
-
             score_header = _score_row("Metric", "↑↓", "  Score", "Rating")
             all_score = [score_header] + score_rows
             sw = max(len(r) for r in all_score)
-
             print(f"  ╔{'═' * (sw + 2)}╗")
             print(_box_line(score_header, sw))
             print(f"  ╟{'─' * (sw + 2)}╢")
             for row in score_rows:
                 print(_box_line(row, sw))
             print(f"  ╚{'═' * (sw + 2)}╝")
-
-            print(f"\n  With calibration, expect significant improvement over untuned identity.")
         else:
             print(f"\n  pyiqa not installed. Install with: pip install -r tuning/requirements.txt")
     except Exception as e:
