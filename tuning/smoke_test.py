@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Smoke test: verify that model loading, calibration recording, and TeaCache
-forward all work without crashing before committing to a multi-hour calibration run.
+"""Smoke test: verify model loading, calibration recording, mini-optimization,
+and TeaCache forward all work before committing to a full calibration run.
+
+Generates 3 varied images to collect diverse calibration data, runs the
+offline optimizer on that data, then tests TeaCache with tuned coefficients.
 
 Usage:
-    cd /path/to/ComfyUI-TeaCache-CosmosPredict
-    python -m tuning.smoke_test --comfy-dir /path/to/ComfyUI [--steps 30]
+    cd /path/to/ComfyUI
+    PYTHONPATH=".:custom_nodes/ComfyUI-TeaCache-CosmosPredict" \\
+        python -m tuning.smoke_test --comfy-dir .
 """
 
 import argparse
@@ -15,10 +19,10 @@ from pathlib import Path
 
 import torch
 
-from .config_types import TeacacheConfig, TuningConfig
-from .utils import load_models, sample, get_diffusion_model, compute_quality_metrics, QualityMetrics
+from .config_types import TeacacheConfig, TuningConfig, CalibrationEntry
+from .utils import load_models, sample, get_diffusion_model, QualityMetrics
 from .recorder import make_calibration_forward
-from .forward import teacache_anima_forward
+from .forward import teacache_anima_forward, compute_distance, apply_mapping, accumulate_distance, step_schedule_multiplier
 
 
 SMOKE_PROMPT = (
@@ -27,15 +31,212 @@ SMOKE_PROMPT = (
 )
 SMOKE_NEGATIVE = ""
 
+# ── Calibration runs — varied to produce diverse (rel_l1, out_rel) pairs  ──
+SMOKE_RUNS = [
+    {"sampler": "er_sde",       "steps": 30, "cfg": 5.0, "scheduler": "normal", "seed": 42},
+    {"sampler": "dpmpp_2m_sde", "steps": 28, "cfg": 4.5, "scheduler": "simple", "seed": 7},
+    {"sampler": "euler_a",       "steps": 32, "cfg": 5.5, "scheduler": "normal", "seed": 99},
+]
+
+
+def _unwrap_simulate(entries, cfg):
+    """Lightweight offline simulation ported from optimize.py.
+
+    Groups entries by (prompt_id, seed, cond, total_steps), replays
+    accumulator logic, returns (skip_rate, avg_error, speedup, quality_proxy).
+    """
+    BLOCK_COST_RATIO = 0.85
+    groups = {}
+    for e in entries:
+        key = (e.prompt_id, e.seed, e.cond, e.total_steps)
+        groups.setdefault(key, []).append(e)
+    for key in groups:
+        groups[key].sort(key=lambda e: e.step)
+
+    total_entries = 0
+    skip_count = 0
+    total_error = 0.0
+
+    for key, group in groups.items():
+        accumulated = 0.0
+        total_entries += len(group)
+        for e in group:
+            # Extract stats for chosen source
+            src_key = e.t_emb if cfg.source == "t_emb" else e.shift
+            if src_key is None:
+                continue
+            stats = {
+                "mean": src_key.mean, "max": src_key.max, "std": src_key.std,
+                "p95": src_key.p95, "median": src_key.median, "min": src_key.min,
+            }
+            distance = compute_distance(stats, cfg.metric_type, cfg.metric_weights)
+            if cfg.signal_scale != 1.0:
+                distance *= cfg.signal_scale
+            predicted = apply_mapping(distance, cfg.mapping_type, cfg.coefficients, cfg.mapping_params)
+            effective = cfg.rel_l1_thresh * step_schedule_multiplier(e.step_fraction, cfg.step_schedule)
+            new_acc, should_calc = accumulate_distance(
+                accumulated, predicted, effective, cfg.accumulation_type, cfg.accumulation_params
+            )
+            accumulated = new_acc
+            if not should_calc:
+                skip_count += 1
+                total_error += e.out_rel if e.out_rel > 0 else e.res_rel
+
+    skip_rate = skip_count / max(total_entries, 1)
+    avg_error = total_error / max(total_entries, 1)
+    quality_proxy = 1.0 / (1.0 + avg_error)
+    speedup = 1.0 / (1.0 - skip_rate * BLOCK_COST_RATIO)
+    return skip_rate, avg_error, speedup, quality_proxy
+
+
+def _fit_poly(entries, cfg, degree=4):
+    """Fit polynomial coefficients for a given config."""
+    xs, ys = [], []
+    for e in entries:
+        src_key = e.t_emb if cfg.source == "t_emb" else e.shift
+        if src_key is None:
+            continue
+        stats = {"mean": src_key.mean, "max": src_key.max, "std": src_key.std,
+                 "p95": src_key.p95, "median": src_key.median, "min": src_key.min}
+        distance = compute_distance(stats, cfg.metric_type, cfg.metric_weights)
+        if cfg.signal_scale != 1.0:
+            distance *= cfg.signal_scale
+        y_val = e.out_rel if e.out_rel > 0 else e.res_rel
+        if y_val <= 0:
+            continue
+        xs.append(distance)
+        ys.append(y_val)
+    if len(xs) < 20:
+        return [0.0, 0.0, 0.0, 1.0, 0.0]
+    import numpy as np
+    xs_a = np.array(xs, dtype=np.float64)
+    ys_a = np.array(ys, dtype=np.float64)
+    mask = np.isfinite(xs_a) & np.isfinite(ys_a) & (xs_a > 0) & (ys_a > 0)
+    if mask.sum() < 20:
+        return [0.0, 0.0, 0.0, 1.0, 0.0]
+    return np.polyfit(xs_a[mask], ys_a[mask], deg=degree).tolist()
+
+
+def _run_calibration(unet, clip, vae, params, prompt_id):
+    """Run one calibration pass, returning list of CalibrationEntry."""
+    dm = get_diffusion_model(unet)
+    calib_fwd = make_calibration_forward()
+
+    if hasattr(dm, "_calib_state"):
+        delattr(dm, "_calib_state")
+    dm.calibration_log = []
+
+    original = dm._forward
+    dm._forward = calib_fwd.__get__(dm, dm.__class__)
+
+    steps = params["steps"]
+    to = unet.model_options.setdefault("transformer_options", {})
+    to["calibration_step"] = 0
+    to["calibration_total_steps"] = steps
+    to["calibration_prompt_id"] = prompt_id
+    to["calibration_seed"] = params["seed"]
+
+    def wrapper(model_function, kwargs):
+        c = kwargs["c"]
+        timestep = kwargs["timestep"]
+        c_to = c.setdefault("transformer_options", {})
+        sigmas = c_to.get("sample_sigmas")
+        if sigmas is not None:
+            matched = (sigmas == timestep[0]).nonzero()
+            if len(matched) > 0:
+                step_idx = matched[0].item()
+            else:
+                step_idx = 0
+                for i in range(len(sigmas) - 1):
+                    if (sigmas[i] - timestep[0]) * (sigmas[i + 1] - timestep[0]) <= 0:
+                        step_idx = i
+                        break
+            c_to["calibration_step"] = step_idx
+        return model_function(kwargs["input"], timestep, **c)
+
+    try:
+        unet.set_model_unet_function_wrapper(wrapper)
+        sample(
+            unet, clip, vae, SMOKE_PROMPT,
+            seed=params["seed"], steps=steps,
+            width=512, height=512,
+            cfg=params["cfg"], sampler_name=params["sampler"],
+            scheduler=params["scheduler"], negative=SMOKE_NEGATIVE,
+        )
+        entries = list(dm.calibration_log)
+    finally:
+        dm._forward = original
+        unet.set_model_unet_function_wrapper(None)
+        for k in list(to.keys()):
+            if k.startswith("calibration_"):
+                del to[k]
+
+    return entries
+
+
+def _run_teacache(unet, clip, vae, cfg: TeacacheConfig, seed, steps, sampler, sched, cfg_val):
+    """Run one TeaCache generation, returning (image, wall_time)."""
+    dm = get_diffusion_model(unet)
+    if hasattr(dm, "teacache_state"):
+        delattr(dm, "teacache_state")
+
+    original = dm._forward
+    dm._forward = teacache_anima_forward.__get__(dm, dm.__class__)
+
+    to = unet.model_options.setdefault("transformer_options", {})
+    cfg.inject_into_transformer_options(to)
+    to["enable_teacache"] = True
+
+    def tc_wrapper(model_function, kwargs):
+        c = kwargs["c"]
+        timestep = kwargs["timestep"]
+        c_to = c.setdefault("transformer_options", {})
+        sigmas = c_to.get("sample_sigmas")
+        if sigmas is not None:
+            matched = (sigmas == timestep[0]).nonzero()
+            if len(matched) > 0:
+                step_idx = matched[0].item()
+            else:
+                step_idx = 0
+                for i in range(len(sigmas) - 1):
+                    if (sigmas[i] - timestep[0]) * (sigmas[i + 1] - timestep[0]) <= 0:
+                        step_idx = i
+                        break
+            c_to["current_percent"] = step_idx / max(len(sigmas) - 1, 1)
+            c_to["enable_teacache"] = (cfg.start_percent <= c_to["current_percent"] <= cfg.end_percent)
+        return model_function(kwargs["input"], timestep, **c)
+
+    try:
+        unet.set_model_unet_function_wrapper(tc_wrapper)
+        t0 = time.time()
+        img = sample(
+            unet, clip, vae, SMOKE_PROMPT,
+            seed=seed, steps=steps,
+            width=512, height=512,
+            cfg=cfg_val, sampler_name=sampler, scheduler=sched,
+            negative=SMOKE_NEGATIVE,
+        )
+        dt = time.time() - t0
+    finally:
+        dm._forward = original
+        unet.set_model_unet_function_wrapper(None)
+        for k in list(to.keys()):
+            if k.startswith("tc_"):
+                del to[k]
+        to.pop("enable_teacache", None)
+        to.pop("rel_l1_thresh", None)
+        to.pop("coefficients", None)
+        to.pop("current_percent", None)
+
+    return img, dt
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════════════════
 
 def run_smoke_test(comfy_dir: str, steps: int = 30):
-    print("=" * 60)
-    print("  TeaCache Anima Smoke Test")
-    print("=" * 60)
-    print(f"  ComfyUI: {comfy_dir}")
-    print(f"  Steps:   {steps}")
-
-    # Load the default config for model paths
+    # Load config for model paths
     cfg_path = Path(__file__).parent / "config.json"
     if cfg_path.exists():
         tcfg = TuningConfig.load(str(cfg_path))
@@ -49,198 +250,140 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
         clip_type  = "qwen_image"
         vae_name   = "qwen_image_vae.safetensors"
 
-    # ── 1. Load models ──
-    print("\n[1/5] Loading models...")
+    print("=" * 60)
+    print("  TeaCache Anima Smoke Test")
+    print("=" * 60)
+    print(f"  ComfyUI: {comfy_dir}")
+    print(f"  Runs:    {len(SMOKE_RUNS)} varied (sampler, steps, cfg)")
+
+    # ── [1/6] Load models ──────────────────────────────────────────────
+    print("\n[1/6] Loading models...")
     try:
-        unet, clip, vae = load_models(
-            comfy_dir, model_name, clip_name, clip_type, vae_name
-        )
+        unet, clip, vae = load_models(comfy_dir, model_name, clip_name, clip_type, vae_name)
     except Exception as e:
         print(f"\n  FAILED to load models: {e}")
         return False
 
-    # ── 2. Baseline generation (no patching) ──
-    print(f"\n[2/5] Baseline generation ({steps} steps)...")
+    # ── [2/6] Calibration data collection ──────────────────────────────
+    print(f"\n[2/6] Collecting calibration data ({len(SMOKE_RUNS)} runs)...")
+    all_entries = []
+    try:
+        for i, run in enumerate(SMOKE_RUNS):
+            t0 = time.time()
+            entries = _run_calibration(unet, clip, vae, run, prompt_id=i)
+            dt = time.time() - t0
+            all_entries.extend(entries)
+            valid = sum(1 for e in entries if e.out_rel > 0)
+            print(f"  run {i+1}: steps={run['steps']} sampler={run['sampler']:>12s} "
+                  f"cfg={run['cfg']} seed={run['seed']}  "
+                  f"took={dt:.1f}s  entries={len(entries)}  valid={valid}")
+
+        total_valid = sum(1 for e in all_entries if e.out_rel > 0)
+        print(f"  Total: {len(all_entries)} entries ({total_valid} valid)")
+        if total_valid < 50:
+            print(f"  ⚠  Only {total_valid} valid — mini-optimizer may be unreliable")
+    except Exception as e:
+        print(f"\n  FAILED calibration: {e}")
+        import traceback; traceback.print_exc()
+        return False
+
+    # ── [3/6] Mini-optimizer ───────────────────────────────────────────
+    print(f"\n[3/6] Mini-optimizer (fitting coefficients)...")
+    try:
+        candidates = []
+        for source in ["first_block_shift", "t_emb"]:
+            for metric_type in ["mean_only", "mean_and_max"]:
+                for mapping in ["identity", "polynomial"]:
+                    cfg = TeacacheConfig(
+                        source=source, metric_type=metric_type,
+                        metric_weights={"mean": 0.7, "max": 0.3} if metric_type == "mean_and_max" else {},
+                        signal_scale=1.0 if source == "first_block_shift" else 100.0,
+                        mapping_type=mapping, coefficients=[],
+                        accumulation_type="hard_reset", rel_l1_thresh=0.07,
+                        step_schedule="constant", start_percent=0.05, end_percent=0.95,
+                        residual_strategy="hard", block_mode="all_or_nothing",
+                    )
+                    if mapping == "polynomial":
+                        cfg.coefficients = _fit_poly(all_entries, cfg)
+                    skip, err, sp, qp = _unwrap_simulate(all_entries, cfg)
+                    candidates.append((cfg, skip, err, sp, qp))
+
+        candidates.sort(key=lambda x: x[4] * x[3], reverse=True)  # quality * speedup
+
+        print(f"  {'source':<22} {'metric':<14} {'map':<12} {'skip':>6} {'speed':>6} {'error':>8} {'score':>6}")
+        print(f"  {'─' * 22} {'─' * 14} {'─' * 12} {'─' * 6} {'─' * 6} {'─' * 8} {'─' * 6}")
+        for cfg, skip, err, sp, qp in candidates[:8]:
+            print(f"  {cfg.source:<22} {cfg.metric_type:<14} {cfg.mapping_type:<12} "
+                  f"{skip:>5.1%}  {sp:>4.2f}x  {err:>7.4f}  {qp*sp:>5.3f}")
+
+        best = candidates[0]
+        best_cfg = best[0]
+        print(f"\n  Winner: {best_cfg.source} / {best_cfg.metric_type} / {best_cfg.mapping_type}")
+        if best_cfg.coefficients:
+            print(f"  Coeffs: {[f'{c:.4e}' for c in best_cfg.coefficients]}")
+            print(f"  Max |coeff|: {max(abs(c) for c in best_cfg.coefficients):.4e}")
+
+        # Try a quick threshold sweep on the winner
+        best_sweep = []
+        for t in [0.03, 0.05, 0.07, 0.10, 0.15, 0.20, 0.30, 0.50, 0.70, 1.0]:
+            cfg_s = TeacacheConfig.from_dict(best_cfg.to_dict())
+            cfg_s.rel_l1_thresh = t
+            skip, err, sp, qp = _unwrap_simulate(all_entries, cfg_s)
+            best_sweep.append((t, sp, qp))
+        best_thresh = max(best_sweep[1:], key=lambda x: x[1] * x[2])  # skip t=0 baseline
+        print(f"  Simulated best threshold: {best_thresh[0]} (speedup={best_thresh[1]:.2f}x, quality={best_thresh[2]:.3f})")
+
+        # Use the best found threshold for the TeaCache run
+        best_cfg.rel_l1_thresh = best_thresh[0]
+    except Exception as e:
+        print(f"\n  FAILED mini-optimizer: {e}")
+        import traceback; traceback.print_exc()
+        return False
+
+    # ── [4/6] Baseline + TeaCache generation ───────────────────────────
+    print(f"\n[4/6] Baseline + TeaCache generation...")
+    base_run = SMOKE_RUNS[0]
+
+    # Baseline (no patching)
     try:
         t0 = time.time()
         img_base = sample(
             unet, clip, vae, SMOKE_PROMPT,
-            seed=42, steps=steps,
+            seed=base_run["seed"], steps=base_run["steps"],
             width=512, height=512,
-            cfg=5.5,
-            sampler_name="dpmpp_2m_sde",
-            scheduler="normal",
-            negative=SMOKE_NEGATIVE,
+            cfg=base_run["cfg"], sampler_name=base_run["sampler"],
+            scheduler=base_run["scheduler"], negative=SMOKE_NEGATIVE,
         )
         t_base = time.time() - t0
-        print(f"  Baseline: {t_base:.1f}s, image size: {img_base.size}")
+        print(f"  Baseline:  {t_base:.1f}s  ({base_run['steps']} steps, {base_run['sampler']}, cfg={base_run['cfg']})")
     except Exception as e:
-        print(f"\n  FAILED baseline generation: {e}")
+        print(f"\n  FAILED baseline: {e}")
         import traceback; traceback.print_exc()
         return False
 
-    # ── 3. Calibration recording smoke test ──
-    print(f"\n[3/5] Calibration recording ({steps} steps, 1 prompt)...")
+    # TeaCache with tuned config
     try:
-        dm = get_diffusion_model(unet)
-        calib_fwd = make_calibration_forward()
-
-        dm.calibration_log = []
-        if hasattr(dm, "_calib_state"):
-            delattr(dm, "_calib_state")
-
-        original = dm._forward
-        dm._forward = calib_fwd.__get__(dm, dm.__class__)
-
-        # Install wrapper to inject per-step metadata
-        to = unet.model_options.setdefault("transformer_options", {})
-        to["calibration_step"] = 0
-        to["calibration_total_steps"] = steps
-        to["calibration_prompt_id"] = 0
-        to["calibration_seed"] = 42
-
-        def wrapper(model_function, kwargs):
-            c = kwargs["c"]
-            timestep = kwargs["timestep"]
-            c_to = c.setdefault("transformer_options", {})
-            sigmas = c_to.get("sample_sigmas")
-            if sigmas is not None:
-                matched = (sigmas == timestep[0]).nonzero()
-                if len(matched) > 0:
-                    step_idx = matched[0].item()
-                else:
-                    step_idx = 0
-                    for i in range(len(sigmas) - 1):
-                        if (sigmas[i] - timestep[0]) * (sigmas[i + 1] - timestep[0]) <= 0:
-                            step_idx = i
-                            break
-                c_to["calibration_step"] = step_idx
-            return model_function(kwargs["input"], timestep, **c)
-
-        try:
-            unet.set_model_unet_function_wrapper(wrapper)
-
-            img_calib = sample(
-                unet, clip, vae, SMOKE_PROMPT,
-                seed=42, steps=steps,
-                width=512, height=512,
-                cfg=7.5,
-                sampler_name="dpmpp_2m_sde",
-                scheduler="normal",
-                negative=SMOKE_NEGATIVE,
-            )
-
-            n_entries = len(dm.calibration_log)
-            print(f"  Calibration: recorded {n_entries} entries")
-            if n_entries > 0:
-                e = dm.calibration_log[0]
-                print(f"  Sample entry: step={e.step}, t_emb_mean={e.t_emb.mean if e.t_emb else 'N/A'}")
-        finally:
-            dm._forward = original
-            unet.set_model_unet_function_wrapper(None)
-            for k in list(to.keys()):
-                if k.startswith("calibration_"):
-                    del to[k]
-    except Exception as e:
-        print(f"\n  FAILED calibration recording: {e}")
-        import traceback; traceback.print_exc()
-        return False
-
-    complete = n_entries >= (steps - 1) * 2  # 2 cond slots per step
-    if complete:
-        print(f"  ✅ Calibration recording works (expected ~{steps*2} entries)")
-    else:
-        print(f"  ⚠ Calibration recording produced fewer entries than expected")
-
-    # ── 4. TeaCache forward smoke test ──
-    print(f"\n[4/5] TeaCache forward (config: default)...")
-    try:
-        dm = get_diffusion_model(unet)
-
-        # Reset TeaCache state
-        if hasattr(dm, "teacache_state"):
-            delattr(dm, "teacache_state")
-
-        tc_fwd = teacache_anima_forward
-        original = dm._forward
-        dm._forward = tc_fwd.__get__(dm, dm.__class__)
-
-        # Inject a default config
-        cfg = TeacacheConfig(
-            source="first_block_shift",
-            metric_type="mean_only",
-            mapping_type="identity",
-            coefficients=[],
-            accumulation_type="hard_reset",
-            rel_l1_thresh=0.07,
-            start_percent=0.05,
-            end_percent=0.95,
+        img_tc, t_tc = _run_teacache(
+            unet, clip, vae, best_cfg,
+            seed=base_run["seed"], steps=base_run["steps"],
+            sampler=base_run["sampler"], sched=base_run["scheduler"],
+            cfg_val=base_run["cfg"],
         )
-        to = unet.model_options.setdefault("transformer_options", {})
-        cfg.inject_into_transformer_options(to)
-        to["enable_teacache"] = True
-
-        # Install step-tracking wrapper (same pattern as TeaCache.apply_teacache)
-        def tc_wrapper(model_function, kwargs):
-            c = kwargs["c"]
-            timestep = kwargs["timestep"]
-            c_to = c.setdefault("transformer_options", {})
-            sigmas = c_to.get("sample_sigmas")
-            if sigmas is not None:
-                matched = (sigmas == timestep[0]).nonzero()
-                if len(matched) > 0:
-                    step_idx = matched[0].item()
-                else:
-                    step_idx = 0
-                    for i in range(len(sigmas) - 1):
-                        if (sigmas[i] - timestep[0]) * (sigmas[i + 1] - timestep[0]) <= 0:
-                            step_idx = i
-                            break
-                c_to["current_percent"] = step_idx / max(len(sigmas) - 1, 1)
-                c_to["enable_teacache"] = (
-                    cfg.start_percent <= c_to["current_percent"] <= cfg.end_percent
-                )
-            return model_function(kwargs["input"], timestep, **c)
-
-        try:
-            unet.set_model_unet_function_wrapper(tc_wrapper)
-            t0 = time.time()
-            img_tc = sample(
-                unet, clip, vae, SMOKE_PROMPT,
-                seed=42, steps=steps,
-                width=512, height=512,
-                cfg=5.5,
-                sampler_name="dpmpp_2m_sde",
-                scheduler="normal",
-                negative=SMOKE_NEGATIVE,
-            )
-            t_tc = time.time() - t0
-            print(f"  TeaCache: {t_tc:.1f}s (baseline: {t_base:.1f}s) "
-                  f"speedup: {t_base/max(t_tc, 0.001):.2f}x")
-        finally:
-            dm._forward = original
-            unet.set_model_unet_function_wrapper(None)
-            for k in list(to.keys()):
-                if k.startswith("tc_"):
-                    del to[k]
-            to.pop("enable_teacache", None)
-            to.pop("rel_l1_thresh", None)
-            to.pop("coefficients", None)
-            to.pop("current_percent", None)
+        su = t_base / max(t_tc, 0.001)
+        print(f"  TeaCache:  {t_tc:.1f}s  (speedup: {su:.2f}x, "
+              f"thresh={best_cfg.rel_l1_thresh:.3f}, "
+              f"src={best_cfg.source}, {best_cfg.metric_type}, {best_cfg.mapping_type})")
     except Exception as e:
         print(f"\n  FAILED TeaCache forward: {e}")
         import traceback; traceback.print_exc()
         return False
 
-    # ── 5. Quality check ──
-    print(f"\n[5/5] Quality check (all 12 metrics, Tier 3)...")
+    # ── [5/6] Quality check ────────────────────────────────────────────
+    print(f"\n[5/6] Quality check (all 12 metrics, Tier 3)...")
     try:
         qm = QualityMetrics(tier=3)
 
         # ── Legend ──────────────────────────────────────────────────────
-        # (name,  dir↑↓, what it measures,  good_thresh, mid_thresh)
-        # For ↑ metrics: good >= thresh, mid >= thresh, else bad
-        # For ↓ metrics: good <= thresh, mid <= thresh, else bad
         METRIC_LEGEND = [
             ("psnr",       "↑", "pixel-level accuracy",           35.0,  25.0),
             ("ssim",       "↑", "structural similarity",          0.95,  0.85),
@@ -256,27 +399,22 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
             ("vsi",        "↑", "visual saliency-weighted simil.", 0.97,  0.90),
         ]
 
-        # Column widths (excludes spacers)
         COL_METRIC = 12
         COL_DIR    = 3
         COL_GOOD   = 7
-        COL_MID    = 11
+        COL_MID    = 14
         COL_POOR   = 7
         COL_WHAT   = 35
         SPACER = " │ "
 
         def _legend_row(metric, dir_str, good_s, mid_s, poor_s, what_s):
-            row = (
-                f"{metric:>{COL_METRIC}}{SPACER}"
-                f"{dir_str:^{COL_DIR}}{SPACER}"
-                f"{good_s:>{COL_GOOD}}{SPACER}"
-                f"{mid_s:>{COL_MID}}{SPACER}"
-                f"{poor_s:>{COL_POOR}}{SPACER}"
-                f"{what_s:<{COL_WHAT}}"
-            )
-            return row
+            return (f"{metric:>{COL_METRIC}}{SPACER}"
+                    f"{dir_str:^{COL_DIR}}{SPACER}"
+                    f"{good_s:>{COL_GOOD}}{SPACER}"
+                    f"{mid_s:>{COL_MID}}{SPACER}"
+                    f"{poor_s:>{COL_POOR}}{SPACER}"
+                    f"{what_s:<{COL_WHAT}}")
 
-        # Build all rows first to determine max width
         legend_rows = []
         for name, direction, what, good, mid in METRIC_LEGEND:
             if direction == "↑":
@@ -285,17 +423,13 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
                 gs, ms, ps = f"  <{good:g}", f"  {good:g} - {mid:g}", f"  >{mid:g}"
             legend_rows.append(_legend_row(name, direction, gs, ms, ps, what))
 
-        # Also build header-like rows for sizing
-        header_row = _legend_row(
-            "Metric", "dir", "  Good", "    Mid", "  Poor", "What it measures"
-        )
+        header_row = _legend_row("Metric", "↑↓", "  Good", "    Mid", "  Poor", "What it measures")
         all_rows = [header_row] + legend_rows
-        box_width = max(len(r) for r in all_rows)  # body content width
+        box_width = max(len(r) for r in all_rows)
 
         def _box_line(body, width):
             return f"  ║ {body.ljust(width)} ║"
 
-        # Print the box
         print(f"\n  ╔{'═' * (box_width + 2)}╗")
         print(_box_line("HOW TO READ METRICS", box_width))
         print(_box_line("↑ = higher is better    ↓ = lower is better", box_width))
@@ -310,44 +444,32 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
         if qm.available:
             scores = qm.measure(img_tc, img_base)
 
-            # Summary line
-            excellent = 0
-            acceptable = 0
-            poor = 0
+            excellent = acceptable = poor = 0
             for name, direction, _, good, mid in METRIC_LEGEND:
                 val = scores.get(name, float("nan"))
-                if val != val:  # NaN
+                if val != val:
                     continue
                 if direction == "↑":
-                    if val >= good:
-                        excellent += 1
-                    elif val >= mid:
-                        acceptable += 1
-                    else:
-                        poor += 1
+                    if val >= good:   excellent += 1
+                    elif val >= mid:  acceptable += 1
+                    else:             poor += 1
                 else:
-                    if val <= good:
-                        excellent += 1
-                    elif val <= mid:
-                        acceptable += 1
-                    else:
-                        poor += 1
+                    if val <= good:   excellent += 1
+                    elif val <= mid:  acceptable += 1
+                    else:             poor += 1
 
-            print(f"\n  TeaCache vs Baseline:")
+            ts = f"thresh={best_cfg.rel_l1_thresh}  speedup={su:.2f}x"
+            print(f"\n  TeaCache vs Baseline  [{ts}]")
             print(f"    {excellent} ✅ excellent   {acceptable} ✓ acceptable   {poor} ⚠ needs tuning\n")
 
-            # Score table using same column layout as legend
             COL_SCORE = 8
             COL_RATING = 14
 
             def _score_row(metric, dir_str, score_str, rating):
-                row = (
-                    f"{metric:>{COL_METRIC}}{SPACER}"
-                    f"{dir_str:^{COL_DIR}}{SPACER}"
-                    f"{score_str:>{COL_SCORE}}{SPACER}"
-                    f"{rating:<{COL_RATING}}"
-                )
-                return row
+                return (f"{metric:>{COL_METRIC}}{SPACER}"
+                        f"{dir_str:^{COL_DIR}}{SPACER}"
+                        f"{score_str:>{COL_SCORE}}{SPACER}"
+                        f"{rating:<{COL_RATING}}")
 
             score_rows = []
             for name, direction, _, good, mid in METRIC_LEGEND:
@@ -363,9 +485,9 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
                     else:             rating = "⚠ POOR"
                 score_rows.append(_score_row(name, direction, score_str, rating))
 
-            score_header = _score_row("Metric", "dir", "  Score", "Rating")
-            all_score_rows = [score_header] + score_rows
-            sw = max(len(r) for r in all_score_rows)
+            score_header = _score_row("Metric", "↑↓", "  Score", "Rating")
+            all_score = [score_header] + score_rows
+            sw = max(len(r) for r in all_score)
 
             print(f"  ╔{'═' * (sw + 2)}╗")
             print(_box_line(score_header, sw))
@@ -374,22 +496,18 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
                 print(_box_line(row, sw))
             print(f"  ╚{'═' * (sw + 2)}╝")
 
-            print(f"\n  Expect many ⚠ at this stage — the config is not yet tuned.")
-            print(f"  Calibration (Phase 1) + Optimization (Phase 2) will find")
-            print(f"  the coefficients that push most metrics into ✅ range.")
+            print(f"\n  With calibration, expect significant improvement over untuned identity.")
         else:
-            psnr, ssim, lpips = compute_quality_metrics(img_tc, img_base)
-            print(f"\n  pyiqa not installed. Legacy fallback:")
-            print(f"  PSNR:  {psnr:.2f}")
-            print(f"  SSIM:  {ssim:.4f}")
-            print(f"  LPIPS: {lpips:.4f}")
+            print(f"\n  pyiqa not installed. Install with: pip install -r tuning/requirements.txt")
     except Exception as e:
         print(f"  Could not compute metrics: {e}")
 
+    # ── [6/6] Summary ──────────────────────────────────────────────────
     print(f"\n{'=' * 60}")
-    print(f"  Smoke test PASSED")
-    print(f"  All 5 checks completed successfully")
-    print(f"  Ready for full calibration run")
+    print(f"  Smoke test PASSED — all {6} checks completed")
+    print(f"  Ready for full calibration run:")
+    print(f"    PYTHONPATH='.:custom_nodes/ComfyUI-TeaCache-CosmosPredict'")
+    print(f"    python -m tuning.calibrate --comfy-dir .")
     print(f"{'=' * 60}")
     return True
 
@@ -401,7 +519,6 @@ def main():
     parser.add_argument("--steps", type=int, default=30,
                         help="Number of sampling steps (default: 30)")
     args = parser.parse_args()
-
     success = run_smoke_test(args.comfy_dir, args.steps)
     sys.exit(0 if success else 1)
 
