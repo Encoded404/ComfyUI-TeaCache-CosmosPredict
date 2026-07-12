@@ -160,6 +160,7 @@ def fit_polynomial_coefficients(
     entries: List[CalibrationEntry],
     cfg: TeacacheConfig,
     degree: int = 4,
+    quiet: bool = False,
 ) -> List[float]:
     """Fit polynomial coefficients for a given configuration (source, metric, scale).
 
@@ -200,8 +201,9 @@ def fit_polynomial_coefficients(
     predicted = np.polyval(coeffs, xs[mask])
     rmse = float(np.sqrt(np.mean((ys[mask] - predicted) ** 2)))
 
-    print(f"  [fit] n={int(mask.sum())}  range=[{xs[mask].min():.5f}, {xs[mask].max():.5f}]  "
-          f"RMSE={rmse:.4f}  max|coeff|={max(abs(c) for c in coeffs):.3e}")
+    if not quiet:
+        print(f"  [fit] n={int(mask.sum())}  range=[{xs[mask].min():.5f}, {xs[mask].max():.5f}]  "
+              f"RMSE={rmse:.4f}  max|coeff|={max(abs(c) for c in coeffs):.3e}")
 
     return coeffs
 

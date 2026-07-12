@@ -35,6 +35,7 @@ SMOKE_NEGATIVE = ""
 # ── Calibration runs — varied to produce diverse (rel_l1, out_rel) pairs  ──
 SMOKE_RUNS = [
     {"sampler": "er_sde",        "steps": 30, "cfg": 5.0, "scheduler": "normal", "seed": 42},
+    {"sampler": "er_sde",        "steps": 29, "cfg": 4.5, "scheduler": "simple", "seed": 45},
     {"sampler": "dpmpp_2m_sde",  "steps": 28, "cfg": 4.5, "scheduler": "simple", "seed": 7},
     {"sampler": "dpmpp_2m_sde",  "steps": 30, "cfg": 5.0, "scheduler": "normal", "seed": 7},
     {"sampler": "euler_a",       "steps": 32, "cfg": 5.5, "scheduler": "normal", "seed": 99},
@@ -244,7 +245,8 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
         for cfg in candidates:
             if cfg.mapping_type == "polynomial":
                 cfg.coefficients = fit_polynomial_coefficients(
-                    all_entries, cfg, degree=tcfg.optimization.get("poly_degree", 4)
+                    all_entries, cfg, degree=tcfg.optimization.get("poly_degree", 4),
+                    quiet=True,  # already printing summary below
                 )
             skip, err, sp, qp = simulate_config(all_entries, cfg)
             results.append({
@@ -254,9 +256,13 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
 
         results.sort(key=lambda r: r["score"], reverse=True)
 
-        # Build Pareto frontier (no config is both faster AND higher quality)
+        # Build Pareto frontier — exclude configs with effectively no caching
+        # (skip_rate < 1% or speedup < 1.005x), which are just different identity
+        # configs that produce identical baseline output.
         pareto = []
         for r in results:
+            if r["skip"] < 0.01:
+                continue  # skip identity baseline equivalents
             dominated = False
             for p in pareto:
                 if (p["speedup"] >= r["speedup"] and p["quality"] >= r["quality"]):
@@ -267,25 +273,32 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
                 pareto.append(r)
 
         pareto.sort(key=lambda r: r["speedup"])
+
+        if not pareto:
+            print(f"  ⚠  No configs with skip > 1% — calibration data may be too sparse.")
+            pareto = [r for r in results if r["skip"] >= 0][:3]  # fallback
+
         print(f"  Pareto frontier: {len(pareto)} configs (from {len(results)} total)")
         print(f"  {'source':<22} {'metric':<14} {'map':<12} {'skip':>6} {'speed':>6} {'error':>8} {'score':>6}")
         print(f"  {'─' * 22} {'─' * 14} {'─' * 12} {'─' * 6} {'─' * 6} {'─' * 8} {'─' * 6}")
-        for r in results[:8]:
+        for r in pareto[:8]:
             c = r["config"]
             print(f"  {c.source:<22} {c.metric_type:<14} {c.mapping_type:<12} "
                   f"{r['skip']:>5.1%}  {r['speedup']:>4.2f}x  {r['error']:>7.4f}  {r['score']:>5.3f}")
 
-        # Pick up to 3 fairly-spaced configs from the Pareto frontier for real-world testing
+        # Pick up to 3 fairly-spaced configs from the Pareto frontier
         n_pick = min(3, len(pareto))
-        indices = [0]
-        if n_pick >= 2:
-            indices.append(len(pareto) // 2)
-        if n_pick >= 3:
-            indices.append(len(pareto) - 1)
-        indices = sorted(set(indices))
-
-        picks = []
-        labels = ["conservative", "balanced", "aggressive"]
+        if n_pick == 1:
+            indices = [0]
+        elif n_pick == 2:
+            indices = [0, len(pareto) - 1]
+        else:
+            # Pick from low, middle, and high speedup regions
+            by_speed = pareto  # already sorted by speedup
+            lo, hi = 0, len(by_speed) - 1
+            mid = len(by_speed) // 2
+            indices = sorted(set([lo, mid, hi]))
+        labels = ["conservative", "balanced", "aggressive"][:n_pick]
         for i, idx in enumerate(indices):
             r = pareto[idx]
             c = r["config"]
