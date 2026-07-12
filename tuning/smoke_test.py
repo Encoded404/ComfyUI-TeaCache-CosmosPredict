@@ -51,6 +51,26 @@ SMOKE_RUNS = [
     {"sampler": "euler_a",       "steps": 30, "cfg": 5.0, "scheduler": "simple", "seed": 64},
 ]
 
+# ── Reference: daraskme's published coefficients for Anima at 30 steps ──
+# Source: github.com/daraskme/comfy_anima_tea_cache
+# Used as a validation baseline — if this config also produces poor results,
+# there's a fundamental infrastructure issue, not a calibration issue.
+DARASKME_CONFIG = TeacacheConfig(
+    source="first_block_shift",
+    metric_type="mean_only",
+    signal_scale=1.0,
+    mapping_type="polynomial",
+    coefficients=[5954.035087553969, -2410.0426539290293, 349.24023850217395,
+                  -17.264742642375417, 0.31229336331906893],
+    accumulation_type="hard_reset",
+    rel_l1_thresh=0.07,
+    step_schedule="constant",
+    start_percent=0.05,
+    end_percent=0.95,
+    residual_strategy="hard",
+    block_mode="all_or_nothing",
+)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Prompt diversity test — 12 prompts designed to discriminate between
@@ -422,6 +442,28 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
             import traceback; traceback.print_exc()
             return False
 
+    # ── Daraskme reference (known-good config, validation baseline) ────
+    print(f"\n  {'─' * 60}")
+    print(f"  Reference: daraskme config (first_block_shift, polynomial, thresh=0.07)")
+    print(f"  Source: github.com/daraskme/comfy_anima_tea_cache")
+    try:
+        img_ref, dt_ref = run_single_teacache(
+            unet, clip, vae,
+            SMOKE_FULL, SMOKE_NEGATIVE,
+            DARASKME_CONFIG,
+            seed=base_run["seed"], steps=base_run["steps"],
+            sampler=base_run["sampler"], scheduler=base_run["scheduler"],
+            width=512, height=512,
+            cfg_val=base_run["cfg"],
+        )
+        su_ref = t_base / max(dt_ref, 0.001)
+        print(f"  {'daraskme':>14}: thresh={DARASKME_CONFIG.rel_l1_thresh:.3f}  {dt_ref:.1f}s  speedup={su_ref:.2f}x")
+        comparison["daraskme"] = {"time": dt_ref, "speedup": su_ref,
+                                   "thresh": DARASKME_CONFIG.rel_l1_thresh, "img": img_ref}
+    except Exception as e:
+        print(f"  {'daraskme':>14}: FAILED — {e}")
+        import traceback; traceback.print_exc()
+
     # ── [7/8] Quality check ────────────────────────────────────────────
     print(f"\n[7/8] Quality check (all 12 metrics, Tier 3)...")
     try:
@@ -450,7 +492,16 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
             print(header)
             print(f"  {'─' * 14}─┼─{'─' * 7}─┼─{'─' * 8}─┼─" + "─┼─".join("─" * 8 for _ in KEY_METRICS))
 
-            for label, info in comparison.items():
+            # Show tuned configs first, then daraskme reference with separator
+            pick_labels = [p["label"] for p in picks]
+            all_labels = pick_labels + (["daraskme"] if "daraskme" in comparison else [])
+
+            for li, label in enumerate(all_labels):
+                if label == "daraskme" and li > 0:
+                    print(f"  {'─' * 72}")
+                info = comparison.get(label)
+                if info is None:
+                    continue
                 scores = all_run_scores.get(label, {})
                 vals = " │ ".join(f"{scores.get(m, float('nan')):>8.4f}" for m in KEY_METRICS)
                 print(f"  {label:>14} │ {info['thresh']:>7.3f} │ {info['speedup']:>7.2f}x │ {vals}")
