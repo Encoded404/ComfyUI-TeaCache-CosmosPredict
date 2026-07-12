@@ -403,24 +403,29 @@ def optimize(configs: List[TeacacheConfig],
 
     results.sort(key=lambda r: r.score, reverse=True)
 
-    # Build Pareto frontier — exclude configs with no caching effect
+    # ── Fast O(n log n) Pareto frontier ─────────────────────────────────
+    # Filter out zero-skip configs, then sort by speedup descending.
+    # Walk through: keep configs whose quality exceeds the best seen so far.
+    # A config with lower quality than a previously-seen config is dominated
+    # (previous config has equal or higher speedup AND higher quality).
+    p_start = time_mod.time()
+    candidates_for_pareto = [r for r in results if r.skip_rate >= 0.01]
+    candidates_for_pareto.sort(
+        key=lambda r: (-r.estimated_speedup, -r.accumulated_error)
+    )
     pareto = []
-    for r in results:
-        if r.skip_rate < 0.01:
-            continue
-        dominated = False
-        for p in pareto:
-            if (p.estimated_speedup >= r.estimated_speedup
-                    and p.accumulated_error <= r.accumulated_error):
-                if (p.estimated_speedup > r.estimated_speedup
-                        or p.accumulated_error < r.accumulated_error):
-                    dominated = True
-                    break
-        if not dominated:
+    best_quality = float("inf")  # lower accumulated_error is better quality
+    for r in candidates_for_pareto:
+        # accumulated_error: lower is better for quality
+        if r.accumulated_error < best_quality:
             pareto.append(r)
+            best_quality = r.accumulated_error
 
+    p_elapsed = time_mod.time() - p_start
     print(f"\n[pareto] {len(pareto)} Pareto-optimal configurations "
-          f"(out of {len(results)} total, {len(configs)} candidates)")
+          f"(from {len(candidates_for_pareto)} with skip>=1% / "
+          f"{len(results)} total, {len(configs)} candidates) "
+          f"in {p_elapsed:.1f}s")
     print(f"[time]   {elapsed:.1f}s total, {elapsed/total*1000:.1f}ms/config, "
           f"{elapsed/len(configs)*1000:.1f}ms/candidate")
 
