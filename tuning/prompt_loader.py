@@ -97,13 +97,14 @@ def select_prompts(
     """Select `count` prompts from the pool using the given strategy.
 
     Methods:
-      from_top:        Take first N (deterministic, good for reproducibility)
-      from_bottom:     Take last N
-      random:          Random selection
-      tag_diversity:   Greedy selection maximizing unique tag coverage
-      tag_filter:      Only include prompts matching specific tags
-                       (prefix tag with - to exclude, e.g. ["character", "-nsfw"])
-      weighted_random: Weight by prompt position (favor early entries)
+      from_top:          Take first N (deterministic, good for reproducibility)
+      from_bottom:       Take last N
+      random:            Random selection
+      tag_diversity:     Greedy selection maximizing unique tag coverage
+      text_diversity:    Greedy selection maximizing lexical (word-level) diversity
+      tag_filter:        Only include prompts matching specific tags
+                         (prefix tag with - to exclude, e.g. ["character", "-nsfw"])
+      weighted_random:   Weight by prompt position (favor early entries)
     """
     rng = random.Random(seed)
 
@@ -126,6 +127,9 @@ def select_prompts(
 
     if method == "tag_diversity":
         return _select_tag_diversity(pool, count, rng)
+
+    if method == "text_diversity":
+        return _select_text_diversity(pool, count, rng)
 
     if method == "weighted_random":
         weights = [max(len(pool) - i, 1) for i in range(len(pool))]
@@ -201,7 +205,6 @@ def _select_tag_diversity(
                 best_new = len(new_tags)
                 best_idx = i
         if best_new == 0:
-            # No new tags available; pick random from remaining
             pick = remaining.pop(rng.randint(0, len(remaining) - 1))
             selected.append(pick)
             continue
@@ -209,6 +212,173 @@ def _select_tag_diversity(
         selected.append(pick)
         covered_tags |= set(pick.tags)
     return selected
+
+
+def _tokenize(text: str) -> Set[str]:
+    """Tokenize prompt text into a set of lowercase word tokens.
+
+    Strips weight annotations like (keyword:1.5) and punctuation,
+    keeping only alphanumeric words of length >= 2.
+    """
+    import re
+    # Remove weight annotations: (word:1.5) → word
+    cleaned = re.sub(r'\(([^:)]+):[\d.]+\)', r'\1', text)
+    # Remove parentheses and special chars
+    cleaned = re.sub(r'[()\[\]{},]', ' ', cleaned)
+    # Split and filter
+    words = set()
+    for w in cleaned.lower().split():
+        w = w.strip()
+        if len(w) >= 2 and w.isalpha():
+            words.add(w)
+    return words
+
+
+def _select_text_diversity(
+    pool: List[PromptEntry], count: int, rng: random.Random
+) -> List[PromptEntry]:
+    """Greedy selection maximizing lexical diversity across prompt text.
+
+    Uses word-level Jaccard distance: picks prompts that share the
+    fewest words with already-selected prompts. This favors prompts
+    with different vocabulary — different subjects, settings, styles,
+    and compositions without needing tags or an embedding model.
+
+    Starts with a random prompt, then repeatedly picks the one with
+    the highest average Jaccard distance to all selected prompts.
+    """
+    count = min(count, len(pool))
+    if count <= 1:
+        return [pool[rng.randint(0, len(pool) - 1)]]
+
+    remaining = list(pool)
+    # Start with the most word-dense prompt (to avoid picking a stub)
+    tokenized = [_tokenize(p.text) for p in remaining]
+    best_start = max(range(len(remaining)), key=lambda i: len(tokenized[i]))
+    selected = [remaining.pop(best_start)]
+    selected_tokens = [tokenized.pop(best_start)]
+
+    for _ in range(count - 1):
+        best_idx = 0
+        best_score = -1.0
+        for i in range(len(remaining)):
+            p_words = tokenized[i]
+            # Average Jaccard distance to all selected prompts
+            total_dist = 0.0
+            for sw in selected_tokens:
+                intersection = len(p_words & sw)
+                union = len(p_words | sw)
+                total_dist += 1.0 - (intersection / max(union, 1))
+            avg_dist = total_dist / max(len(selected_tokens), 1)
+            if avg_dist > best_score:
+                best_score = avg_dist
+                best_idx = i
+
+        pick = remaining.pop(best_idx)
+        selected.append(pick)
+        selected_tokens.append(tokenized.pop(best_idx))
+
+    return selected
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  SEMANTIC DIVERSITY (LLM-BASED) — investigation
+# ══════════════════════════════════════════════════════════════════════
+#
+# Text-based Jaccard diversity only captures lexical overlap (shared
+# words). Two prompts can be lexically different but semantically
+# similar (e.g., "samurai in forest at dawn" vs "elf archer in woods
+# at sunrise"). An embedding model would catch this.
+#
+# === Option A: Use ComfyUI's already-loaded CLIP model ===
+#
+# Anima loads qwen_image CLIP (~1.5GB on GPU). We could encode prompts
+# through CLIP's text encoder and use cosine similarity between the
+# pooled embeddings for diversity selection.
+#
+#   def _get_clip_embeddings(clip, texts) -> np.ndarray:
+#       import numpy as np
+#       embs = []
+#       for t in texts:
+#           tokens = clip.tokenize(t)
+#           emb = clip.encode_from_tokens_scheduled(tokens)
+#           embs.append(emb.flatten().cpu().numpy())
+#       return np.vstack(embs)
+#
+#   def _select_semantic_diversity(pool, count, rng, clip):
+#       texts = [p.text for p in pool]
+#       embs = _get_clip_embeddings(clip, texts)
+#       norms = np.linalg.norm(embs, axis=1)
+#       ...
+#
+# Pros: zero new dependencies, CLIP already loaded
+# Cons: GPU-heavy for many prompts, requires passing CLIP to loader,
+#       CLIP embeddings optimized for image-text alignment, not
+#       specifically for prompt-to-prompt similarity
+#
+# === Option B: Small sentence-transformers model (CPU) ===
+#
+#   pip install sentence-transformers
+#   model = SentenceTransformer('all-MiniLM-L6-v2')  # 80 MB download
+#   embeddings = model.encode(texts)  # 384-dim vectors
+#
+# Pros: trivial integration, 80 MB, runs on CPU, ~1000 prompts/sec,
+#       specifically trained for semantic textual similarity
+# Cons: adds sentence-transformers + torch dependency (~200 MB extra),
+#       but torch is already installed via ComfyUI
+#
+# === Option C: FastText / GloVe word vectors (CPU) ===
+#
+# Average word vectors → sentence vector. ~100MB download, no
+# sentence-transformers dependency. Lower quality than transformers
+# but much smaller footprint.
+#
+#   pip install fasttext  # or use glove vectors
+#   import fasttext.util
+#   ft = fasttext.load_model('cc.en.300.bin')
+#
+# === Recommendation ===
+#
+# Option B (sentence-transformers/MiniLM) is the best tradeoff:
+# - The model is tiny (80 MB) and downloads automatically on first use
+# - CPU inference is fast enough for prompt selection (not in hot path)
+# - The embeddings are specifically trained for semantic similarity
+# - It would be a one-time dependency installed in smoke_test preamble
+#
+# Implementation sketch (add to prompt_loader.py):
+#
+#   _semantic_model = None
+#
+#   def _get_semantic_model():
+#       global _semantic_model
+#       if _semantic_model is None:
+#           from sentence_transformers import SentenceTransformer
+#           _semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
+#       return _semantic_model
+#
+#   def _select_semantic_diversity(pool, count, rng):
+#       model = _get_semantic_model()
+#       texts = [p.text for p in pool]
+#       import numpy as np
+#       embs = np.asarray(model.encode(texts, convert_to_numpy=True))
+#       norms = np.linalg.norm(embs, axis=1, keepdims=True)
+#       embs = embs / np.maximum(norms, 1e-8)
+#
+#       selected = [0]
+#       for _ in range(count - 1):
+#           best_idx = -1
+#           best_dist = 2.0  # worst cosine dist
+#           for i in range(len(pool)):
+#               if i in selected: continue
+#               min_sim = max(np.dot(embs[i], embs[s]) for s in selected)
+#               if min_sim < best_dist:
+#                   best_dist = min_sim
+#                   best_idx = i
+#           selected.append(best_idx)
+#       return [pool[i] for i in selected]
+#
+# To enable: add "semantic_diversity" to the method dispatch in
+# select_prompts() and add sentence-transformers to requirements.txt.
 
 
 # ── File I/O ─────────────────────────────────────────────────────────
