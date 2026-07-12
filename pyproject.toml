@@ -1,14 +1,14 @@
 [project]
-name = "teacache"
-description = "Unofficial implementation of [ali-vilab/TeaCache](https://github.com/ali-vilab/TeaCache) for ComfyUI"
+name = "teacache-cosmospredict"
+description = "Unofficial implementation of [ali-vilab/TeaCache](https://github.com/ali-vilab/TeaCache) for ComfyUI, with cosmos predict support"
 version = "1.9.0"
 license = {file = "LICENSE"}
 
 [project.urls]
-Repository = "https://github.com/welltop-cn/ComfyUI-TeaCache"
+Repository = "https://github.com/Encoded404/ComfyUI-TeaCache-CosmosPredict.git"
 #  Used by Comfy Registry https://comfyregistry.org
 
 [tool.comfy]
-PublisherId = "yunjieyu"
-DisplayName = "ComfyUI-TeaCache"
+PublisherId = "Encoded404"
+DisplayName = "ComfyUI-TeaCache-CosmosPredict"
 Icon = ""
