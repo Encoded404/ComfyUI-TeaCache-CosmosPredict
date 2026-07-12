@@ -21,7 +21,7 @@ def load_models(comfy_dir: str,     model_name: str,
     setup_comfy_path(comfy_dir)
 
     import folder_paths
-    import nodes
+    from comfy import nodes
 
     mdir = str(Path(comfy_dir) / "models")
     folder_paths.add_model_folder_path("diffusion_models", mdir + "/diffusion_models")
