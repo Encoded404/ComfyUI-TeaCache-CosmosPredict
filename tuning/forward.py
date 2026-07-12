@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 from typing import Dict, List, Optional
 
 import torch
@@ -210,6 +211,24 @@ def step_schedule_multiplier(step_fraction: float, schedule_type: str) -> float:
     if schedule_type == "constant":
         return 1.0
 
+    if schedule_type == "linear_ramp":
+        return 0.5 + 0.5 * step_fraction
+
+    if schedule_type == "linear_decay":
+        return 2.0 - step_fraction
+
+    if schedule_type == "cosine":
+        return math.cos(step_fraction * math.pi / 2.0)
+
+    if schedule_type == "bell":
+        return math.sin(step_fraction * math.pi)
+
+    warnings.warn(
+        f"Unknown step_schedule type '{schedule_type}', "
+        f"falling back to constant (1.0)"
+    )
+    return 1.0
+
 
 # ═════════════════════════════════════════════════════════════════════
 #  Knob 8: Block group detection
@@ -260,20 +279,6 @@ def get_block_group_indices(blocks) -> list[int]:
     """Return the start index of each block group for the split_groups mode."""
     groups = detect_block_groups(blocks)
     return [g[0] for g in groups]
-
-    if schedule_type == "linear_ramp":
-        return 0.5 + 0.5 * step_fraction
-
-    if schedule_type == "linear_decay":
-        return 2.0 - step_fraction
-
-    if schedule_type == "cosine":
-        return math.cos(step_fraction * math.pi / 2.0)
-
-    if schedule_type == "bell":
-        return math.sin(step_fraction * math.pi)
-
-    return 1.0
 
 
 # ═════════════════════════════════════════════════════════════════════
