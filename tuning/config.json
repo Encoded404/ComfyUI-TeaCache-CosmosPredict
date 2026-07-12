@@ -21,8 +21,8 @@
 
     "calibration": {
         "prompts_file": "prompts/calibration.json",
-        "prompt_selection": "from_top",
-        "prompt_tag_filter": ["-nsfw"],
+        "prompt_selection": "semantic_diversity",
+        "prompt_tag_filter": [],
         "num_prompts": 30,
         "seeds": [34635345, 53453634, 267454, 123],
         "negative_prompt": "",
