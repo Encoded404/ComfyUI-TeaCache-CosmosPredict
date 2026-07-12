@@ -292,8 +292,10 @@ def optimize(configs: List[TeacacheConfig],
     fits polynomial on train set, evaluates on holdout set.
     """
     import random
+    import time as time_mod
     opt = tcfg.optimization
     results: List[OptimizationResult] = []
+    t0 = time_mod.time()
 
     # Cross-validation split
     do_cv = opt.get("cross_validate", False)
@@ -310,6 +312,9 @@ def optimize(configs: List[TeacacheConfig],
         holdout_entries = [e for e in entries if e.prompt_id in holdout_ids]
         print(f"  CV: {len(train_entries)} train / {len(holdout_entries)} holdout "
               f"(split by prompt, {cv_fraction:.0%} holdout)")
+
+    total = len(configs)
+    last_log = 0
 
     for i, cfg in enumerate(configs):
         if cfg.mapping_type == "polynomial":
@@ -332,19 +337,28 @@ def optimize(configs: List[TeacacheConfig],
             score=score,
         ))
 
-        if (i + 1) % 50 == 0 or i == 0:
-            print(f"  [{i+1}/{len(configs)}] "
-                  f"src={cfg.source} metric={cfg.metric_type} "
-                  f"map={cfg.mapping_type} acc={cfg.accumulation_type} "
-                  f"scale={cfg.signal_scale:.0f} "
-                  f"skip={skip_rate:.2%} speedup={speedup:.2f}x "
-                  f"error={avg_error:.4f} score={score:.3f}")
+        # Progress with ETA
+        elapsed = time_mod.time() - t0
+        do_log = (i + 1) % 50 == 0 or i == 0 or (i + 1) == total
+        if do_log and (i + 1) != last_log:
+            last_log = i + 1
+            eta = elapsed / (i + 1) * (total - i - 1) if i > 0 else 0
+            print(f"  [{i+1:>5d}/{total}] "
+                  f"{(i+1)/total*100:5.1f}%  "
+                  f"elapsed={elapsed:.0f}s  ETA={eta:.0f}s  "
+                  f"last: src={cfg.source} {cfg.metric_type} {cfg.mapping_type} "
+                  f"skip={skip_rate:.1%} sp={speedup:.2f}x score={score:.3f}")
+
+    elapsed = time_mod.time() - t0
+    print(f"  Complete: {elapsed:.1f}s ({elapsed/total*1000:.1f} ms per config)")
 
     results.sort(key=lambda r: r.score, reverse=True)
 
-    # Build Pareto frontier (no other config is both faster AND higher quality)
+    # Build Pareto frontier — exclude configs with no caching effect
     pareto = []
     for r in results:
+        if r.skip_rate < 0.01:
+            continue
         dominated = False
         for p in pareto:
             if (p.estimated_speedup >= r.estimated_speedup
@@ -357,7 +371,9 @@ def optimize(configs: List[TeacacheConfig],
             pareto.append(r)
 
     print(f"\n[pareto] {len(pareto)} Pareto-optimal configurations "
-          f"(out of {len(results)} total)")
+          f"(out of {len(results)} total, {len(configs)} candidates)")
+    print(f"[time]   {elapsed:.1f}s total, {elapsed/total*1000:.1f}ms/config, "
+          f"{elapsed/len(configs)*1000:.1f}ms/candidate")
 
     return results, pareto
 

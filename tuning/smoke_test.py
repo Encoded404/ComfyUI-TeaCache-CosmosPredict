@@ -22,7 +22,7 @@ import torch
 from .config_types import TeacacheConfig, TuningConfig, CalibrationEntry
 from .utils import load_models, sample, get_diffusion_model, QualityMetrics, print_metrics_legend, score_from_legend
 from .recorder import make_calibration_forward
-from .optimize import simulate_config, fit_polynomial_coefficients, generate_candidate_configs
+from .optimize import generate_candidate_configs, optimize as run_optimizer
 from .prompt_loader import select_prompts, PromptEntry, PromptConfig
 from .validate import run_single_teacache
 
@@ -331,76 +331,45 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
         candidates = generate_candidate_configs(tcfg)
         print(f"  Generated {len(candidates)} candidate configs")
 
-        results = []
-        for cfg in candidates:
-            if cfg.mapping_type == "polynomial":
-                cfg.coefficients = fit_polynomial_coefficients(
-                    all_entries, cfg, degree=tcfg.optimization.get("poly_degree", 4),
-                    quiet=True,  # already printing summary below
-                )
-            skip, err, sp, qp = simulate_config(all_entries, cfg)
-            results.append({
-                "config": cfg, "skip": skip, "error": err,
-                "speedup": sp, "quality": qp, "score": sp * qp,
-            })
+        # Use the real optimizer (same code path as full pipeline)
+        all_opt_results, pareto_results = run_optimizer(candidates, all_entries, tcfg)
 
-        results.sort(key=lambda r: r["score"], reverse=True)
+        # Show Pareto summary
+        pareto = pareto_results if pareto_results else all_opt_results[:3]
+        pareto.sort(key=lambda r: r.estimated_speedup)
 
-        # Build Pareto frontier — exclude configs with effectively no caching
-        # and deduplicate near-identical results (same speedup/quality to 3dp).
-        pareto = []
-        seen_pareto = set()
-        for r in results:
-            if r["skip"] < 0.01:
-                continue
-            dominated = False
-            for p in pareto:
-                if (p["speedup"] >= r["speedup"] and p["quality"] >= r["quality"]):
-                    if p["speedup"] > r["speedup"] or p["quality"] > r["quality"]:
-                        dominated = True
-                        break
-            if not dominated:
-                key = (round(r["speedup"], 3), round(r["quality"], 3))
-                if key not in seen_pareto:
-                    seen_pareto.add(key)
-                    pareto.append(r)
-
-        pareto.sort(key=lambda r: r["speedup"])
-
-        if not pareto:
+        if not pareto or all(r.skip_rate < 0.01 for r in pareto):
             print(f"  ⚠  No configs with skip > 1% — calibration data may be too sparse.")
-            pareto = [r for r in results if r["skip"] >= 0][:3]  # fallback
+            pareto = [r for r in all_opt_results if r.skip_rate >= 0][:3]
 
-        print(f"  Pareto frontier: {len(pareto)} configs (from {len(results)} total)")
+        print(f"\n  Pareto summary ({len(pareto)} configs):")
         print(f"  {'source':<22} {'metric':<14} {'map':<12} {'skip':>6} {'speed':>6} {'error':>8} {'score':>6}")
         print(f"  {'─' * 22} {'─' * 14} {'─' * 12} {'─' * 6} {'─' * 6} {'─' * 8} {'─' * 6}")
         for r in pareto[:8]:
-            c = r["config"]
+            c = r.config
             print(f"  {c.source:<22} {c.metric_type:<14} {c.mapping_type:<12} "
-                  f"{r['skip']:>5.1%}  {r['speedup']:>4.2f}x  {r['error']:>7.4f}  {r['score']:>5.3f}")
+                  f"{r.skip_rate:>5.1%}  {r.estimated_speedup:>4.2f}x  {r.accumulated_error:>7.4f}  {r.score:>5.3f}")
 
-        # Pick up to 3 fairly-spaced configs from the Pareto frontier
+        # Pick fairly-spaced configs for end-to-end validation
         n_pick = min(3, len(pareto))
         if n_pick == 1:
             indices = [0]
         elif n_pick == 2:
             indices = [0, len(pareto) - 1]
         else:
-            # Pick from low, middle, and high speedup regions
-            by_speed = pareto  # already sorted by speedup
-            lo, hi = 0, len(by_speed) - 1
-            mid = len(by_speed) // 2
+            lo, hi = 0, len(pareto) - 1
+            mid = len(pareto) // 2
             indices = sorted(set([lo, mid, hi]))
         labels = ["conservative", "balanced", "aggressive"][:n_pick]
         picks = []
         for i, idx in enumerate(indices):
             r = pareto[idx]
-            c = r["config"]
+            c = r.config
             picks.append({
                 "label": labels[i],
                 "thresh": c.rel_l1_thresh,
-                "sim_speedup": r["speedup"],
-                "sim_error": r["error"],
+                "sim_speedup": r.estimated_speedup,
+                "sim_error": r.accumulated_error,
                 "config": c,
             })
 
