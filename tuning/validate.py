@@ -27,7 +27,7 @@ from .config_types import (
 )
 from .utils import (
     load_models, sample, get_diffusion_model,
-    compute_quality_metrics, img_to_tensor,
+    compute_quality_metrics, img_to_tensor, QualityMetrics,
 )
 from .forward import teacache_anima_forward
 
@@ -76,13 +76,18 @@ def validate_config(
     prompts: List[str],
     seeds: List[int],
     tcfg: TuningConfig,
+    qm: QualityMetrics,
 ) -> ValidationResult:
     """End-to-end validation of one configuration."""
-    results = []
+    metric_names = qm.metric_names()
+    all_scores: dict[str, list[float]] = {k: [] for k in metric_names}
+    all_speedups: list[float] = []
+    all_times: list[float] = []
 
     for pi, prompt in enumerate(prompts):
         for seed in seeds:
-            print(f"    p={pi} s={seed} thresh={cfg.rel_l1_thresh}  ", end="")
+            sp = f"p={pi} s={seed} thresh={cfg.rel_l1_thresh}"
+            item_text = "  " + sp
 
             # Baseline (no patching)
             torch.cuda.empty_cache()
@@ -122,37 +127,41 @@ def validate_config(
                 cleanup_patch(dm, unet)
 
             speedup = t_base / max(t_tc, 0.001)
-            psnr, ssim, lpips = compute_quality_metrics(img_tc, img_base)
+            all_speedups.append(speedup)
+            all_times.append(t_tc)
 
-            results.append({
-                "time_base": t_base,
-                "time_tc": t_tc,
-                "speedup": speedup,
-                "psnr": psnr,
-                "ssim": ssim,
-                "lpips": lpips,
-            })
+            # Compute all quality metrics
+            scores = qm.measure(img_tc, img_base)
+            for k in metric_names:
+                all_scores[k].append(scores.get(k, float("nan")))
 
-            print(f"speedup={speedup:.2f}x  LPIPS={lpips:.4f}")
+            lpips = scores.get("lpips_alex", float("inf"))
+            item_text += f"speedup={speedup:.2f}x  LPIPS={lpips:.4f}"
+
+            # Show key Tier 2 metrics if available
+            if qm.tier >= 2:
+                item_text += "  FSIM={:.4f} VIF={:.3f}".format(
+                    scores.get("fsim", float("nan")),
+                    scores.get("vif", float("nan")),
+                )
+            print("  " + sp + f"speedup={speedup:.2f}x  LPIPS={lpips:.4f}")
 
     # Aggregate
-    n = len(results)
-    mean_speedup  = sum(r["speedup"] for r in results) / n
-    mean_time     = sum(r["time_tc"] for r in results) / n
-    mean_psnr     = sum(r["psnr"] for r in results if r["psnr"] != float("inf")) / max(
-        sum(1 for r in results if r["psnr"] != float("inf")), 1
-    )
-    mean_ssim     = sum(r["ssim"]  for r in results) / n
-    mean_lpips    = sum(r["lpips"] for r in results) / n
+    n = len(all_speedups)
+    mean_metrics = {}
+    for k in metric_names:
+        vals = [v for v in all_scores[k] if v != float("inf") and v == v]
+        mean_metrics[k] = round(sum(vals) / max(len(vals), 1), 4) if vals else float("nan")
 
     return ValidationResult(
         config=cfg,
-        mean_speedup=round(mean_speedup, 3),
-        mean_psnr=round(mean_psnr, 2),
-        mean_ssim=round(mean_ssim, 4),
-        mean_lpips=round(mean_lpips, 4),
-        mean_time_sec=round(mean_time, 2),
+        mean_speedup=round(sum(all_speedups) / n, 3),
+        mean_psnr=round(mean_metrics.get("psnr", float("inf")), 2),
+        mean_ssim=round(mean_metrics.get("ssim", 1.0), 4),
+        mean_lpips=round(mean_metrics.get("lpips_alex", 0.0), 4),
+        mean_time_sec=round(sum(all_times) / n, 2),
         n_samples=n,
+        mean_metrics=mean_metrics,
     )
 
 
@@ -162,6 +171,7 @@ def sweep_thresholds(
     prompts: List[str],
     seeds: List[int],
     tcfg: TuningConfig,
+    qm: QualityMetrics,
     thresh_values: List[float],
 ) -> List[ValidationResult]:
     """Sweep threshold values for a given base config."""
@@ -170,7 +180,7 @@ def sweep_thresholds(
         cfg = TeacacheConfig.from_dict(base_cfg.to_dict())
         cfg.rel_l1_thresh = thresh
         print(f"\n  Threshold sweep: thresh={thresh}")
-        result = validate_config(cfg, unet, clip, vae, prompts, seeds, tcfg)
+        result = validate_config(cfg, unet, clip, vae, prompts, seeds, tcfg, qm)
         results.append(result)
     return results
 
@@ -187,6 +197,8 @@ def main():
                         help="Validate top K configurations (default: 10)")
     parser.add_argument("--extra-sweep", action="store_true",
                         help="Also run threshold sweeps for top configs")
+    parser.add_argument("--tier", type=int, default=1, choices=[1, 2, 3],
+                        help="Metric tier (1=fastest, 3=most comprehensive)")
     args = parser.parse_args()
 
     if args.config is None:
@@ -201,7 +213,16 @@ def main():
     print("=" * 60)
     print(f"  Pareto:  {args.pareto}")
     print(f"  Top-K:   {args.top_k}")
+    print(f"  Tiers:   {args.tier}")
     print(f"  Output:  {out_dir}")
+
+    # Create shared metrics instance before validation runs
+    qm = QualityMetrics(tier=args.tier)
+    if not qm.available:
+        print("  ⚠ pyiqa not found. Install: pip install -r tuning/requirements.txt")
+        sys.exit(1)
+    metric_names = qm.metric_names()
+    print(f"  Metrics:  {', '.join(metric_names)}")
     print("=" * 60)
 
     # Load Pareto frontier
@@ -240,7 +261,7 @@ def main():
         print(f"\n  [{idx+1}/{len(selected)}] {cfg.source} {cfg.metric_type} "
               f"{cfg.mapping_type} (sim speedup={opt_result.estimated_speedup:.2f}x)")
 
-        result = validate_config(cfg, unet, clip, vae, prompts, seeds, tcfg)
+        result = validate_config(cfg, unet, clip, vae, prompts, seeds, tcfg, qm)
         all_results.append(result)
 
         # Extra threshold sweep for top-3
@@ -249,7 +270,7 @@ def main():
                 0.03, 0.05, 0.07, 0.10, 0.15, 0.20, 0.30, 0.50, 0.70, 1.0])
             sweep_results = sweep_thresholds(
                 cfg, unet, clip, vae, prompts[:4], seeds[:2],
-                tcfg, extra_threshes,
+                tcfg, qm, extra_threshes,
             )
             all_results.extend(sweep_results)
 
@@ -261,25 +282,44 @@ def main():
     print(f"\n{'=' * 60}")
     print(f"  Validation Results")
     print(f"{'=' * 60}")
-    header = (f"  {'#':>3} | {'source':<20} | {'metric':<15} | {'speedup':>8} | "
-              f"{'PSNR':>8} | {'SSIM':>6} | {'LPIPS':>6}")
+
+    # Build dynamic header from actual metric names
+    short_metrics = {
+        "psnr": "PSNR", "ssim": "SSIM", "lpips_alex": "LPIPSa",
+        "lpips_vgg": "LPIPSv", "dists": "DISTS", "ms_ssim": "MSSIM",
+        "fsim": "FSIM", "vif": "VIF", "gmsd": "GMSD",
+        "nlpd": "NLPD", "pieapp": "PieAPP", "vsi": "VSI",
+    }
+    display_names = [short_metrics.get(n, n[:6]) for n in metric_names]
+
+    header = (f"  {'#':>3} | {'source':<20} | {'speed':>6} | "
+              + " | ".join(f"{d:>7}" for d in display_names))
     print(header)
     print(f"  {'─' * len(header)}")
 
     primary = [r for r in all_results if not hasattr(r.config, '_is_sweep')]
     for i, r in enumerate(primary):
         c = r.config
-        print(f"  {i+1:>3} | {c.source:<20} | {c.metric_type:<15} | "
-              f"{r.mean_speedup:>7.2f}x | {r.mean_psnr:>8.1f} | "
-              f"{r.mean_ssim:>6.4f} | {r.mean_lpips:>6.4f}")
+        vals = " | ".join(
+            f"{r.mean_metrics.get(n, float('nan')):>7.4f}"
+            for n in metric_names
+        )
+        print(f"  {i+1:>3} | {c.source:<20} | {r.mean_speedup:>5.2f}x | {vals}")
 
     # Find best by LPIPS < 0.05 and max speedup
     good = [r for r in all_results if r.mean_lpips < 0.05]
     if good:
         best = max(good, key=lambda r: r.mean_speedup)
+        extra = ""
+        if best.mean_metrics:
+            extra = "  " + "  ".join(
+                f"{short_metrics.get(n, n)}={best.mean_metrics.get(n, '?'):.4f}"
+                for n in ["dists", "ms_ssim", "fsim", "vif", "gmsd"]
+                if n in best.mean_metrics
+            )
         print(f"\n  ★ Recommended (LPIPS<0.05): thresh={best.config.rel_l1_thresh} "
-              f"speedup={best.mean_speedup}x LPIPS={best.mean_lpips} "
-              f"({best.config.source} {best.config.metric_type})")
+              f"speedup={best.mean_speedup}x LPIPS={best.mean_lpips}"
+              f"{extra}")
     else:
         best = min(all_results, key=lambda r: r.mean_lpips)
         print(f"\n  ★ Best quality (no LPIPS<0.05): thresh={best.config.rel_l1_thresh} "

@@ -16,7 +16,7 @@ from pathlib import Path
 import torch
 
 from .config_types import TeacacheConfig, TuningConfig
-from .utils import load_models, sample, get_diffusion_model, compute_quality_metrics
+from .utils import load_models, sample, get_diffusion_model, compute_quality_metrics, QualityMetrics
 from .recorder import make_calibration_forward
 from .forward import teacache_anima_forward
 
@@ -233,12 +233,18 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
         return False
 
     # ── 5. Quality check ──
-    print(f"\n[5/5] Quality check (PSNR/SSIM/LPIPS vs baseline)...")
+    print(f"\n[5/5] Quality check (multimetric, Tier 1)...")
     try:
-        psnr, ssim, lpips = compute_quality_metrics(img_tc, img_base)
-        print(f"  PSNR:  {psnr:.2f}")
-        print(f"  SSIM:  {ssim:.4f}")
-        print(f"  LPIPS: {lpips:.4f}")
+        qm = QualityMetrics(tier=1)
+        scores = qm.measure(img_tc, img_base)
+        if qm.available:
+            for name in qm.metric_names():
+                print(f"  {name:>12}: {scores.get(name, float('nan')):.4f}")
+        else:
+            psnr, ssim, lpips = compute_quality_metrics(img_tc, img_base)
+            print(f"  PSNR:  {psnr:.2f}")
+            print(f"  SSIM:  {ssim:.4f}")
+            print(f"  LPIPS: {lpips:.4f}")
     except Exception as e:
         print(f"  Could not compute metrics: {e}")
 

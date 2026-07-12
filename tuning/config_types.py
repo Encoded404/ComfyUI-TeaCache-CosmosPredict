@@ -249,9 +249,10 @@ class ValidationResult:
     mean_lpips: float
     mean_time_sec: float
     n_samples: int
+    mean_metrics: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "config": self.config.to_dict(),
             "mean_speedup": self.mean_speedup,
             "mean_psnr": self.mean_psnr,
@@ -260,6 +261,9 @@ class ValidationResult:
             "mean_time_sec": self.mean_time_sec,
             "n_samples": self.n_samples,
         }
+        if self.mean_metrics:
+            d["mean_metrics"] = self.mean_metrics
+        return d
 
 
 @dataclass

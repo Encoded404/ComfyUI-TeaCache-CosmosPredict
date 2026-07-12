@@ -92,42 +92,146 @@ def img_to_tensor(img) -> torch.Tensor:
 _PYIQA_AVAILABLE = False
 _PYIQA_WARNED = False
 
-def compute_quality_metrics(
-    img_pred, img_ref
-) -> Tuple[float, float, float]:
-    """Return (PSNR, SSIM, LPIPS) for pred vs ref images.
+# ── Metric definitions ────────────────────────────────────────────────
+# Each tier adds progressively more expensive metrics.
+# Tier 1: essential perceptual metrics (always computed)
+# Tier 2: structure/texture/edge metrics (moderate cost)
+# Tier 3: human-preference and specialized metrics (expensive)
 
-    Requires: pip install -r tuning/requirements.txt
-    If pyiqa is not installed, warns once and returns sentinel values.
+_TIER1_METRICS = {
+    "psnr":        "psnr",           # Pixel accuracy (higher=better)
+    "ssim":        "ssim",           # Structural similarity (higher=better)
+    "lpips_alex":  "lpips",          # Perceptual, AlexNet backbone (lower=better)
+    "lpips_vgg":   "lpips-vgg",      # Perceptual, VGG16 backbone — catches texture drift better (lower=better)
+    "dists":       "dists",          # Separates structure vs texture quality (lower=better)
+    "ms_ssim":     "ms_ssim",        # Multi-scale SSIM, catches scale-specific artifacts (higher=better)
+}
+
+_TIER2_METRICS = {
+    "fsim":        "fsim",           # Edge/sharpness via phase congruency (higher=better)
+    "vif":         "vif",            # Information fidelity — measures info loss from caching (higher=better)
+    "gmsd":        "gmsd",           # Gradient deviation — very sensitive to blur (lower=better)
+}
+
+_TIER3_METRICS = {
+    "nlpd":        "nlpd",           # Normalized Laplacian Pyramid — human visual system model (lower=better)
+    "pieapp":      "pieapp",         # Trained on human pairwise preference — gold standard (lower=better)
+    "vsi":         "vsi",            # Visual saliency-weighted — penalizes degradation in important regions (higher=better)
+}
+
+
+class QualityMetrics:
+    """Multi-metric image quality assessment via pyiqa.
+
+    Metrics are lazily loaded by tier to minimize GPU memory.
+    Each call to measure() returns a dict of named scores.
+
+    Usage:
+        qm = QualityMetrics(tier=1)
+        scores = qm.measure(img_pred, img_ref)
     """
-    global _PYIQA_AVAILABLE, _PYIQA_WARNED
 
-    try:
-        if not _PYIQA_AVAILABLE:
+    _all_metric_names = (
+        list(_TIER1_METRICS.keys())
+        + list(_TIER2_METRICS.keys())
+        + list(_TIER3_METRICS.keys())
+    )
+
+    def __init__(self, tier: int = 1):
+        self.tier = tier
+        self._pyiqa = None
+        self._metrics: dict[str, object] = {}
+        self._device = torch.device("cuda")
+        self._loaded = False
+
+    @property
+    def available(self) -> bool:
+        if self._loaded:
+            return True
+        try:
             import pyiqa
-            _PYIQA_AVAILABLE = True
-        device = torch.device("cuda")
-        psnr_m  = pyiqa.create_metric("psnr",  device=device)
-        ssim_m  = pyiqa.create_metric("ssim",  device=device)
-        lpips_m = pyiqa.create_metric("lpips", device=device)
+            self._pyiqa = pyiqa
+            self._loaded = True
+            return True
+        except ImportError:
+            return False
 
-        t_pred = img_to_tensor(img_pred)
-        t_ref  = img_to_tensor(img_ref)
-
-        psnr  = float(psnr_m(t_pred, t_ref).item())
-        ssim  = float(ssim_m(t_pred, t_ref).item())
-        lpips = float(lpips_m(t_pred, t_ref).item())
-        return psnr, ssim, lpips
-    except ImportError:
+    def _warn_once(self):
+        global _PYIQA_WARNED
         if not _PYIQA_WARNED:
             _PYIQA_WARNED = True
             print(
                 "\n  ⚠ WARNING: pyiqa is not installed. "
-                "Quality metrics (PSNR/SSIM/LPIPS) are UNAVAILABLE.\n"
+                "Quality metrics are UNAVAILABLE.\n"
                 "  Install with: pip install -r tuning/requirements.txt\n"
-                "  The values below are dummy placeholders — NOT real measurements.\n"
+                "  All metric values below are placeholders — NOT real measurements.\n"
             )
-        return float("inf"), 1.0, 0.0
+
+    def _create_metric(self, friendly_name: str, pyiqa_name: str) -> None:
+        if friendly_name in self._metrics or not self.available:
+            return
+        try:
+            self._metrics[friendly_name] = self._pyiqa.create_metric(
+                pyiqa_name, device=self._device
+            )
+        except Exception:
+            self._metrics[friendly_name] = None  # mark as unavailable
+
+    def measure(self, img_pred, img_ref) -> dict[str, float]:
+        """Return dict of all applicable metric scores for one image pair."""
+        if not self.available:
+            self._warn_once()
+            return {k: float("inf") for k in self._all_metric_names}
+
+        t_pred = img_to_tensor(img_pred)
+        t_ref = img_to_tensor(img_ref)
+
+        # Lazy init all metrics on first call
+        for friendly, pyiqa_name in _TIER1_METRICS.items():
+            self._create_metric(friendly, pyiqa_name)
+        if self.tier >= 2:
+            for friendly, pyiqa_name in _TIER2_METRICS.items():
+                self._create_metric(friendly, pyiqa_name)
+        if self.tier >= 3:
+            for friendly, pyiqa_name in _TIER3_METRICS.items():
+                self._create_metric(friendly, pyiqa_name)
+
+        scores = {}
+        for name in self._all_metric_names:
+            m = self._metrics.get(name)
+            if m is not None:
+                try:
+                    scores[name] = float(m(t_pred, t_ref).item())
+                except Exception:
+                    scores[name] = float("nan")
+            else:
+                scores[name] = float("nan")
+
+        return scores
+
+    def metric_names(self) -> list[str]:
+        """Return metric names active for current tier."""
+        names = list(_TIER1_METRICS.keys())
+        if self.tier >= 2:
+            names += list(_TIER2_METRICS.keys())
+        if self.tier >= 3:
+            names += list(_TIER3_METRICS.keys())
+        return names
+
+
+# ── Legacy compatibility wrapper ──────────────────────────────────────
+
+def compute_quality_metrics(
+    img_pred, img_ref
+) -> Tuple[float, float, float]:
+    """Legacy wrapper — returns (PSNR, SSIM, LPIPS-alex)."""
+    _global_qm = QualityMetrics(tier=1)
+    scores = _global_qm.measure(img_pred, img_ref)
+    return (
+        scores.get("psnr", float("inf")),
+        scores.get("ssim", 1.0),
+        scores.get("lpips_alex", 0.0),
+    )
 
 
 def get_diffusion_model(unet):
