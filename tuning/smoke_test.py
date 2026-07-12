@@ -256,19 +256,55 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
             ("vsi",        "↑", "visual saliency-weighted simil.", 0.97,  0.90),
         ]
 
-        print(f"\n  ╔{'═' * 76}╗")
-        print(f"  ║  HOW TO READ METRICS                                             ║")
-        print(f"  ║  ↑ = higher is better    ↓ = lower is better                     ║")
-        print(f"  ╟{'─' * 76}╢")
-        print(f"  ║ {'Metric':>12} │ dir │ {'Good':>6} │ {'Mid':>6} │ {'Poor':>6} │ What it measures              ║")
-        print(f"  ╟{'─' * 76}╢")
+        # Column widths (excludes spacers)
+        COL_METRIC = 12
+        COL_DIR    = 3
+        COL_GOOD   = 7
+        COL_MID    = 11
+        COL_POOR   = 7
+        COL_WHAT   = 35
+        SPACER = " │ "
+
+        def _legend_row(metric, dir_str, good_s, mid_s, poor_s, what_s):
+            row = (
+                f"{metric:>{COL_METRIC}}{SPACER}"
+                f"{dir_str:^{COL_DIR}}{SPACER}"
+                f"{good_s:>{COL_GOOD}}{SPACER}"
+                f"{mid_s:>{COL_MID}}{SPACER}"
+                f"{poor_s:>{COL_POOR}}{SPACER}"
+                f"{what_s:<{COL_WHAT}}"
+            )
+            return row
+
+        # Build all rows first to determine max width
+        legend_rows = []
         for name, direction, what, good, mid in METRIC_LEGEND:
             if direction == "↑":
-                gs, ms, ps = f">{good}", f"{mid}-{good}", f"<{mid}"
+                gs, ms, ps = f"  >{good:g}", f"  {mid:g} - {good:g}", f"  <{mid:g}"
             else:
-                gs, ms, ps = f"<{good}", f"{good}-{mid}", f">{mid}"
-            print(f"  ║ {name:>12} │  {direction}  │ {gs:>6} │ {ms:>6} │ {ps:>6} │ {what:<28}║")
-        print(f"  ╚{'═' * 76}╝")
+                gs, ms, ps = f"  <{good:g}", f"  {good:g} - {mid:g}", f"  >{mid:g}"
+            legend_rows.append(_legend_row(name, direction, gs, ms, ps, what))
+
+        # Also build header-like rows for sizing
+        header_row = _legend_row(
+            "Metric", "dir", "  Good", "    Mid", "  Poor", "What it measures"
+        )
+        all_rows = [header_row] + legend_rows
+        box_width = max(len(r) for r in all_rows)  # body content width
+
+        def _box_line(body, width):
+            return f"  ║ {body.ljust(width)} ║"
+
+        # Print the box
+        print(f"\n  ╔{'═' * (box_width + 2)}╗")
+        print(_box_line("HOW TO READ METRICS", box_width))
+        print(_box_line("↑ = higher is better    ↓ = lower is better", box_width))
+        print(f"  ╟{'─' * (box_width + 2)}╢")
+        print(_box_line(header_row, box_width))
+        print(f"  ╟{'─' * (box_width + 2)}╢")
+        for row in legend_rows:
+            print(_box_line(row, box_width))
+        print(f"  ╚{'═' * (box_width + 2)}╝")
 
         # ── Scores ──────────────────────────────────────────────────────
         if qm.available:
@@ -297,28 +333,46 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
                     else:
                         poor += 1
 
-            print(f"\n  TeaCache vs Baseline ({qm.tier} tiers):")
+            print(f"\n  TeaCache vs Baseline:")
             print(f"    {excellent} ✅ excellent   {acceptable} ✓ acceptable   {poor} ⚠ needs tuning\n")
 
-            print(f"  {'Metric':>12} │ dir │ {'Score':>8} │ {'Rating':^14}")
-            print(f"  {'─' * 12}─┼─────┼─{'─' * 8}─┼─{'─' * 14}")
+            # Score table using same column layout as legend
+            COL_SCORE = 8
+            COL_RATING = 14
+
+            def _score_row(metric, dir_str, score_str, rating):
+                row = (
+                    f"{metric:>{COL_METRIC}}{SPACER}"
+                    f"{dir_str:^{COL_DIR}}{SPACER}"
+                    f"{score_str:>{COL_SCORE}}{SPACER}"
+                    f"{rating:<{COL_RATING}}"
+                )
+                return row
+
+            score_rows = []
             for name, direction, _, good, mid in METRIC_LEGEND:
                 val = scores.get(name, float("nan"))
+                score_str = f"  {val:.4f}" if val == val else "    N/A"
                 if direction == "↑":
-                    if val >= good:
-                        rating = "✅ EXCELLENT"
-                    elif val >= mid:
-                        rating = "✓ acceptable"
-                    else:
-                        rating = "⚠ POOR"
+                    if val >= good:   rating = "✅ EXCELLENT"
+                    elif val >= mid:  rating = "✓ acceptable"
+                    else:             rating = "⚠ POOR"
                 else:
-                    if val <= good:
-                        rating = "✅ EXCELLENT"
-                    elif val <= mid:
-                        rating = "✓ acceptable"
-                    else:
-                        rating = "⚠ POOR"
-                print(f"  {name:>12} │  {direction}  │ {val:>8.4f} │ {rating:^14}")
+                    if val <= good:   rating = "✅ EXCELLENT"
+                    elif val <= mid:  rating = "✓ acceptable"
+                    else:             rating = "⚠ POOR"
+                score_rows.append(_score_row(name, direction, score_str, rating))
+
+            score_header = _score_row("Metric", "dir", "  Score", "Rating")
+            all_score_rows = [score_header] + score_rows
+            sw = max(len(r) for r in all_score_rows)
+
+            print(f"  ╔{'═' * (sw + 2)}╗")
+            print(_box_line(score_header, sw))
+            print(f"  ╟{'─' * (sw + 2)}╢")
+            for row in score_rows:
+                print(_box_line(row, sw))
+            print(f"  ╚{'═' * (sw + 2)}╝")
 
             print(f"\n  Expect many ⚠ at this stage — the config is not yet tuned.")
             print(f"  Calibration (Phase 1) + Optimization (Phase 2) will find")
