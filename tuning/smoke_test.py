@@ -20,11 +20,11 @@ from pathlib import Path
 import torch
 
 from .config_types import TeacacheConfig, TuningConfig, CalibrationEntry
-from .utils import load_models, sample, get_diffusion_model, QualityMetrics
+from .utils import load_models, sample, get_diffusion_model, QualityMetrics, print_metrics_legend, score_from_legend
 from .recorder import make_calibration_forward
-from .forward import teacache_anima_forward
 from .optimize import simulate_config, fit_polynomial_coefficients, generate_candidate_configs
 from .prompt_loader import select_prompts, PromptEntry, PromptConfig
+from .validate import run_single_teacache
 
 
 SMOKE_PREFIX = (
@@ -225,62 +225,6 @@ def _run_calibration(unet, clip, vae, params, prompt_id):
     return entries
 
 
-def _run_teacache(unet, clip, vae, cfg: TeacacheConfig, seed, steps, sampler, sched, cfg_val):
-    """Run one TeaCache generation, returning (image, wall_time)."""
-    dm = get_diffusion_model(unet)
-    if hasattr(dm, "teacache_state"):
-        delattr(dm, "teacache_state")
-
-    original = dm._forward
-    dm._forward = teacache_anima_forward.__get__(dm, dm.__class__)
-
-    to = unet.model_options.setdefault("transformer_options", {})
-    cfg.inject_into_transformer_options(to)
-    to["enable_teacache"] = True
-
-    def tc_wrapper(model_function, kwargs):
-        c = kwargs["c"]
-        timestep = kwargs["timestep"]
-        c_to = c.setdefault("transformer_options", {})
-        sigmas = c_to.get("sample_sigmas")
-        if sigmas is not None:
-            matched = (sigmas == timestep[0]).nonzero()
-            if len(matched) > 0:
-                step_idx = matched[0].item()
-            else:
-                step_idx = 0
-                for i in range(len(sigmas) - 1):
-                    if (sigmas[i] - timestep[0]) * (sigmas[i + 1] - timestep[0]) <= 0:
-                        step_idx = i
-                        break
-            c_to["current_percent"] = step_idx / max(len(sigmas) - 1, 1)
-            c_to["enable_teacache"] = (cfg.start_percent <= c_to["current_percent"] <= cfg.end_percent)
-        return model_function(kwargs["input"], timestep, **c)
-
-    try:
-        unet.set_model_unet_function_wrapper(tc_wrapper)
-        t0 = time.time()
-        img = sample(
-            unet, clip, vae, SMOKE_FULL,
-            seed=seed, steps=steps,
-            width=512, height=512,
-            cfg=cfg_val, sampler_name=sampler, scheduler=sched,
-            negative=SMOKE_NEGATIVE,
-        )
-        dt = time.time() - t0
-    finally:
-        dm._forward = original
-        unet.set_model_unet_function_wrapper(None)
-        unet.model_options.pop("model_function_wrapper", None)
-        for k in list(to.keys()):
-            if k.startswith("tc_"):
-                del to[k]
-        to.pop("enable_teacache", None)
-        to.pop("rel_l1_thresh", None)
-        to.pop("coefficients", None)
-        to.pop("current_percent", None)
-
-    return img, dt
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -460,10 +404,13 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
         cfg_cmp = p["config"]
 
         try:
-            img, dt = _run_teacache(
-                unet, clip, vae, cfg_cmp,
+            img, dt = run_single_teacache(
+                unet, clip, vae,
+                SMOKE_FULL, SMOKE_NEGATIVE,
+                cfg_cmp,
                 seed=base_run["seed"], steps=base_run["steps"],
-                sampler=base_run["sampler"], sched=base_run["scheduler"],
+                sampler=base_run["sampler"], scheduler=base_run["scheduler"],
+                width=512, height=512,
                 cfg_val=base_run["cfg"],
             )
             su = t_base / max(dt, 0.001)
@@ -480,62 +427,10 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
     try:
         qm = QualityMetrics(tier=3)
 
-        # ── Legend ──────────────────────────────────────────────────────
-        METRIC_LEGEND = [
-            ("psnr",       "↑", "pixel-level accuracy",           35.0,  25.0),
-            ("ssim",       "↑", "structural similarity",          0.95,  0.85),
-            ("lpips_alex", "↓", "perceptual (AlexNet, semantic)", 0.05,  0.15),
-            ("lpips_vgg",  "↓", "perceptual (VGG16, texture)",    0.10,  0.25),
-            ("dists",      "↓", "structure vs texture decomp",    0.05,  0.15),
-            ("ms_ssim",    "↑", "multi-scale structural simil.",  0.97,  0.92),
-            ("fsim",       "↑", "edge sharpness (phase congru.)", 0.97,  0.90),
-            ("vif",        "↑", "information fidelity",           0.60,  0.30),
-            ("gmsd",       "↓", "gradient deviation (blur)",      0.05,  0.15),
-            ("nlpd",       "↓", "Laplacian pyramid (human vis.)", 0.10,  0.25),
-            ("pieapp",     "↓", "human pairwise preference",      0.10,  0.30),
-            ("vsi",        "↑", "visual saliency-weighted simil.", 0.97,  0.90),
-        ]
-
-        COL_METRIC = 12
-        COL_DIR    = 3
-        COL_GOOD   = 7
-        COL_MID    = 14
-        COL_POOR   = 7
-        COL_WHAT   = 35
-        SPACER = " │ "
-
-        def _legend_row(metric, dir_str, good_s, mid_s, poor_s, what_s):
-            return (f"{metric:>{COL_METRIC}}{SPACER}"
-                    f"{dir_str:^{COL_DIR}}{SPACER}"
-                    f"{good_s:>{COL_GOOD}}{SPACER}"
-                    f"{mid_s:>{COL_MID}}{SPACER}"
-                    f"{poor_s:>{COL_POOR}}{SPACER}"
-                    f"{what_s:<{COL_WHAT}}")
-
-        legend_rows = []
-        for name, direction, what, good, mid in METRIC_LEGEND:
-            if direction == "↑":
-                gs, ms, ps = f"  >{good:g}", f"  {mid:g} - {good:g}", f"  <{mid:g}"
-            else:
-                gs, ms, ps = f"  <{good:g}", f"  {good:g} - {mid:g}", f"  >{mid:g}"
-            legend_rows.append(_legend_row(name, direction, gs, ms, ps, what))
-
-        header_row = _legend_row("Metric", "↑↓", "  Good", "    Mid", "  Poor", "What it measures")
-        all_rows = [header_row] + legend_rows
-        box_width = max(len(r) for r in all_rows)
-
-        def _box_line(body, width):
-            return f"  ║ {body.ljust(width)} ║"
-
-        print(f"\n  ╔{'═' * (box_width + 2)}╗")
-        print(_box_line("HOW TO READ METRICS", box_width))
-        print(_box_line("↑ = higher is better    ↓ = lower is better", box_width))
-        print(f"  ╟{'─' * (box_width + 2)}╢")
-        print(_box_line(header_row, box_width))
-        print(f"  ╟{'─' * (box_width + 2)}╢")
-        for row in legend_rows:
-            print(_box_line(row, box_width))
-        print(f"  ╚{'═' * (box_width + 2)}╝")
+        # ── Legend (shared with validate.py) ────────────────────────────
+        print_metrics_legend()
+        # Also import the legend data for score rating
+        from .utils import METRIC_LEGEND
 
         # ── Scores — key metrics across all comparison runs ──────────────
         if qm.available:
@@ -567,50 +462,40 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
             detail_info = comparison.get(detail_key, {})
 
             excellent = acceptable = poor = 0
-            for name, direction, _, good, mid in METRIC_LEGEND:
+            for name, _, _, _, _ in METRIC_LEGEND:
                 val = detail_scores.get(name, float("nan"))
-                if val != val: continue
-                if direction == "↑":
-                    if val >= good:   excellent += 1
-                    elif val >= mid:  acceptable += 1
-                    else:             poor += 1
-                else:
-                    if val <= good:   excellent += 1
-                    elif val <= mid:  acceptable += 1
-                    else:             poor += 1
+                rating = score_from_legend(name, val)
+                if "EXCELLENT" in rating:   excellent += 1
+                elif "acceptable" in rating: acceptable += 1
+                else:                       poor += 1
 
             spd = detail_info.get("speedup", 0)
             print(f"\n  Detailed breakdown ({detail_key}, thresh={detail_info.get('thresh', '?'):.3f}, speedup={spd:.2f}x):")
             print(f"    {excellent} ✅ excellent   {acceptable} ✓ acceptable   {poor} ⚠ needs tuning\n")
 
+            COL_M = 12;  COL_D = 3;  SP = " │ "
             COL_SCORE = 8
             COL_RATING = 14
             def _score_row(metric, dir_str, score_str, rating):
-                return (f"{metric:>{COL_METRIC}}{SPACER}"
-                        f"{dir_str:^{COL_DIR}}{SPACER}"
-                        f"{score_str:>{COL_SCORE}}{SPACER}"
+                return (f"{metric:>{COL_M}}{SP}"
+                        f"{dir_str:^{COL_D}}{SP}"
+                        f"{score_str:>{COL_SCORE}}{SP}"
                         f"{rating:<{COL_RATING}}")
             score_rows = []
             for name, direction, _, good, mid in METRIC_LEGEND:
                 val = detail_scores.get(name, float("nan"))
                 score_str = f"  {val:.4f}" if val == val else "    N/A"
-                if direction == "↑":
-                    if val >= good:   rating = "✅ EXCELLENT"
-                    elif val >= mid:  rating = "✓ acceptable"
-                    else:             rating = "⚠ POOR"
-                else:
-                    if val <= good:   rating = "✅ EXCELLENT"
-                    elif val <= mid:  rating = "✓ acceptable"
-                    else:             rating = "⚠ POOR"
+                rating = score_from_legend(name, val)
                 score_rows.append(_score_row(name, direction, score_str, rating))
             score_header = _score_row("Metric", "↑↓", "  Score", "Rating")
             all_score = [score_header] + score_rows
             sw = max(len(r) for r in all_score)
+
             print(f"  ╔{'═' * (sw + 2)}╗")
-            print(_box_line(score_header, sw))
+            print(f"  ║ {' ' + score_header.ljust(sw)} ║")
             print(f"  ╟{'─' * (sw + 2)}╢")
             for row in score_rows:
-                print(_box_line(row, sw))
+                print(f"  ║ {' ' + row.ljust(sw)} ║")
             print(f"  ╚{'═' * (sw + 2)}╝")
         else:
             print(f"\n  pyiqa not installed. Install with: pip install -r tuning/requirements.txt")

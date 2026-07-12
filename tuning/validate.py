@@ -28,6 +28,7 @@ from .config_types import (
 from .utils import (
     load_models, sample, get_diffusion_model,
     compute_quality_metrics, img_to_tensor, QualityMetrics,
+    print_metrics_legend,
 )
 from .forward import teacache_anima_forward
 
@@ -86,8 +87,74 @@ def cleanup_patch(dm, unet):
     to.pop("enable_teacache", None)
     to.pop("rel_l1_thresh", None)
     to.pop("coefficients", None)
+    to.pop("current_percent", None)
+    unet.model_options.pop("model_function_wrapper", None)
     if hasattr(dm, "teacache_state"):
         delattr(dm, "teacache_state")
+
+
+def run_single_teacache(
+    unet, clip, vae,
+    prompt: str, negative: str,
+    cfg: TeacacheConfig,
+    seed: int, steps: int,
+    sampler: str, scheduler: str,
+    width: int, height: int,
+    cfg_val: float = 5.0,
+) -> tuple:
+    """Run one TeaCache generation. Returns (image, wall_time_sec).
+
+    Handles patching, step-tracking wrapper, sampling, and cleanup.
+    Used by both validate_config() and the smoke test.
+    """
+    dm = get_diffusion_model(unet)
+    if hasattr(dm, "teacache_state"):
+        delattr(dm, "teacache_state")
+
+    original = dm._forward
+    dm._forward = teacache_anima_forward.__get__(dm, dm.__class__)
+
+    to = unet.model_options.setdefault("transformer_options", {})
+    cfg.inject_into_transformer_options(to)
+    to["enable_teacache"] = True
+
+    def tc_wrapper(model_function, kwargs):
+        c = kwargs["c"]
+        timestep = kwargs["timestep"]
+        c_to = c.setdefault("transformer_options", {})
+        sigmas = c_to.get("sample_sigmas")
+        if sigmas is not None:
+            matched = (sigmas == timestep[0]).nonzero()
+            if len(matched) > 0:
+                step_idx = matched[0].item()
+            else:
+                step_idx = 0
+                for i in range(len(sigmas) - 1):
+                    if (sigmas[i] - timestep[0]) * (sigmas[i + 1] - timestep[0]) <= 0:
+                        step_idx = i
+                        break
+            c_to["current_percent"] = step_idx / max(len(sigmas) - 1, 1)
+            c_to["enable_teacache"] = (
+                cfg.start_percent <= c_to["current_percent"] <= cfg.end_percent
+            )
+        return model_function(kwargs["input"], timestep, **c)
+
+    try:
+        unet.set_model_unet_function_wrapper(tc_wrapper)
+        t0 = time.time()
+        img = sample(
+            unet, clip, vae, prompt,
+            seed=seed, steps=steps,
+            width=width, height=height,
+            cfg=cfg_val,
+            sampler_name=sampler, scheduler=scheduler,
+            negative=negative,
+        )
+        dt = time.time() - t0
+    finally:
+        cleanup_patch(dm, unet)
+
+    return img, dt
 
 
 def validate_config(
@@ -128,25 +195,16 @@ def validate_config(
             )
             t_base = time.time() - t0
 
-            # TeaCache run
-            dm = patch_with_config(unet, cfg)
-
-            try:
-                torch.cuda.empty_cache()
-                t0 = time.time()
-                img_tc = sample(
-                    unet, clip, vae, pdata["prompt"],
-                    seed=seed, steps=tcfg.sampling.get("default_steps", 30),
-                    cfg=tcfg.sampling["cfg"],
-                    sampler_name=tcfg.sampling["sampler"],
-                    scheduler=tcfg.sampling["scheduler"],
-                    width=tcfg.sampling["width"],
-                    height=tcfg.sampling["height"],
-                    negative=pdata["negative"],
-                )
-                t_tc = time.time() - t0
-            finally:
-                cleanup_patch(dm, unet)
+            # TeaCache run (shared function — same code path as smoke test)
+            img_tc, t_tc = run_single_teacache(
+                unet, clip, vae,
+                pdata["prompt"], pdata["negative"],
+                cfg,
+                seed=seed, steps=tcfg.sampling.get("default_steps", 30),
+                sampler=tcfg.sampling["sampler"], scheduler=tcfg.sampling["scheduler"],
+                width=tcfg.sampling["width"], height=tcfg.sampling["height"],
+                cfg_val=tcfg.sampling["cfg"],
+            )
 
             speedup = t_base / max(t_tc, 0.001)
             all_speedups.append(speedup)
@@ -301,6 +359,9 @@ def main():
     print(f"\n{'=' * 60}")
     print(f"  Validation Results")
     print(f"{'=' * 60}")
+
+    # Print the metric legend for context
+    print_metrics_legend()
 
     # Build dynamic header from actual metric names
     short_metrics = {

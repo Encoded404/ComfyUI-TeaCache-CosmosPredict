@@ -242,3 +242,73 @@ def get_diffusion_model(unet):
 def measure_vram() -> float:
     """Return peak VRAM usage in GB."""
     return torch.cuda.max_memory_allocated() / (1024 ** 3)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Shared metric legend (used by both validate.py and smoke_test.py)
+# ═══════════════════════════════════════════════════════════════════════════
+
+METRIC_LEGEND = [
+    ("psnr",       "↑", "pixel-level accuracy",           35.0,  25.0),
+    ("ssim",       "↑", "structural similarity",          0.95,  0.85),
+    ("lpips_alex", "↓", "perceptual (AlexNet, semantic)", 0.05,  0.15),
+    ("lpips_vgg",  "↓", "perceptual (VGG16, texture)",    0.10,  0.25),
+    ("dists",      "↓", "structure vs texture decomp",    0.05,  0.15),
+    ("ms_ssim",    "↑", "multi-scale structural simil.",  0.97,  0.92),
+    ("fsim",       "↑", "edge sharpness (phase congru.)", 0.97,  0.90),
+    ("vif",        "↑", "information fidelity",           0.60,  0.30),
+    ("gmsd",       "↓", "gradient deviation (blur)",      0.05,  0.15),
+    ("nlpd",       "↓", "Laplacian pyramid (human vis.)", 0.10,  0.25),
+    ("pieapp",     "↓", "human pairwise preference",      0.10,  0.30),
+    ("vsi",        "↑", "visual saliency-weighted simil.", 0.97,  0.90),
+]
+
+
+def print_metrics_legend():
+    """Print the HOW TO READ METRICS legend box (shared by validate + smoke test)."""
+    COL_METRIC = 12
+    COL_DIR    = 3
+    COL_GOOD   = 7
+    COL_MID    = 14
+    COL_POOR   = 7
+    COL_WHAT   = 35
+    SPACER = " │ "
+
+    def _row(metric, dir_str, gs, ms, ps, what):
+        return (f"{metric:>{COL_METRIC}}{SPACER}"
+                f"{dir_str:^{COL_DIR}}{SPACER}"
+                f"{gs:>{COL_GOOD}}{SPACER}"
+                f"{ms:>{COL_MID}}{SPACER}"
+                f"{ps:>{COL_POOR}}{SPACER}"
+                f"{what:<{COL_WHAT}}")
+
+    header = _row("Metric", "↑↓", "  Good", "    Mid", "  Poor", "What it measures")
+    rows = [header]
+    for name, direction, what, good, mid in METRIC_LEGEND:
+        if direction == "↑":
+            gs, ms, ps = f"  >{good:g}", f"  {mid:g} - {good:g}", f"  <{mid:g}"
+        else:
+            gs, ms, ps = f"  <{good:g}", f"  {good:g} - {mid:g}", f"  >{mid:g}"
+        rows.append(_row(name, direction, gs, ms, ps, what))
+
+    w = max(len(r) for r in rows)
+    print(f"\n  ╔{'═' * (w + 2)}╗")
+    print(f"  ║ {'HOW TO READ METRICS'.ljust(w)} ║")
+    print(f"  ║ {'↑ = higher is better    ↓ = lower is better'.ljust(w)} ║")
+    print(f"  ╟{'─' * (w + 2)}╢")
+    print(f"  ║ {rows[0].ljust(w)} ║")
+    print(f"  ╟{'─' * (w + 2)}╢")
+    for row in rows[1:]:
+        print(f"  ║ {row.ljust(w)} ║")
+    print(f"  ╚{'═' * (w + 2)}╝")
+
+
+def score_from_legend(name: str, val: float) -> str:
+    """Rate a metric value using the shared legend thresholds."""
+    for n, direction, _, good, mid in METRIC_LEGEND:
+        if n == name and val == val:  # val == val checks not NaN
+            if direction == "↑":
+                return "✅ EXCELLENT" if val >= good else "✓ acceptable" if val >= mid else "⚠ POOR"
+            else:
+                return "✅ EXCELLENT" if val <= good else "✓ acceptable" if val <= mid else "⚠ POOR"
+    return "N/A"
