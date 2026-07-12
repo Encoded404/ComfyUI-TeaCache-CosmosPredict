@@ -17,11 +17,16 @@ def setup_comfy_path(comfy_dir: str) -> None:
 def load_models(comfy_dir: str,     model_name: str,
                 clip_name: str,     clip_type: str,
                 vae_name: str):
-    """Load Anima UNet + CLIP + VAE via ComfyUI loaders."""
+    """Load Anima UNet + CLIP + VAE via ComfyUI's sd module directly.
+
+    Uses comfy.sd.load_diffusion_model / load_clip / load_vae instead
+    of nodes.UNETLoader / CLIPLoader / VAELoader, because this addon's
+    own nodes.py shadows ComfyUI's when doing 'import nodes'.
+    """
     setup_comfy_path(comfy_dir)
 
+    import comfy.sd
     import folder_paths
-    from comfy import nodes
 
     mdir = str(Path(comfy_dir) / "models")
     folder_paths.add_model_folder_path("diffusion_models", mdir + "/diffusion_models")
@@ -29,16 +34,46 @@ def load_models(comfy_dir: str,     model_name: str,
     folder_paths.add_model_folder_path("vae",              mdir + "/vae")
 
     print(f"[load] UNet: {model_name}")
-    unet = nodes.UNETLoader().load_unet(model_name, "default")[0]
+    unet_path = folder_paths.get_full_path_or_raise("diffusion_models", model_name)
+    unet = comfy.sd.load_diffusion_model(unet_path)
 
     print(f"[load] CLIP: {clip_name} ({clip_type})")
-    clip = nodes.CLIPLoader().load_clip(clip_name, clip_type, "default")[0]
+    clip_path = folder_paths.get_full_path_or_raise("text_encoders", clip_name)
+    clip = comfy.sd.load_clip(clip_path, clip_type=clip_type)
 
     print(f"[load] VAE: {vae_name}")
-    vae = nodes.VAELoader().load_vae(vae_name)[0]
+    vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)
+    vae = comfy.sd.load_vae(vae_path)
 
     print("[load] All models ready")
     return unet, clip, vae
+
+
+_comfy_nodes_cache = {}
+
+def _load_comfy_nodes(comfy_dir_arg=None):
+    """Load ComfyUI's nodes.py by file path, cached.
+
+    Using 'import nodes' would find this addon's nodes.py instead of
+    ComfyUI's. Loading by file path bypasses the module name conflict.
+    """
+    import importlib.util
+    if comfy_dir_arg is None:
+        dirs = [p for p in sys.path if p and p != "." and "comfy" in p.lower()]
+        if not dirs:
+            raise RuntimeError(
+                "ComfyUI directory not found in sys.path. "
+                "Run load_models() first or set PYTHONPATH."
+            )
+        comfy_dir_arg = dirs[0]
+    if comfy_dir_arg not in _comfy_nodes_cache:
+        spec = importlib.util.spec_from_file_location(
+            "comfyui_nodes", str(Path(comfy_dir_arg) / "nodes.py")
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _comfy_nodes_cache[comfy_dir_arg] = mod
+    return _comfy_nodes_cache[comfy_dir_arg]
 
 
 def sample(unet, clip, vae, prompt: str, *,
@@ -49,17 +84,21 @@ def sample(unet, clip, vae, prompt: str, *,
            width: int = 1024, height: int = 1024,
            negative: str = "",
            return_latent: bool = False):
-    """Run a full sampling pass. Returns PIL.Image (or (latent, image) tuple)."""
-    import nodes
+    """Run a full sampling pass. Returns PIL.Image (or (latent, image) tuple).
+
+    Loads ComfyUI node classes by file path to avoid the local nodes.py
+    shadowing issue.
+    """
     from PIL import Image
 
-    pos = nodes.CLIPTextEncode().encode(clip, prompt)[0]
-    neg = nodes.CLIPTextEncode().encode(clip, negative)[0]
-    latent = nodes.EmptyLatentImage().generate(width, height, 1)[0]
-    samples = nodes.KSampler().sample(
+    _nodes = _load_comfy_nodes()
+    pos = _nodes.CLIPTextEncode().encode(clip, prompt)[0]
+    neg = _nodes.CLIPTextEncode().encode(clip, negative)[0]
+    latent = _nodes.EmptyLatentImage().generate(width, height, 1)[0]
+    samples = _nodes.KSampler().sample(
         unet, seed, steps, cfg, sampler_name, scheduler, pos, neg, latent, 1.0
     )[0]
-    decoded = nodes.VAEDecode().decode(vae, samples)[0]
+    decoded = _nodes.VAEDecode().decode(vae, samples)[0]
     arr = (decoded.detach().cpu().float().numpy() * 255).clip(0, 255).astype("uint8")
     if arr.ndim == 4:
         arr = arr[0]
