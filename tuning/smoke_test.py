@@ -257,12 +257,12 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
         results.sort(key=lambda r: r["score"], reverse=True)
 
         # Build Pareto frontier — exclude configs with effectively no caching
-        # (skip_rate < 1% or speedup < 1.005x), which are just different identity
-        # configs that produce identical baseline output.
+        # and deduplicate near-identical results (same speedup/quality to 3dp).
         pareto = []
+        seen_pareto = set()
         for r in results:
             if r["skip"] < 0.01:
-                continue  # skip identity baseline equivalents
+                continue
             dominated = False
             for p in pareto:
                 if (p["speedup"] >= r["speedup"] and p["quality"] >= r["quality"]):
@@ -270,7 +270,10 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
                         dominated = True
                         break
             if not dominated:
-                pareto.append(r)
+                key = (round(r["speedup"], 3), round(r["quality"], 3))
+                if key not in seen_pareto:
+                    seen_pareto.add(key)
+                    pareto.append(r)
 
         pareto.sort(key=lambda r: r["speedup"])
 
@@ -299,6 +302,7 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
             mid = len(by_speed) // 2
             indices = sorted(set([lo, mid, hi]))
         labels = ["conservative", "balanced", "aggressive"][:n_pick]
+        picks = []
         for i, idx in enumerate(indices):
             r = pareto[idx]
             c = r["config"]
