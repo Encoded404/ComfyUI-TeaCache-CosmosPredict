@@ -167,6 +167,8 @@ def _run_calibration(unet, clip, vae, params, prompt_id):
     finally:
         dm._forward = original
         unet.set_model_unet_function_wrapper(None)
+        unet.model_options.pop("model_function_wrapper", None)
+        unet.model_options.pop("model_function_wrapper", None)
         for k in list(to.keys()):
             if k.startswith("calibration_"):
                 del to[k]
@@ -220,6 +222,7 @@ def _run_teacache(unet, clip, vae, cfg: TeacacheConfig, seed, steps, sampler, sc
     finally:
         dm._forward = original
         unet.set_model_unet_function_wrapper(None)
+        unet.model_options.pop("model_function_wrapper", None)
         for k in list(to.keys()):
             if k.startswith("tc_"):
                 del to[k]
@@ -256,16 +259,35 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
     print(f"  ComfyUI: {comfy_dir}")
     print(f"  Runs:    {len(SMOKE_RUNS)} varied (sampler, steps, cfg)")
 
-    # ── [1/6] Load models ──────────────────────────────────────────────
-    print("\n[1/6] Loading models...")
+    # ── [1/7] Load models ──────────────────────────────────────────────
+    print("\n[1/7] Loading models...")
     try:
         unet, clip, vae = load_models(comfy_dir, model_name, clip_name, clip_type, vae_name)
     except Exception as e:
         print(f"\n  FAILED to load models: {e}")
         return False
 
-    # ── [2/6] Calibration data collection ──────────────────────────────
-    print(f"\n[2/6] Collecting calibration data ({len(SMOKE_RUNS)} runs)...")
+    # ── [2/7] Baseline generation (no patching) ────────────────────────
+    base_run = SMOKE_RUNS[0]
+    print(f"\n[2/7] Baseline generation ({base_run['steps']} steps, {base_run['sampler']}, cfg={base_run['cfg']})...")
+    try:
+        t0 = time.time()
+        img_base = sample(
+            unet, clip, vae, SMOKE_PROMPT,
+            seed=base_run["seed"], steps=base_run["steps"],
+            width=512, height=512,
+            cfg=base_run["cfg"], sampler_name=base_run["sampler"],
+            scheduler=base_run["scheduler"], negative=SMOKE_NEGATIVE,
+        )
+        t_base = time.time() - t0
+        print(f"  Baseline: {t_base:.1f}s, image size: {img_base.size}")
+    except Exception as e:
+        print(f"\n  FAILED baseline generation: {e}")
+        import traceback; traceback.print_exc()
+        return False
+
+    # ── [3/7] Calibration data collection ──────────────────────────────
+    print(f"\n[3/7] Collecting calibration data ({len(SMOKE_RUNS)} runs)...")
     all_entries = []
     try:
         for i, run in enumerate(SMOKE_RUNS):
@@ -287,8 +309,8 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
         import traceback; traceback.print_exc()
         return False
 
-    # ── [3/6] Mini-optimizer ───────────────────────────────────────────
-    print(f"\n[3/6] Mini-optimizer (fitting coefficients)...")
+    # ── [4/7] Mini-optimizer ───────────────────────────────────────────
+    print(f"\n[4/7] Mini-optimizer (fitting coefficients)...")
     try:
         candidates = []
         for source in ["first_block_shift", "t_emb"]:
@@ -340,28 +362,8 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
         import traceback; traceback.print_exc()
         return False
 
-    # ── [4/6] Baseline + TeaCache generation ───────────────────────────
-    print(f"\n[4/6] Baseline + TeaCache generation...")
-    base_run = SMOKE_RUNS[0]
-
-    # Baseline (no patching)
-    try:
-        t0 = time.time()
-        img_base = sample(
-            unet, clip, vae, SMOKE_PROMPT,
-            seed=base_run["seed"], steps=base_run["steps"],
-            width=512, height=512,
-            cfg=base_run["cfg"], sampler_name=base_run["sampler"],
-            scheduler=base_run["scheduler"], negative=SMOKE_NEGATIVE,
-        )
-        t_base = time.time() - t0
-        print(f"  Baseline:  {t_base:.1f}s  ({base_run['steps']} steps, {base_run['sampler']}, cfg={base_run['cfg']})")
-    except Exception as e:
-        print(f"\n  FAILED baseline: {e}")
-        import traceback; traceback.print_exc()
-        return False
-
-    # TeaCache with tuned config
+    # ── [5/7] TeaCache with tuned coefficients ────────────────────────
+    print(f"\n[5/7] TeaCache with tuned config...")
     try:
         img_tc, t_tc = _run_teacache(
             unet, clip, vae, best_cfg,
@@ -374,12 +376,12 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
               f"thresh={best_cfg.rel_l1_thresh:.3f}, "
               f"src={best_cfg.source}, {best_cfg.metric_type}, {best_cfg.mapping_type})")
     except Exception as e:
-        print(f"\n  FAILED TeaCache forward: {e}")
+        print(f"\n  FAILED TeaCache: {e}")
         import traceback; traceback.print_exc()
         return False
 
-    # ── [5/6] Quality check ────────────────────────────────────────────
-    print(f"\n[5/6] Quality check (all 12 metrics, Tier 3)...")
+    # ── [6/7] Quality check ────────────────────────────────────────────
+    print(f"\n[6/7] Quality check (all 12 metrics, Tier 3)...")
     try:
         qm = QualityMetrics(tier=3)
 
@@ -502,9 +504,9 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
     except Exception as e:
         print(f"  Could not compute metrics: {e}")
 
-    # ── [6/6] Summary ──────────────────────────────────────────────────
+    # ── [7/7] Summary ──────────────────────────────────────────────────
     print(f"\n{'=' * 60}")
-    print(f"  Smoke test PASSED — all {6} checks completed")
+    print(f"  Smoke test PASSED — all 7 checks completed")
     print(f"  Ready for full calibration run:")
     print(f"    PYTHONPATH='.:custom_nodes/ComfyUI-TeaCache-CosmosPredict'")
     print(f"    python -m tuning.calibrate --comfy-dir .")
