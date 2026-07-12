@@ -101,17 +101,19 @@ def make_calibration_forward(source_hint: str = "all"):
         step_fraction = current_step / max(total_steps - 1, 1)
 
         # ── Initialize calibration state ──
+        # Always init both cond slots [0, 1] since CFG passes them
+        # separately (cond_or_uncond can be [0] or [1] on different calls).
         if not hasattr(self, "_calib_state"):
-            self._calib_state = {
-                k: {
+            self._calib_state = {}
+        for i, k in enumerate(cond_or_uncond):
+            if k not in self._calib_state:
+                self._calib_state[k] = {
                     "prev_t_emb": None,
                     "prev_shift": None,
                     "prev_latent": None,
                     "prev_out": None,
                     "prev_residual": None,
                 }
-                for k in cond_or_uncond
-            }
         if not hasattr(self, "calibration_log"):
             self.calibration_log = []
 

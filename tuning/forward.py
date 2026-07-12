@@ -319,15 +319,15 @@ def teacache_anima_forward(
     b = int(x_B_T_H_W_D.shape[0] / len(cond_or_uncond))
 
     if not hasattr(self, "teacache_state"):
-        self.teacache_state = {
-            k: {
+        self.teacache_state = {}
+    for k in cond_or_uncond:
+        if k not in self.teacache_state:
+            self.teacache_state[k] = {
                 "accumulated": 0.0,
                 "should_calc": True,
                 "prev_mod": None,
                 "prev_residual": None,
             }
-            for k in cond_or_uncond
-        }
 
     # ── 3b. Determine current step index ──
     sigmas = transformer_options.get("sample_sigmas", None)
