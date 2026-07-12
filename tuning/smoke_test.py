@@ -66,7 +66,10 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
         img_base = sample(
             unet, clip, vae, SMOKE_PROMPT,
             seed=42, steps=steps,
-            width=1024, height=1024,
+            width=512, height=512,
+            cfg=5.5,
+            sampler_name="dpmpp_2m_sde",
+            scheduler="normal",
             negative=SMOKE_NEGATIVE,
         )
         t_base = time.time() - t0
@@ -120,7 +123,10 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
             img_calib = sample(
                 unet, clip, vae, SMOKE_PROMPT,
                 seed=42, steps=steps,
-                width=1024, height=1024,
+                width=512, height=512,
+                cfg=7.5,
+                sampler_name="dpmpp_2m_sde",
+                scheduler="normal",
                 negative=SMOKE_NEGATIVE,
             )
 
@@ -202,7 +208,10 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
             img_tc = sample(
                 unet, clip, vae, SMOKE_PROMPT,
                 seed=42, steps=steps,
-                width=1024, height=1024,
+                width=512, height=512,
+                cfg=5.5,
+                sampler_name="dpmpp_2m_sde",
+                scheduler="normal",
                 negative=SMOKE_NEGATIVE,
             )
             t_tc = time.time() - t0
