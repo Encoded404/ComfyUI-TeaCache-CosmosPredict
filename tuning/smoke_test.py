@@ -233,15 +233,99 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
         return False
 
     # ── 5. Quality check ──
-    print(f"\n[5/5] Quality check (multimetric, Tier 1)...")
+    print(f"\n[5/5] Quality check (all 12 metrics, Tier 3)...")
     try:
-        qm = QualityMetrics(tier=1)
-        scores = qm.measure(img_tc, img_base)
+        qm = QualityMetrics(tier=3)
+
+        # ── Legend ──────────────────────────────────────────────────────
+        # (name,  dir↑↓, what it measures,  good_thresh, mid_thresh)
+        # For ↑ metrics: good >= thresh, mid >= thresh, else bad
+        # For ↓ metrics: good <= thresh, mid <= thresh, else bad
+        METRIC_LEGEND = [
+            ("psnr",       "↑", "pixel-level accuracy",           35.0,  25.0),
+            ("ssim",       "↑", "structural similarity",          0.95,  0.85),
+            ("lpips_alex", "↓", "perceptual (AlexNet, semantic)", 0.05,  0.15),
+            ("lpips_vgg",  "↓", "perceptual (VGG16, texture)",    0.10,  0.25),
+            ("dists",      "↓", "structure vs texture decomp",    0.05,  0.15),
+            ("ms_ssim",    "↑", "multi-scale structural simil.",  0.97,  0.92),
+            ("fsim",       "↑", "edge sharpness (phase congru.)", 0.97,  0.90),
+            ("vif",        "↑", "information fidelity",           0.60,  0.30),
+            ("gmsd",       "↓", "gradient deviation (blur)",      0.05,  0.15),
+            ("nlpd",       "↓", "Laplacian pyramid (human vis.)", 0.10,  0.25),
+            ("pieapp",     "↓", "human pairwise preference",      0.10,  0.30),
+            ("vsi",        "↑", "visual saliency-weighted simil.", 0.97,  0.90),
+        ]
+
+        print(f"\n  ╔{'═' * 76}╗")
+        print(f"  ║  HOW TO READ METRICS                                             ║")
+        print(f"  ║  ↑ = higher is better    ↓ = lower is better                     ║")
+        print(f"  ╟{'─' * 76}╢")
+        print(f"  ║ {'Metric':>12} │ dir │ {'Good':>6} │ {'Mid':>6} │ {'Poor':>6} │ What it measures              ║")
+        print(f"  ╟{'─' * 76}╢")
+        for name, direction, what, good, mid in METRIC_LEGEND:
+            if direction == "↑":
+                gs, ms, ps = f">{good}", f"{mid}-{good}", f"<{mid}"
+            else:
+                gs, ms, ps = f"<{good}", f"{good}-{mid}", f">{mid}"
+            print(f"  ║ {name:>12} │  {direction}  │ {gs:>6} │ {ms:>6} │ {ps:>6} │ {what:<28}║")
+        print(f"  ╚{'═' * 76}╝")
+
+        # ── Scores ──────────────────────────────────────────────────────
         if qm.available:
-            for name in qm.metric_names():
-                print(f"  {name:>12}: {scores.get(name, float('nan')):.4f}")
+            scores = qm.measure(img_tc, img_base)
+
+            # Summary line
+            excellent = 0
+            acceptable = 0
+            poor = 0
+            for name, direction, _, good, mid in METRIC_LEGEND:
+                val = scores.get(name, float("nan"))
+                if val != val:  # NaN
+                    continue
+                if direction == "↑":
+                    if val >= good:
+                        excellent += 1
+                    elif val >= mid:
+                        acceptable += 1
+                    else:
+                        poor += 1
+                else:
+                    if val <= good:
+                        excellent += 1
+                    elif val <= mid:
+                        acceptable += 1
+                    else:
+                        poor += 1
+
+            print(f"\n  TeaCache vs Baseline ({qm.tier} tiers):")
+            print(f"    {excellent} ✅ excellent   {acceptable} ✓ acceptable   {poor} ⚠ needs tuning\n")
+
+            print(f"  {'Metric':>12} │ dir │ {'Score':>8} │ {'Rating':^14}")
+            print(f"  {'─' * 12}─┼─────┼─{'─' * 8}─┼─{'─' * 14}")
+            for name, direction, _, good, mid in METRIC_LEGEND:
+                val = scores.get(name, float("nan"))
+                if direction == "↑":
+                    if val >= good:
+                        rating = "✅ EXCELLENT"
+                    elif val >= mid:
+                        rating = "✓ acceptable"
+                    else:
+                        rating = "⚠ POOR"
+                else:
+                    if val <= good:
+                        rating = "✅ EXCELLENT"
+                    elif val <= mid:
+                        rating = "✓ acceptable"
+                    else:
+                        rating = "⚠ POOR"
+                print(f"  {name:>12} │  {direction}  │ {val:>8.4f} │ {rating:^14}")
+
+            print(f"\n  Expect many ⚠ at this stage — the config is not yet tuned.")
+            print(f"  Calibration (Phase 1) + Optimization (Phase 2) will find")
+            print(f"  the coefficients that push most metrics into ✅ range.")
         else:
             psnr, ssim, lpips = compute_quality_metrics(img_tc, img_base)
+            print(f"\n  pyiqa not installed. Legacy fallback:")
             print(f"  PSNR:  {psnr:.2f}")
             print(f"  SSIM:  {ssim:.4f}")
             print(f"  LPIPS: {lpips:.4f}")
