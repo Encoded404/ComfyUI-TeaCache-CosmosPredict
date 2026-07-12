@@ -365,7 +365,8 @@ def optimize(configs: List[TeacacheConfig],
     for i, cfg in enumerate(configs):
         if cfg.mapping_type == "polynomial":
             cfg.coefficients = fit_polynomial_coefficients(
-                train_entries, cfg, degree=opt.get("poly_degree", 4)
+                train_entries, cfg, degree=opt.get("poly_degree", 4),
+                quiet=True,
             )
 
         if do_cv:
@@ -389,13 +390,15 @@ def optimize(configs: List[TeacacheConfig],
         if do_log and (i + 1) != last_log:
             last_log = i + 1
             eta = elapsed / (i + 1) * (total - i - 1) if i > 0 else 0
-            print(f"  [{i+1:>5d}/{total}] "
+            print(f"\r  [{i+1:>5d}/{total}] "
                   f"{(i+1)/total*100:5.1f}%  "
                   f"elapsed={elapsed:.0f}s  ETA={eta:.0f}s  "
                   f"last: src={cfg.source} {cfg.metric_type} {cfg.mapping_type} "
-                  f"skip={skip_rate:.1%} sp={speedup:.2f}x score={score:.3f}")
+                  f"skip={skip_rate:.1%} sp={speedup:.2f}x score={score:.3f}",
+                  end="", flush=True)
 
     elapsed = time_mod.time() - t0
+    print()  # newline after progress bar
     print(f"  Complete: {elapsed:.1f}s ({elapsed/total*1000:.1f} ms per config)")
 
     results.sort(key=lambda r: r.score, reverse=True)
