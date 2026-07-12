@@ -23,6 +23,8 @@ import sys
 import time
 from pathlib import Path
 
+import torch
+
 from .config_types import CalibrationEntry, TuningConfig
 from .utils import load_models, sample, get_diffusion_model
 from .recorder import make_calibration_forward
