@@ -102,6 +102,8 @@ def select_prompts(
       random:            Random selection
       tag_diversity:     Greedy selection maximizing unique tag coverage
       text_diversity:    Greedy selection maximizing lexical (word-level) diversity
+      semantic_diversity:Greedy selection maximizing semantic diversity via
+                         sentence-transformers all-MiniLM-L6-v2 (80 MB, CPU)
       tag_filter:        Only include prompts matching specific tags
                          (prefix tag with - to exclude, e.g. ["character", "-nsfw"])
       weighted_random:   Weight by prompt position (favor early entries)
@@ -130,6 +132,9 @@ def select_prompts(
 
     if method == "text_diversity":
         return _select_text_diversity(pool, count, rng)
+
+    if method == "semantic_diversity":
+        return _select_semantic_diversity(pool, count, rng)
 
     if method == "weighted_random":
         weights = [max(len(pool) - i, 1) for i in range(len(pool))]
@@ -281,104 +286,82 @@ def _select_text_diversity(
     return selected
 
 
+_semantic_model = None
+
+def _get_semantic_model():
+    """Lazy-load the sentence-transformers MiniLM model (80 MB, CPU)."""
+    global _semantic_model
+    if _semantic_model is None:
+        from sentence_transformers import SentenceTransformer
+        _semantic_model = SentenceTransformer("all-MiniLM-L6-v2")
+    return _semantic_model
+
+
+def _select_semantic_diversity(
+    pool: List[PromptEntry], count: int, rng: random.Random
+) -> List[PromptEntry]:
+    """Greedy selection maximizing semantic diversity via MiniLM embeddings.
+
+    Encodes each prompt into a 384-dim embedding vector using the
+    all-MiniLM-L6-v2 model (80 MB, runs on CPU, ~1000 prompts/sec).
+    Picks prompts that are maximally distant in cosine space from all
+    already-selected prompts.
+
+    This catches semantic drift that lexical (word-level) methods miss:
+    e.g. "samurai in bamboo forest at dawn" vs "elf archer in woods at
+    sunrise" — lexically different but semantically similar.
+    """
+    import numpy as np
+
+    count = min(count, len(pool))
+    if count <= 1:
+        return [pool[rng.randint(0, len(pool) - 1)]]
+
+    model = _get_semantic_model()
+    texts = [p.text for p in pool]
+    embs = np.asarray(model.encode(texts, convert_to_numpy=True), dtype=np.float64)
+
+    # Normalize to unit vectors
+    norms = np.linalg.norm(embs, axis=1, keepdims=True)
+    embs = embs / np.maximum(norms, 1e-8)
+
+    # Start with a random prompt, then greedily pick the most distant
+    remaining = list(range(len(pool)))
+    first = rng.randint(0, len(remaining))
+    selected = [remaining.pop(first)]
+
+    for _ in range(count - 1):
+        best_idx = 0
+        best_dist = 2.0  # worst cosine distance (cosine similarity ∈ [-1, 1], so dist ∈ [0, 2])
+        for j, i in enumerate(remaining):
+            # Minimum cosine similarity to any already-selected prompt
+            min_sim = max(float(np.dot(embs[i], embs[s])) for s in selected)
+            if min_sim < best_dist:
+                best_dist = min_sim
+                best_idx = j
+        selected.append(remaining.pop(best_idx))
+
+    return [pool[i] for i in selected]
+
+
 # ══════════════════════════════════════════════════════════════════════
-#  SEMANTIC DIVERSITY (LLM-BASED) — investigation
+#  How the three diversity methods compare
 # ══════════════════════════════════════════════════════════════════════
 #
-# Text-based Jaccard diversity only captures lexical overlap (shared
-# words). Two prompts can be lexically different but semantically
-# similar (e.g., "samurai in forest at dawn" vs "elf archer in woods
-# at sunrise"). An embedding model would catch this.
+#  tag_diversity:        "elf archer, forest, character" vs
+#                        "dragon, landscape, sunset"     → different tags, good
+#                        "girl, silver hair, cherry" vs
+#                        "woman, platinum hair, sakura"  → SAME tags, misses drift
 #
-# === Option A: Use ComfyUI's already-loaded CLIP model ===
+#  text_diversity:       "samurai katana bamboo" vs
+#                        "dragon medieval castle"       → different words, good
+#                        "girl silver cherry blossom" vs
+#                        "woman platinum sakura petals" → different words, catches
 #
-# Anima loads qwen_image CLIP (~1.5GB on GPU). We could encode prompts
-# through CLIP's text encoder and use cosine similarity between the
-# pooled embeddings for diversity selection.
-#
-#   def _get_clip_embeddings(clip, texts) -> np.ndarray:
-#       import numpy as np
-#       embs = []
-#       for t in texts:
-#           tokens = clip.tokenize(t)
-#           emb = clip.encode_from_tokens_scheduled(tokens)
-#           embs.append(emb.flatten().cpu().numpy())
-#       return np.vstack(embs)
-#
-#   def _select_semantic_diversity(pool, count, rng, clip):
-#       texts = [p.text for p in pool]
-#       embs = _get_clip_embeddings(clip, texts)
-#       norms = np.linalg.norm(embs, axis=1)
-#       ...
-#
-# Pros: zero new dependencies, CLIP already loaded
-# Cons: GPU-heavy for many prompts, requires passing CLIP to loader,
-#       CLIP embeddings optimized for image-text alignment, not
-#       specifically for prompt-to-prompt similarity
-#
-# === Option B: Small sentence-transformers model (CPU) ===
-#
-#   pip install sentence-transformers
-#   model = SentenceTransformer('all-MiniLM-L6-v2')  # 80 MB download
-#   embeddings = model.encode(texts)  # 384-dim vectors
-#
-# Pros: trivial integration, 80 MB, runs on CPU, ~1000 prompts/sec,
-#       specifically trained for semantic textual similarity
-# Cons: adds sentence-transformers + torch dependency (~200 MB extra),
-#       but torch is already installed via ComfyUI
-#
-# === Option C: FastText / GloVe word vectors (CPU) ===
-#
-# Average word vectors → sentence vector. ~100MB download, no
-# sentence-transformers dependency. Lower quality than transformers
-# but much smaller footprint.
-#
-#   pip install fasttext  # or use glove vectors
-#   import fasttext.util
-#   ft = fasttext.load_model('cc.en.300.bin')
-#
-# === Recommendation ===
-#
-# Option B (sentence-transformers/MiniLM) is the best tradeoff:
-# - The model is tiny (80 MB) and downloads automatically on first use
-# - CPU inference is fast enough for prompt selection (not in hot path)
-# - The embeddings are specifically trained for semantic similarity
-# - It would be a one-time dependency installed in smoke_test preamble
-#
-# Implementation sketch (add to prompt_loader.py):
-#
-#   _semantic_model = None
-#
-#   def _get_semantic_model():
-#       global _semantic_model
-#       if _semantic_model is None:
-#           from sentence_transformers import SentenceTransformer
-#           _semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
-#       return _semantic_model
-#
-#   def _select_semantic_diversity(pool, count, rng):
-#       model = _get_semantic_model()
-#       texts = [p.text for p in pool]
-#       import numpy as np
-#       embs = np.asarray(model.encode(texts, convert_to_numpy=True))
-#       norms = np.linalg.norm(embs, axis=1, keepdims=True)
-#       embs = embs / np.maximum(norms, 1e-8)
-#
-#       selected = [0]
-#       for _ in range(count - 1):
-#           best_idx = -1
-#           best_dist = 2.0  # worst cosine dist
-#           for i in range(len(pool)):
-#               if i in selected: continue
-#               min_sim = max(np.dot(embs[i], embs[s]) for s in selected)
-#               if min_sim < best_dist:
-#                   best_dist = min_sim
-#                   best_idx = i
-#           selected.append(best_idx)
-#       return [pool[i] for i in selected]
-#
-# To enable: add "semantic_diversity" to the method dispatch in
-# select_prompts() and add sentence-transformers to requirements.txt.
+#  semantic_diversity:   "samurai bamboo forest dawn" vs
+#                        "elf archer woods sunrise"    → semantic similarity caught
+#                        across entirely different words. Best for catching
+#                        latent conceptual overlap that tags and words miss.
 
 
 # ── File I/O ─────────────────────────────────────────────────────────

@@ -3,8 +3,12 @@
 # pre-installed. These are additional packages needed for calibration,
 # optimization, and validation.
 
-# Quality metrics (PSNR, SSIM, LPIPS) — needed by validate.py
+# Quality metrics (PSNR, SSIM, LPIPS) — needed by validate.py, smoke test
 pyiqa>=0.1.12
+
+# Semantic prompt diversity — needed by prompt_loader when
+# prompt_selection is "semantic_diversity" (80 MB model, CPU only)
+sentence-transformers>=3.0
 
 # Core numerical dependencies (already in ComfyUI, listed for completeness)
 numpy>=1.26
