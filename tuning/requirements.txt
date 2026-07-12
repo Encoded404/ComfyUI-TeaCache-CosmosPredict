@@ -1,0 +1,11 @@
+# Requirements for the TeaCache Anima tuning toolkit.
+# The ComfyUI environment itself (torch, comfy, etc.) is expected to be
+# pre-installed. These are additional packages needed for calibration,
+# optimization, and validation.
+
+# Quality metrics (PSNR, SSIM, LPIPS) — needed by validate.py
+pyiqa>=0.1.12
+
+# Core numerical dependencies (already in ComfyUI, listed for completeness)
+numpy>=1.26
+torch>=2.4
