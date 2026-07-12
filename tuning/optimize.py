@@ -16,10 +16,16 @@ Usage:
     python -m tuning.optimize --data outputs/20260711-120000/calibration_data.jsonl
 """
 
+# ── Prevent BLAS thread contention in multiprocessing workers ───────
+# Must be set BEFORE importing numpy (or torch, which imports numpy)
+import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
 import argparse
 import json
 import math
-import os
 import sys
 import time as time_mod
 from pathlib import Path
@@ -89,9 +95,6 @@ _worker_opt = {}
 
 def _init_worker(shared_entries, shared_poly_cache, shared_opt):
     """Called once per worker process to share read-only calibration data."""
-    os.environ.setdefault("OMP_NUM_THREADS", "1")
-    os.environ.setdefault("MKL_NUM_THREADS", "1")
-
     global _worker_entries, _worker_poly_cache, _worker_opt
     _worker_entries = shared_entries
     _worker_poly_cache = shared_poly_cache
@@ -468,9 +471,12 @@ def optimize(configs: List[TeacacheConfig],
 
     if use_parallel:
         n_workers = min(os.cpu_count() or 4, 16)
-        chunksz = max(50, min(2000, int(0.1 * len(sim_entries) // 100)))
+        # Aim for ~20-30 IPC rounds total. Each chunk should be 0.5-2s
+        # of work so pickle/transfer overhead is negligible.
+        chunksz = max(50, min(5000, total // (n_workers * 25)))
         print(f"  [parallel] {n_workers} workers × {total} configs, "
-              f"chunksize={chunksz} ({iter_count//1_000_000}M entry-iterations)")
+              f"chunksize={chunksz} ({iter_count//1_000_000}M entry-iterations, "
+              f"~{total/(n_workers*chunksz):.0f} rounds)")
 
         indexed = list(enumerate(configs))
         import multiprocessing as mp
