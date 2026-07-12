@@ -479,6 +479,7 @@ def optimize(configs: List[TeacacheConfig],
               f"~{total/(n_workers*chunksz):.0f} rounds)")
 
         indexed = list(enumerate(configs))
+        done_count = 0
         import multiprocessing as mp
         ctx = mp.get_context("spawn")
         with ctx.Pool(
@@ -495,15 +496,15 @@ def optimize(configs: List[TeacacheConfig],
                     config=cfg, skip_rate=skip, estimated_speedup=sp,
                     accumulated_error=err, score=score,
                 )
-                # Progress
-                done = sum(1 for r in results if r is not None)
+                # Progress — O(1) counter, NOT O(N) scan
+                done_count += 1
                 elapsed = time_mod.time() - t0
-                do_log = done % 50 == 0 or done == 1 or done == total
-                if do_log and done != last_log:
-                    last_log = done
-                    eta = elapsed / done * (total - done) if done > 0 else 0
-                    print(f"\r  [{done:>5d}/{total}] "
-                          f"{done/total*100:5.1f}%  "
+                do_log = done_count % 50 == 0 or done_count == 1 or done_count == total
+                if do_log and done_count != last_log:
+                    last_log = done_count
+                    eta = elapsed / done_count * (total - done_count) if done_count > 0 else 0
+                    print(f"\r  [{done_count:>5d}/{total}] "
+                          f"{done_count/total*100:5.1f}%  "
                           f"elapsed={elapsed:.0f}s  ETA={eta:.0f}s  "
                           f"[{n_workers} workers]  "
                           f"sp={sp:.2f}x  score={score:.3f}",
