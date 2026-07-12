@@ -19,7 +19,9 @@ Usage:
 import argparse
 import json
 import math
+import os
 import sys
+import time as time_mod
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -28,6 +30,86 @@ import numpy as np
 from .config_types import (
     CalibrationEntry, TeacacheConfig, OptimizationResult, TuningConfig,
 )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Pre-computed polynomial fit cache
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _poly_fit_key(cfg: TeacacheConfig) -> tuple:
+    """Return a hashable key for the polynomial fit that this config needs."""
+    return (
+        cfg.source,
+        cfg.metric_type,
+        tuple(sorted(cfg.metric_weights.items())),
+        cfg.signal_scale,
+    )
+
+
+def precompute_polyfits(
+    configs: List[TeacacheConfig],
+    entries: List[CalibrationEntry],
+    poly_degree: int = 4,
+) -> Dict[tuple, list]:
+    """Fit polynomial coefficients for every unique (source, metric, scale) combo.
+
+    Only configs with mapping_type="polynomial" are fitted. Identity,
+    power_law, and softplus configs don't need coefficients.
+    """
+    unique_keys = set()
+    for cfg in configs:
+        if cfg.mapping_type == "polynomial":
+            unique_keys.add(_poly_fit_key(cfg))
+
+    cache = {}
+    for key in sorted(unique_keys):
+        # Create a dummy config with the right fields for fitting
+        dummy = TeacacheConfig(
+            source=key[0],
+            metric_type=key[1],
+            metric_weights=dict(key[2]),
+            signal_scale=key[3],
+            mapping_type="polynomial",
+        )
+        coefs = fit_polynomial_coefficients(
+            entries, dummy, degree=poly_degree, quiet=True
+        )
+        cache[key] = coefs
+    return cache
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Multiprocessing worker (module-level for pickling)
+# ═══════════════════════════════════════════════════════════════════════════
+
+_worker_entries = None
+_worker_poly_cache = None
+_worker_opt = {}
+
+
+def _init_worker(shared_entries, shared_poly_cache, shared_opt):
+    """Called once per worker process to share read-only calibration data."""
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+
+    global _worker_entries, _worker_poly_cache, _worker_opt
+    _worker_entries = shared_entries
+    _worker_poly_cache = shared_poly_cache
+    _worker_opt = shared_opt
+
+
+def _process_config(idx_and_cfg: tuple) -> tuple:
+    """Process a single config in a worker process. Returns (idx, skip, err, sp, qp)."""
+    idx, cfg = idx_and_cfg
+    global _worker_entries, _worker_poly_cache, _worker_opt
+
+    # Look up pre-computed coefficients
+    if cfg.mapping_type == "polynomial":
+        key = _poly_fit_key(cfg)
+        cfg.coefficients = _worker_poly_cache.get(key, [])
+
+    skip, err, sp, qp = simulate_config(_worker_entries, cfg)
+    return idx, skip, err, sp, qp
 from .forward import (
     compute_distance, apply_mapping, accumulate_distance,
     step_schedule_multiplier,
@@ -338,7 +420,6 @@ def optimize(configs: List[TeacacheConfig],
     fits polynomial on train set, evaluates on holdout set.
     """
     import random
-    import time as time_mod
     opt = tcfg.optimization
     results: List[OptimizationResult] = []
     t0 = time_mod.time()
@@ -361,45 +442,98 @@ def optimize(configs: List[TeacacheConfig],
 
     total = len(configs)
     last_log = 0
+    sim_entries = holdout_entries if do_cv else entries
 
-    for i, cfg in enumerate(configs):
-        if cfg.mapping_type == "polynomial":
-            cfg.coefficients = fit_polynomial_coefficients(
-                train_entries, cfg, degree=opt.get("poly_degree", 4),
-                quiet=True,
+    # ── Pre-compute all unique polynomial fits ──────────────────────────
+    t_pre = time_mod.time()
+    poly_cache = precompute_polyfits(
+        configs, train_entries,
+        poly_degree=opt.get("poly_degree", 4),
+    )
+    n_fits = len(poly_cache)
+    t_pre_elapsed = time_mod.time() - t_pre
+    if n_fits:
+        print(f"  [precompute] {n_fits} unique polynomial fits "
+              f"in {t_pre_elapsed:.1f}s "
+              f"({t_pre_elapsed/max(n_fits,1)*1000:.0f}ms each)")
+
+    results = [None] * total
+
+    # ── Decide serial vs parallel ───────────────────────────────────────
+    # Only use multiprocessing when the total work is large enough
+    # that spawn/pickle overhead is worth it. Rough heuristic: 10M
+    # entry-iterations (≈2s of serial work).
+    iter_count = total * len(sim_entries)
+    use_parallel = iter_count > 10_000_000  # ~10M → ~2s serial
+
+    if use_parallel:
+        n_workers = min(os.cpu_count() or 4, 16)
+        chunksz = max(50, min(2000, int(0.1 * len(sim_entries) // 100)))
+        print(f"  [parallel] {n_workers} workers × {total} configs, "
+              f"chunksize={chunksz} ({iter_count//1_000_000}M entry-iterations)")
+
+        indexed = list(enumerate(configs))
+        import multiprocessing as mp
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(
+            processes=n_workers,
+            initializer=_init_worker,
+            initargs=(sim_entries, poly_cache, opt),
+        ) as pool:
+            for idx, skip, err, sp, qp in pool.imap_unordered(
+                _process_config, indexed, chunksize=chunksz
+            ):
+                cfg = configs[idx]
+                score = sp * qp
+                results[idx] = OptimizationResult(
+                    config=cfg, skip_rate=skip, estimated_speedup=sp,
+                    accumulated_error=err, score=score,
+                )
+                # Progress
+                done = sum(1 for r in results if r is not None)
+                elapsed = time_mod.time() - t0
+                do_log = done % 50 == 0 or done == 1 or done == total
+                if do_log and done != last_log:
+                    last_log = done
+                    eta = elapsed / done * (total - done) if done > 0 else 0
+                    print(f"\r  [{done:>5d}/{total}] "
+                          f"{done/total*100:5.1f}%  "
+                          f"elapsed={elapsed:.0f}s  ETA={eta:.0f}s  "
+                          f"[{n_workers} workers]  "
+                          f"sp={sp:.2f}x  score={score:.3f}",
+                          end="", flush=True)
+    else:
+        # ── Serial (fast enough for small workloads) ────────────────────
+        for i, cfg in enumerate(configs):
+            if cfg.mapping_type == "polynomial":
+                cfg.coefficients = poly_cache.get(_poly_fit_key(cfg), [])
+
+            skip_rate, avg_error, speedup, quality = simulate_config(
+                sim_entries, cfg
+            )
+            score = speedup * quality
+            results[i] = OptimizationResult(
+                config=cfg, skip_rate=skip_rate, estimated_speedup=speedup,
+                accumulated_error=avg_error, score=score,
             )
 
-        if do_cv:
-            skip_rate, avg_error, speedup, quality = simulate_config(holdout_entries, cfg)
-        else:
-            skip_rate, avg_error, speedup, quality = simulate_config(entries, cfg)
-
-        score = speedup * quality
-
-        results.append(OptimizationResult(
-            config=cfg,
-            skip_rate=skip_rate,
-            estimated_speedup=speedup,
-            accumulated_error=avg_error,
-            score=score,
-        ))
-
-        # Progress with ETA
-        elapsed = time_mod.time() - t0
-        do_log = (i + 1) % 50 == 0 or i == 0 or (i + 1) == total
-        if do_log and (i + 1) != last_log:
-            last_log = i + 1
-            eta = elapsed / (i + 1) * (total - i - 1) if i > 0 else 0
-            print(f"\r  [{i+1:>5d}/{total}] "
-                  f"{(i+1)/total*100:5.1f}%  "
-                  f"elapsed={elapsed:.0f}s  ETA={eta:.0f}s  "
-                  f"last: src={cfg.source} {cfg.metric_type} {cfg.mapping_type} "
-                  f"skip={skip_rate:.1%} sp={speedup:.2f}x score={score:.3f}",
-                  end="", flush=True)
+            elapsed = time_mod.time() - t0
+            do_log = (i + 1) % 50 == 0 or i == 0 or (i + 1) == total
+            if do_log and (i + 1) != last_log:
+                last_log = i + 1
+                eta = elapsed / (i + 1) * (total - i - 1) if i > 0 else 0
+                print(f"\r  [{i+1:>5d}/{total}] "
+                      f"{(i+1)/total*100:5.1f}%  "
+                      f"elapsed={elapsed:.0f}s  ETA={eta:.0f}s  "
+                      f"last: src={cfg.source} {cfg.metric_type} {cfg.mapping_type} "
+                      f"skip={skip_rate:.1%} sp={speedup:.2f}x score={score:.3f}",
+                      end="", flush=True)
 
     elapsed = time_mod.time() - t0
     print()  # newline after progress bar
-    print(f"  Complete: {elapsed:.1f}s ({elapsed/total*1000:.1f} ms per config)")
+    mode = "parallel" if use_parallel else "serial"
+    print(f"  Complete ({mode}): {elapsed:.1f}s "
+          f"({elapsed/total*1000:.1f} ms per config)")
 
     results.sort(key=lambda r: r.score, reverse=True)
 
