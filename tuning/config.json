@@ -10,10 +10,13 @@
         "step_variants": [25, 28, 30, 35, 40],
         "step_weights": [0.05, 0.10, 0.70, 0.10, 0.05],
         "cfg": 5.0,
-        "sampler": "euler_ancestral",
-        "scheduler": "simple",
+        "sampler": "er_sde",
+        "scheduler": "normal",
         "width": 512,
-        "height": 512
+        "height": 512,
+        "sampler_variants": ["er_sde", "dpmpp_2m_sde", "euler_a"],
+        "scheduler_variants": ["normal", "simple"],
+        "cfg_variants": [4.0, 4.5, 5.0, 5.5]
     },
 
     "calibration": {

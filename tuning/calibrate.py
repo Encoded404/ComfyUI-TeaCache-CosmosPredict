@@ -153,6 +153,13 @@ def run_calibration(comfy_dir: str, config_path: str = None):
     seeds = tcfg.calibration["seeds"]
     step_variants = tcfg.sampling["step_variants"]
     step_weights = tcfg.sampling["step_weights"]
+    sampler_variants = tcfg.sampling.get("sampler_variants", [tcfg.sampling["sampler"]])
+    scheduler_variants = tcfg.sampling.get("scheduler_variants", [tcfg.sampling["scheduler"]])
+    cfg_variants = tcfg.sampling.get("cfg_variants", [tcfg.sampling["cfg"]])
+
+    print(f"  Samplers:       {sampler_variants}")
+    print(f"  Schedulers:     {scheduler_variants}")
+    print(f"  CFGs:           {cfg_variants}")
 
     total_runs = len(prompts) * len(seeds) * len(step_variants)
     all_entries: list[CalibrationEntry] = []
@@ -161,6 +168,11 @@ def run_calibration(comfy_dir: str, config_path: str = None):
     data_file = out_dir / "calibration_data.jsonl"
 
     for pi, pdata in enumerate(prompts):
+        # Cycle sampler / scheduler / cfg per prompt for variety
+        cur_sampler  = sampler_variants[pi % len(sampler_variants)]
+        cur_scheduler = scheduler_variants[pi % len(scheduler_variants)]
+        cur_cfg       = cfg_variants[pi % len(cfg_variants)]
+
         for seed in seeds:
             for st in step_variants:
                 steps = int(st)
@@ -180,9 +192,9 @@ def run_calibration(comfy_dir: str, config_path: str = None):
                     img = sample(
                         unet, clip, vae, pdata["prompt"],
                         seed=seed, steps=steps,
-                        cfg=tcfg.sampling["cfg"],
-                        sampler_name=tcfg.sampling["sampler"],
-                        scheduler=tcfg.sampling["scheduler"],
+                        cfg=cur_cfg,
+                        sampler_name=cur_sampler,
+                        scheduler=cur_scheduler,
                         width=tcfg.sampling["width"],
                         height=tcfg.sampling["height"],
                         negative=pdata["negative"],
@@ -197,6 +209,8 @@ def run_calibration(comfy_dir: str, config_path: str = None):
                 for e in run_entries:
                     e.total_steps = steps
                     e.step_fraction = e.step / max(steps - 1, 1)
+                    e.sampler = cur_sampler
+                    e.scheduler = cur_scheduler
 
                 all_entries.extend(run_entries)
 
@@ -212,6 +226,7 @@ def run_calibration(comfy_dir: str, config_path: str = None):
                 print(
                     f"[calib] {run_idx}/{total_runs}  "
                     f"p={pi} s={seed} steps={steps}  "
+                    f"sampler={cur_sampler} cfg={cur_cfg}  "
                     f"took={dt:.1f}s  entries={len(run_entries)}  "
                     f"valid={len(valid)}  VRAM={vram:.1f}GB  ETA={eta:.0f}m"
                 )

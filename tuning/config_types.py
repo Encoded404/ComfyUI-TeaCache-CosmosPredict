@@ -164,11 +164,16 @@ class CalibrationEntry:
     out_rel_std: float = 0.0
     res_rel: float = 0.0
 
+    # Sampler/scheduler identity (for sampler-specific tuning)
+    sampler: str = ""
+    scheduler: str = ""
+
     def to_dict(self) -> dict:
         d = {
             "step": self.step, "step_fraction": self.step_fraction,
             "prompt_id": self.prompt_id, "seed": self.seed,
             "cond": self.cond, "total_steps": self.total_steps,
+            "sampler": self.sampler, "scheduler": self.scheduler,
             "out_rel": self.out_rel,
             "out_rel_max": self.out_rel_max,
             "out_rel_std": self.out_rel_std,
@@ -200,6 +205,7 @@ class CalibrationEntry:
             step=d["step"], step_fraction=d["step_fraction"],
             prompt_id=d["prompt_id"], seed=d["seed"],
             cond=d["cond"], total_steps=d["total_steps"],
+            sampler=d.get("sampler", ""), scheduler=d.get("scheduler", ""),
             t_emb=_parse_stats("t_emb"),
             shift=_parse_stats("shift"),
             latent=_parse_stats("latent"),
