@@ -160,10 +160,27 @@ def make_calibration_forward(source_hint: str = "all"):
             x_B_T_H_W_D = x_B_T_H_W_D.float()
 
         ori_x = x_B_T_H_W_D.to(cache_device)
-        for block in self.blocks:
+
+        # ── Per-block output tracking (if enabled) ──
+        track_per_block = to.get("track_per_block", False)
+        if track_per_block:
+            if not hasattr(self, "_calib_block_prev"):
+                self._calib_block_prev = [None] * len(self.blocks)
+                self._calib_block_deltas = [[] for _ in range(len(self.blocks))]
+
+        for bi, block in enumerate(self.blocks):
             x_B_T_H_W_D = block(
                 x_B_T_H_W_D, t_emb, crossattn_emb, **block_kwargs,
             )
+            if track_per_block:
+                block_out = x_B_T_H_W_D.detach().to(cache_device)
+                if self._calib_block_prev[bi] is not None:
+                    a = self._calib_block_prev[bi].flatten()
+                    b = block_out.flatten()
+                    cos_sim = float((a @ b) / (a.norm() * b.norm() + 1e-8))
+                    self._calib_block_deltas[bi].append(cos_sim)
+                self._calib_block_prev[bi] = block_out
+
         residual = (x_B_T_H_W_D.to(cache_device) - ori_x).detach()
 
         # ── Record ground truth output/residual changes ──

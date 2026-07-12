@@ -223,36 +223,61 @@ def generate_candidate_configs(tcfg: TuningConfig) -> List[TeacacheConfig]:
                     continue
 
                 for mapping_type in opt["mapping_types"]:
-                    for accum_type in opt["accumulation_types"]:
-                        for accum_params_dict in opt["accumulation_params"]:
-                            # Skip incompatible
-                            if accum_type == "hard_reset" and accum_params_dict != {}:
-                                continue
-                            if accum_type == "carry_over" and accum_params_dict != {}:
-                                continue
-                            if accum_type == "leaky" and "leak_factor" not in accum_params_dict:
-                                continue
+                    # Determine mapping params to sweep
+                    mapping_params_list = [{}]
+                    mapping_type_key = opt.get("mapping_params_scenarios", {}).get(mapping_type, [])
+                    if mapping_type_key:
+                        mapping_params_list = mapping_type_key
+                    elif mapping_type == "polynomial":
+                        mapping_params_list = [{}]  # no extra params, coefficients from fit
 
-                            for schedule in opt["step_schedules"]:
-                                scales = opt["signal_scales"].get(source, [1.0])
-                                for scale in scales:
-                                    for residual_strat in opt["residual_strategies"]:
-                                        cfg = TeacacheConfig(
-                                            source=source,
-                                            metric_type=metric_type,
-                                            metric_weights=metric_weights_scenario,
-                                            signal_scale=scale,
-                                            mapping_type=mapping_type,
-                                            coefficients=[],
-                                            accumulation_type=accum_type,
-                                            accumulation_params=accum_params_dict,
-                                            step_schedule=schedule,
-                                            start_percent=0.05,
-                                            end_percent=0.95,
-                                            residual_strategy=residual_strat,
-                                            block_mode="all_or_nothing",
-                                        )
-                                        configs.append(cfg)
+                    for mapping_params in mapping_params_list:
+                        for accum_type in opt["accumulation_types"]:
+                            for accum_params_dict in opt["accumulation_params"]:
+                                if accum_type == "hard_reset" and accum_params_dict != {}:
+                                    continue
+                                if accum_type == "carry_over" and accum_params_dict != {}:
+                                    continue
+                                if accum_type == "leaky" and "leak_factor" not in accum_params_dict:
+                                    continue
+                                if accum_type == "windowed" and "window_size" not in accum_params_dict:
+                                    continue
+
+                                for schedule in opt["step_schedules"]:
+                                    scales = opt["signal_scales"].get(source, [1.0])
+                                    for scale in scales:
+                                        for residual_strat in opt["residual_strategies"]:
+                                            res_params_list = [{}]
+                                            if residual_strat in ("blended", "scaled"):
+                                                res_params_list = opt.get("residual_params_scenarios", [{}])
+
+                                            for res_params in res_params_list:
+                                                for block_mode in opt.get("block_modes", ["all_or_nothing"]):
+                                                    block_params_list = [{}]
+                                                    block_scenarios = opt.get("block_params_scenarios", {})
+                                                    if block_mode in block_scenarios:
+                                                        block_params_list = block_scenarios[block_mode]
+
+                                                    for block_params in block_params_list:
+                                                        cfg = TeacacheConfig(
+                                                            source=source,
+                                                            metric_type=metric_type,
+                                                            metric_weights=metric_weights_scenario,
+                                                            signal_scale=scale,
+                                                            mapping_type=mapping_type,
+                                                            coefficients=[],
+                                                            mapping_params=mapping_params,
+                                                            accumulation_type=accum_type,
+                                                            accumulation_params=accum_params_dict,
+                                                            step_schedule=schedule,
+                                                            start_percent=0.05,
+                                                            end_percent=0.95,
+                                                            residual_strategy=residual_strat,
+                                                            residual_params=res_params,
+                                                            block_mode=block_mode,
+                                                            block_params=block_params,
+                                                        )
+                                                        configs.append(cfg)
 
     print(f"[candidates] Generated {len(configs)} candidate configurations")
     return configs

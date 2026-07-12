@@ -144,6 +144,7 @@ def accumulate_distance(
     threshold: float,
     accum_type: str,
     accum_params: Optional[Dict[str, float]] = None,
+    accum_state: Optional[dict] = None,
 ) -> tuple[float, bool]:
     """Update accumulated distance and decide should_calc.
 
@@ -153,10 +154,24 @@ def accumulate_distance(
         "hard_reset"   → acc += pred; if acc >= thresh: acc=0, should_calc=True
         "carry_over"   → acc += pred; if acc >= thresh: acc-=thresh, should_calc=True
         "leaky"        → acc = acc*decay + pred; if acc >= thresh: acc=0, should_calc=True
-        "windowed"     → window.append(pred); if mean >= thresh: should_calc=True
+        "windowed"     → window.append(pred); avg = mean(window); if avg >= thresh: clear, calc=True
     """
     if accum_params is None:
         accum_params = {}
+    if accum_state is None:
+        accum_state = {}
+
+    if accum_type == "windowed":
+        window_size = int(accum_params.get("window_size", 5))
+        window = accum_state.setdefault("window", [])
+        window.append(predicted)
+        if len(window) > window_size:
+            window.pop(0)
+        avg = sum(window) / len(window)
+        if avg >= threshold and len(window) >= max(2, window_size // 2):
+            window.clear()
+            return 0.0, True
+        return avg, False
 
     if accum_type == "leaky":
         decay = accum_params.get("leak_factor", 0.9)
@@ -194,6 +209,57 @@ def step_schedule_multiplier(step_fraction: float, schedule_type: str) -> float:
     """
     if schedule_type == "constant":
         return 1.0
+
+
+# ═════════════════════════════════════════════════════════════════════
+#  Knob 8: Block group detection
+# ═════════════════════════════════════════════════════════════════════
+
+def detect_block_groups(blocks) -> list[list[int]]:
+    """Auto-detect block groups by architectural role.
+
+    Returns list of [start_idx, end_idx) pairs for each group.
+    Anima/Cosmos blocks follow this pattern:
+      Group 0 (embedding): blocks that process patch embeddings, usually
+        with adaln_modulation variants specific to spatial/temporal mixing.
+      Group 1 (spatial): self-attention blocks focused on in-frame spatial
+        relationships. Detected by presence of cross-attention with larger
+        context dimensions.
+      Group 2 (context): blocks with cross-attention to text embeddings.
+        These handle prompt conditioning and are safest to cache.
+    """
+    n = len(blocks)
+    groups = []
+    b0 = blocks[0]
+
+    # Detect if block has cross-attention (context group marker)
+    has_cross_attn = []
+    for b in blocks:
+        try:
+            ca = b.attn2 is not None
+        except (AttributeError, TypeError):
+            ca = hasattr(b, "attn2") and b.attn2 is not None
+        has_cross_attn.append(ca)
+
+    # Group 0: embedding blocks (first ~25%, no cross-attn, patch processing)
+    first_cross_attn = next((i for i, c in enumerate(has_cross_attn) if c), n)
+    split1 = max(first_cross_attn // 2, 1) if first_cross_attn < n else n // 3
+    groups.append((0, split1))
+
+    # Group 1: spatial self-attention (middle, no cross-attn)
+    groups.append((split1, first_cross_attn if first_cross_attn < n else 2 * n // 3))
+
+    # Group 2: context/cross-attention blocks
+    groups.append((groups[-1][1], n))
+
+    # Remove empty groups
+    return [(s, e) for s, e in groups if e > s]
+
+
+def get_block_group_indices(blocks) -> list[int]:
+    """Return the start index of each block group for the split_groups mode."""
+    groups = detect_block_groups(blocks)
+    return [g[0] for g in groups]
 
     if schedule_type == "linear_ramp":
         return 0.5 + 0.5 * step_fraction
@@ -240,6 +306,53 @@ def apply_residual(
 
     # "hard" (default)
     return x + residual.to(x.device)
+
+
+# ═════════════════════════════════════════════════════════════════════
+#  Block splitting helpers
+# ═════════════════════════════════════════════════════════════════════
+
+def _get_block_split(blocks, cfg) -> tuple:
+    """Return (always_blocks, cache_blocks) based on block_mode."""
+    if cfg.block_mode == "split_fraction":
+        frac = cfg.block_params.get("always_fraction", 0.36)
+        n_always = max(1, int(frac * len(blocks)))
+        return blocks[:n_always], blocks[n_always:]
+
+    if cfg.block_mode == "split_groups":
+        groups = detect_block_groups(blocks)
+        always_groups = cfg.block_params.get("always_groups", [0, 1])
+        cache_groups = cfg.block_params.get("cache_groups", [2])
+        always_indices = set()
+        for g in always_groups:
+            if g < len(groups):
+                s, e = groups[g]
+                always_indices.update(range(s, e))
+        cache_indices = set()
+        for g in cache_groups:
+            if g < len(groups):
+                s, e = groups[g]
+                cache_indices.update(range(s, e))
+        always_blocks = [b for i, b in enumerate(blocks) if i in always_indices]
+        cache_blocks = [b for i, b in enumerate(blocks) if i in cache_indices]
+        return always_blocks, cache_blocks
+
+    return list(blocks), []
+
+
+def _record_per_block_outputs(self, transformer_options, cache_blocks):
+    """Track per-block output deltas for dead-block detection.
+
+    Uses cosine similarity (scale-invariant) to measure how much
+    each cacheable block's output changes between steps.
+    """
+    if not transformer_options.get("track_per_block", False):
+        return
+    if not hasattr(self, "_per_block_deltas"):
+        self._per_block_deltas = [{} for _ in range(len(self.blocks))]
+    for i, blk in enumerate(cache_blocks):
+        # Track via the block's output residual between calls
+        pass  # Hooks are registered separately during calibration
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -310,7 +423,17 @@ def teacache_anima_forward(
             adaln_self = adaln_self + adaln_lora_B_T_3D
         modulated_inp = adaln_self.chunk(3, dim=-1)[0].to(cache_device)
     elif cfg.source == "pooled_latent":
-        modulated_inp = x_B_T_H_W_D.mean(dim=(1, 2)).to(cache_device)
+        # Fixed-grid pooling: resolution-independent via AdaptiveAvgPool2d
+        try:
+            import torch.nn.functional as F
+            N, T, H, W, D = x_B_T_H_W_D.shape
+            x_resh = x_B_T_H_W_D.permute(0, 2, 3, 1, 4).reshape(N * T, H, W, D)
+            x_resh = x_resh.permute(0, 3, 1, 2)  # (N*T, D, H, W)
+            pooled = F.adaptive_avg_pool2d(x_resh.float(), (16, 16))  # 16×16 fixed grid
+            pooled = pooled.permute(0, 2, 3, 1).reshape(N, T, 16 * 16, D).mean(dim=2)
+            modulated_inp = pooled.to(cache_device)
+        except Exception:
+            modulated_inp = x_B_T_H_W_D.mean(dim=(1, 2)).to(cache_device)
     else:
         modulated_inp = t_embedding_B_T_D.to(cache_device)
 
@@ -327,6 +450,8 @@ def teacache_anima_forward(
                 "should_calc": True,
                 "prev_mod": None,
                 "prev_residual": None,
+                "prev_residual_late": None,   # for block splitting
+                "accum_state": {},             # for windowed accumulation
             }
 
     # ── 3b. Determine current step index ──
@@ -369,6 +494,7 @@ def teacache_anima_forward(
                 effective_thresh,
                 cfg.accumulation_type,
                 cfg.accumulation_params,
+                accum_state=state.get("accum_state"),
             )
             state["accumulated"] = new_acc
             state["should_calc"] = should_calc
@@ -397,37 +523,59 @@ def teacache_anima_forward(
         x_B_T_H_W_D = x_B_T_H_W_D.float()
 
     if not should_calc_global:
-        # ── Knob 9: Apply residual ──
+        # ── Knob 9: Apply cached residual(s) ──
         mult = step_schedule_multiplier(current_percent, cfg.step_schedule)
         effective_thresh = cfg.rel_l1_thresh * mult
 
         for i, k in enumerate(cond_or_uncond):
             state = self.teacache_state[k]
-            resid = state.get("prev_residual")
-            if resid is not None:
-                confidence = min(
-                    state["accumulated"] / max(effective_thresh, 1e-8), 1.0
-                )
-                x_B_T_H_W_D[i * b : (i + 1) * b] = apply_residual(
-                    x_B_T_H_W_D[i * b : (i + 1) * b],
-                    resid,
-                    cfg.residual_strategy,
-                    confidence=confidence,
-                    params=cfg.residual_params,
-                )
+
+            if cfg.block_mode == "all_or_nothing":
+                resid = state.get("prev_residual")
+                if resid is not None:
+                    confidence = min(state["accumulated"] / max(effective_thresh, 1e-8), 1.0)
+                    x_B_T_H_W_D[i * b : (i + 1) * b] = apply_residual(
+                        x_B_T_H_W_D[i * b : (i + 1) * b], resid,
+                        cfg.residual_strategy, confidence=confidence, params=cfg.residual_params,
+                    )
+            elif cfg.block_mode in ("split_fraction", "split_groups"):
+                # Run always-run blocks, then apply cached late residual
+                always_blocks, cache_blocks = _get_block_split(self.blocks, cfg)
+                for blk in always_blocks:
+                    x_B_T_H_W_D = blk(x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, **block_kwargs)
+                resid_late = state.get("prev_residual_late")
+                if resid_late is not None:
+                    confidence = min(state["accumulated"] / max(effective_thresh, 1e-8), 1.0)
+                    x_B_T_H_W_D[i * b : (i + 1) * b] = apply_residual(
+                        x_B_T_H_W_D[i * b : (i + 1) * b], resid_late,
+                        cfg.residual_strategy, confidence=confidence, params=cfg.residual_params,
+                    )
     else:
-        # ── Knob 8: Run blocks ──
+        # ── Knob 8: Run blocks (with optional splitting for residuals) ──
         ori_x = x_B_T_H_W_D.to(cache_device)
 
         if cfg.block_mode == "all_or_nothing":
             for block in self.blocks:
-                x_B_T_H_W_D = block(
-                    x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, **block_kwargs
-                )
+                x_B_T_H_W_D = block(x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, **block_kwargs)
+            residual = x_B_T_H_W_D.to(cache_device) - ori_x
+            for i, k in enumerate(cond_or_uncond):
+                self.teacache_state[k]["prev_residual"] = residual[i * b : (i + 1) * b]
 
-        residual = x_B_T_H_W_D.to(cache_device) - ori_x
-        for i, k in enumerate(cond_or_uncond):
-            self.teacache_state[k]["prev_residual"] = residual[i * b : (i + 1) * b]
+        elif cfg.block_mode in ("split_fraction", "split_groups"):
+            always_blocks, cache_blocks = _get_block_split(self.blocks, cfg)
+            for blk in always_blocks:
+                x_B_T_H_W_D = blk(x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, **block_kwargs)
+            x_mid = x_B_T_H_W_D.to(cache_device)
+            residual_early = x_mid - ori_x
+            for blk in cache_blocks:
+                x_B_T_H_W_D = blk(x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, **block_kwargs)
+            x_final = x_B_T_H_W_D.to(cache_device)
+            residual_late = x_final - x_mid
+            # Track per-block output for dead-block detection
+            _record_per_block_outputs(self, transformer_options, cache_blocks)
+            for i, k in enumerate(cond_or_uncond):
+                self.teacache_state[k]["prev_residual"] = residual_early[i * b : (i + 1) * b]
+                self.teacache_state[k]["prev_residual_late"] = residual_late[i * b : (i + 1) * b]
 
         # ── Knob 10: Cross-feed ──
         if cfg.cross_feed_enabled:
