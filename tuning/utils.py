@@ -17,16 +17,15 @@ def setup_comfy_path(comfy_dir: str) -> None:
 def load_models(comfy_dir: str,     model_name: str,
                 clip_name: str,     clip_type: str,
                 vae_name: str):
-    """Load Anima UNet + CLIP + VAE via ComfyUI's sd module directly.
+    """Load Anima UNet + CLIP + VAE via ComfyUI node classes.
 
-    Uses comfy.sd.load_diffusion_model / load_clip / load_vae instead
-    of nodes.UNETLoader / CLIPLoader / VAELoader, because this addon's
-    own nodes.py shadows ComfyUI's when doing 'import nodes'.
+    Loads node classes by file path (same as sample()) to avoid
+    this addon's nodes.py shadowing ComfyUI's.
     """
     setup_comfy_path(comfy_dir)
 
-    import comfy.sd
     import folder_paths
+    _nodes = _load_comfy_nodes(comfy_dir)
 
     mdir = str(Path(comfy_dir) / "models")
     folder_paths.add_model_folder_path("diffusion_models", mdir + "/diffusion_models")
@@ -34,16 +33,13 @@ def load_models(comfy_dir: str,     model_name: str,
     folder_paths.add_model_folder_path("vae",              mdir + "/vae")
 
     print(f"[load] UNet: {model_name}")
-    unet_path = folder_paths.get_full_path_or_raise("diffusion_models", model_name)
-    unet = comfy.sd.load_diffusion_model(unet_path)
+    unet = _nodes.UNETLoader().load_unet(model_name, "default")[0]
 
     print(f"[load] CLIP: {clip_name} ({clip_type})")
-    clip_path = folder_paths.get_full_path_or_raise("text_encoders", clip_name)
-    clip = comfy.sd.load_clip(clip_path, clip_type=clip_type)
+    clip = _nodes.CLIPLoader().load_clip(clip_name, clip_type, "default")[0]
 
     print(f"[load] VAE: {vae_name}")
-    vae_path = folder_paths.get_full_path_or_raise("vae", vae_name)
-    vae = comfy.sd.load_vae(vae_path)
+    vae = _nodes.VAELoader().load_vae(vae_name)[0]
 
     print("[load] All models ready")
     return unet, clip, vae
