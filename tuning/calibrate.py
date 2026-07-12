@@ -160,8 +160,39 @@ def run_calibration(comfy_dir: str, config_path: str = None):
     print(f"  Samplers:       {sampler_variants}")
     print(f"  Schedulers:     {scheduler_variants}")
     print(f"  CFGs:           {cfg_variants}")
+    print(f"\n  Selected prompts ({len(prompts)}):")
+    for i, pdata in enumerate(prompts):
+        sampler = sampler_variants[i % len(sampler_variants)]
+        cfg_val = cfg_variants[i % len(cfg_variants)]
+        tags = [t for t in pdata["entry"].tags[:4]] if "entry" in pdata else []
+        short = pdata["prompt"][:80].replace("\n", " ")
+        print(f"    {i:>2}: [{sampler} cfg={cfg_val}]  [{', '.join(tags)}]  {short}...")
 
     total_runs = len(prompts) * len(seeds) * len(step_variants)
+    # Estimate entries: each run produces ~ (steps - 1) × 2 cond slots
+    avg_steps = sum(step_variants) / max(len(step_variants), 1)
+    est_entries = int(total_runs * (avg_steps - 1) * 2)
+    # Estimate time: ~12s per run at 512² on V100, ~2.5s at 512² faster card
+    est_time = total_runs * 12
+
+    print(f"\n  {'─' * 56}")
+    print(f"  Run schedule")
+    print(f"  {'─' * 56}")
+    print(f"  Permutation:  {len(prompts)} prompts × {len(seeds)} seeds × {len(step_variants)} step variants")
+    print(f"                = {total_runs} total generations")
+    print(f"  Resolution:   {tcfg.sampling['width']}×{tcfg.sampling['height']}")
+    print(f"  Est. entries: ~{est_entries} ({int(est_entries/1000)}k) calibration data points")
+    print(f"  Est. time:    ~{est_time//60}m {est_time%60}s  (V100 at 512²)")
+    print(f"  Est. disk:    ~{est_entries * 300 // 1000}k kB  (JSONL)")
+    print(f"  Output dir:   {out_dir}")
+    print(f"  {'─' * 56}\n")
+    print(f"  Press Ctrl+C to abort, or wait 3 seconds...")
+    try:
+        time.sleep(3)
+    except KeyboardInterrupt:
+        print("\n  Aborted.")
+        return
+
     all_entries: list[CalibrationEntry] = []
     run_idx = 0
 
