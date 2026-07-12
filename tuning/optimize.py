@@ -261,20 +261,42 @@ def generate_candidate_configs(tcfg: TuningConfig) -> List[TeacacheConfig]:
 def optimize(configs: List[TeacacheConfig],
              entries: List[CalibrationEntry],
              tcfg: TuningConfig) -> List[OptimizationResult]:
-    """Simulate all candidate configs, compute scores, build Pareto frontier."""
+    """Simulate all candidate configs, compute scores, build Pareto frontier.
+
+    If cross_validate is True in config, splits entries by prompt_id:
+    fits polynomial on train set, evaluates on holdout set.
+    """
+    import random
     opt = tcfg.optimization
     results: List[OptimizationResult] = []
 
+    # Cross-validation split
+    do_cv = opt.get("cross_validate", False)
+    cv_fraction = opt.get("cv_holdout_fraction", 0.2)
+    train_entries = entries
+    holdout_entries = entries
+    if do_cv:
+        prompt_ids = sorted(set(e.prompt_id for e in entries))
+        rng = random.Random(42)
+        rng.shuffle(prompt_ids)
+        n_holdout = max(1, int(len(prompt_ids) * cv_fraction))
+        holdout_ids = set(prompt_ids[:n_holdout])
+        train_entries = [e for e in entries if e.prompt_id not in holdout_ids]
+        holdout_entries = [e for e in entries if e.prompt_id in holdout_ids]
+        print(f"  CV: {len(train_entries)} train / {len(holdout_entries)} holdout "
+              f"(split by prompt, {cv_fraction:.0%} holdout)")
+
     for i, cfg in enumerate(configs):
-        # Fit polynomial coefficients if needed
         if cfg.mapping_type == "polynomial":
             cfg.coefficients = fit_polynomial_coefficients(
-                entries, cfg, degree=opt.get("poly_degree", 4)
+                train_entries, cfg, degree=opt.get("poly_degree", 4)
             )
 
-        skip_rate, avg_error, speedup, quality = simulate_config(entries, cfg)
+        if do_cv:
+            skip_rate, avg_error, speedup, quality = simulate_config(holdout_entries, cfg)
+        else:
+            skip_rate, avg_error, speedup, quality = simulate_config(entries, cfg)
 
-        # Score: trade off speedup and quality (higher is better)
         score = speedup * quality
 
         results.append(OptimizationResult(

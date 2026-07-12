@@ -26,12 +26,31 @@ from pathlib import Path
 from .config_types import CalibrationEntry, TuningConfig
 from .utils import load_models, sample, get_diffusion_model
 from .recorder import make_calibration_forward
+from .prompt_loader import load_prompt_config, select_prompts, resolve_prompt
 
 
-def load_prompts(prompts_file: str, num_prompts: int) -> list:
-    path = Path(__file__).parent / prompts_file
-    lines = [l.strip() for l in path.read_text().splitlines() if l.strip()]
-    return lines[:num_prompts]
+def load_calibration_prompts(tcfg: TuningConfig):
+    """Load and resolve prompts for calibration based on config settings."""
+    cfg = tcfg.calibration
+    prompt_config = load_prompt_config(
+        str(Path(__file__).parent / cfg["prompts_file"])
+    )
+    entries = select_prompts(
+        prompt_config,
+        method=cfg.get("prompt_selection", "from_top"),
+        count=cfg["num_prompts"],
+        tag_filter=cfg.get("prompt_tag_filter"),
+    )
+    # Resolve with cycling prefix/negative variants
+    resolved = []
+    for i, entry in enumerate(entries):
+        full, neg = resolve_prompt(
+            prompt_config, entry,
+            prefix_variant_idx=i % max(len(prompt_config.prefix_variants), 1),
+            negative_variant_idx=i % max(len(prompt_config.negative_variants), 1),
+        )
+        resolved.append({"prompt": full, "negative": neg, "entry": entry})
+    return resolved
 
 
 def patch_for_calibration(unet, steps: int, prompt_id: int, seed: int):
@@ -128,14 +147,10 @@ def run_calibration(comfy_dir: str, config_path: str = None):
         tcfg.comfy_dir, tcfg.model_name,
         tcfg.clip_name, tcfg.clip_type, tcfg.vae_name,
     )
-    prompts = load_prompts(
-        tcfg.calibration["prompts_file"],
-        tcfg.calibration["num_prompts"],
-    )
+    prompts = load_calibration_prompts(tcfg)
     seeds = tcfg.calibration["seeds"]
     step_variants = tcfg.sampling["step_variants"]
     step_weights = tcfg.sampling["step_weights"]
-    negative = tcfg.calibration.get("negative_prompt", "")
 
     total_runs = len(prompts) * len(seeds) * len(step_variants)
     all_entries: list[CalibrationEntry] = []
@@ -143,13 +158,11 @@ def run_calibration(comfy_dir: str, config_path: str = None):
 
     data_file = out_dir / "calibration_data.jsonl"
 
-    for pi, prompt in enumerate(prompts):
+    for pi, pdata in enumerate(prompts):
         for seed in seeds:
             for st in step_variants:
                 steps = int(st)
                 weight = step_weights[step_variants.index(st)]
-                # step_weights are informational for the optimizer
-                # (it can weight simulation results by step count)
 
                 run_idx += 1
                 t0 = time.time()
@@ -157,21 +170,20 @@ def run_calibration(comfy_dir: str, config_path: str = None):
                 torch.cuda.empty_cache()
                 torch.cuda.reset_peak_memory_stats()
 
-                # Patch model for calibration
                 dm, original_fwd = patch_for_calibration(
                     unet, steps, prompt_id=pi, seed=seed
                 )
 
                 try:
                     img = sample(
-                        unet, clip, vae, prompt,
+                        unet, clip, vae, pdata["prompt"],
                         seed=seed, steps=steps,
                         cfg=tcfg.sampling["cfg"],
                         sampler_name=tcfg.sampling["sampler"],
                         scheduler=tcfg.sampling["scheduler"],
                         width=tcfg.sampling["width"],
                         height=tcfg.sampling["height"],
-                        negative=negative,
+                        negative=pdata["negative"],
                     )
                 finally:
                     restore_model(dm, original_fwd, unet)

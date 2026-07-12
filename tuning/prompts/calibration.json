@@ -1,0 +1,233 @@
+{
+  "default_prefix": "masterpiece, best quality, score_7, newest, highres, absurdres, anime screenshot, detailed anime style, ",
+  "default_negative": "worst quality, low quality, score_1, score_2, score_3, artist name, multiple views",
+  "prefix_variants": [
+    "masterpiece, best quality, score_7, newest, highres, absurdres, anime screenshot, detailed anime style, ",
+    "masterpiece, best quality, score_7, absurdres, detailed illustration, sharp focus, ",
+    "masterpiece, best quality, score_7, highres, newest, detailed anime art, vibrant colors, ",
+    "best quality, masterwork, absurdres, sharp focus, cinematic lighting, anime, "
+  ],
+  "negative_variants": [
+    "worst quality, low quality, score_1, score_2, score_3, artist name, multiple views",
+    "worst quality, low quality, score_1, score_2, watermark, signature, jpeg artifacts",
+    "worst quality, low quality, score_1, score_2, score_3, multiple views, artist name, bad anatomy",
+    "worst quality, low quality, score_1, score_2, score_3, sketch, rough, incomplete, watermark"
+  ],
+  "prompts": [
+    {
+      "text": "1boy, Lian, male elf, mature man, (pointed ears:1.75), golden blonde hair, emerald green eyes, lean slender build, wearing green tunic, brown trousers, leather boots, standing beside Sylvarie, holding her hand tightly, looking forward with a nervous but steady expression, (taller than Sylvarie:3), 1girl, Sylvarie, female elf, (pointed ears:1.5), platinum blonde hair partially hidden, violet eyes, curvaceous build, (large breasts:1.3), wearing a white off-shoulder cotton bodice, (heavy pleated brown wool skirt hanging loosely:1.2), cream colored low heeled sandals, head lowered, looking down at the polished floor, clutching her skirt with trembling hands, deep blush on cheeks, standing beside Lian, (slightly shorter than Lian:2), Interior, grand foyer of an elven estate, (polished obsidian floor:1.3), floating mana-lamps emitting amber light, high ceilings, luxury elven architecture, cinematic lighting, high detail, digital art",
+      "tags": ["character", "couple", "interior", "detail_heavy", "cinematic", "day"],
+      "nsfw": false
+    },
+    {
+      "text": "(wide shot, god's eye view, distance view:2), (colossal vertical pillar of white-hot flame:1.7), (massive explosion:1.5), white fire, orange fire, red fire, hints of blue energy, swirling ash, superheated air, shockwave, grey stone quarry walls, jagged cliffs, distant forest background, cinematic lighting, atmospheric perspective, 1boy, Lian, mature man, blonde hair, green tunic, sand-colored cloak, holding a staff, standing at the cliff edge, small figure, looking at the explosion, 1girl, Sylvarie, mature woman, long platinum blonde hair, white off-shoulder bodice, long pleated brown wool skirt, sand-colored cloak, standing beside Lian, small figure, looking at the explosion",
+      "tags": ["action", "landscape", "couple", "cinematic", "day"],
+      "nsfw": false
+    },
+    {
+      "text": "1girl, 1boy, anime style, soft lighting, Sylvarie, elf woman, long platinum blonde hair, pointed ears, bright violet eyes, large breasts, wearing a tight violet tunic and tight leather trousers, blushing, looking away with a shy expression, Lian, elf man, male, mage attire, holding hands with Sylvarie (interlocked fingers:1.5), walking side by side on a forest dirt path, shoulder touching, sunny daylight, greenery background",
+      "tags": ["character", "couple", "landscape", "day", "simple"],
+      "nsfw": false
+    },
+    {
+      "text": "safe, nighttime, wide shot, view from behind, characters occupying a small portion of the frame, focusing on the vast landscape, overlooking the city of Omnia, futuristic cyberpunk cityscape, glittering neon lights, distant city glow, a wide black mirror-like canal reflecting the city lights, shimmering water, dark starry sky, standing on a high plateau, metal railing, 1girl, Lyra, wolf girl, mature woman, long silver-white hair, wolf ears, (she hads a silver-white tail:1.5), slender and curvaceous build, huge breasts, wearing a heavy oversized cream knit sweater hanging loosely, soft leggings, sitting on a railing, leaning against Renzo, head on Renzo's shoulder, 1boy, Renzo, wolf man, mature man, (he has a silver-grey hair:1.5), (wolf ears:2), silver-grey tail, imposing build, taller than Lyra, standing beside Lyra, holding her close, (his arm wrapped around her waist:2)",
+      "tags": ["character", "couple", "landscape", "night", "cinematic"],
+      "nsfw": false
+    },
+    {
+      "text": "1girl, anime warrior, female knight, silver armor with ornate gold trim, long flowing cape, (holding a gleaming greatsword:1.3), windswept battlefield, dramatic sky, scattered cherry blossoms, epic fantasy illustration",
+      "tags": ["character", "action", "landscape", "day", "detail_heavy"],
+      "nsfw": false
+    },
+    {
+      "text": "1boy, rogue assassin, male, dark leather armor, hooded cloak, dual daggers, crouching on a rooftop, rain-soaked medieval city below, moonlight breaking through clouds, stealth, tension, dark atmosphere",
+      "tags": ["character", "action", "night", "cinematic", "interior"],
+      "nsfw": false
+    },
+    {
+      "text": "1girl, witch, long dark purple hair, glowing arcane eyes, levitating spellbook, swirling magical energy, standing in an ancient library, floating candles, floating bookshelves, mystical atmosphere, high detail",
+      "tags": ["character", "interior", "detail_heavy", "night", "abstract"],
+      "nsfw": false
+    },
+    {
+      "text": "1boy, 1girl, adventurers resting by a campfire, starlit sky, vast mountain range in the background, tents and gear scattered, warm firelight on faces, peaceful night, fantasy illustration",
+      "tags": ["character", "couple", "landscape", "night", "simple"],
+      "nsfw": false
+    },
+    {
+      "text": "bustling marketplace in a fantasy port city, colorful stalls, merchants haggling, exotic goods, crates and barrels, ships in the harbor, midday sun, vibrant atmosphere, wide shot",
+      "tags": ["landscape", "day", "detail_heavy", "interior"],
+      "nsfw": false
+    },
+    {
+      "text": "1girl, multi view, character reference sheet, same female elf character, front view, side view, back view, three-quarters view, expression sheet, neutral, happy, angry, surprised, wearing consistent fantasy outfit, white background, organized layout, clean lineart",
+      "tags": ["character", "multi_view", "simple"],
+      "nsfw": false
+    },
+    {
+      "text": "1boy, multi view, character design sheet, male knight, front view standing, side profile, back view with cape, action pose with sword drawn, helmet on and off variants, detailed armor reference, medieval fantasy style, clean presentation",
+      "tags": ["character", "multi_view", "simple"],
+      "nsfw": false
+    },
+    {
+      "text": "1girl, multi view, turnaround sheet, female space marine, sci-fi armor, helmet on front, helmet off side, back profile, crouching combat pose, weapon drawn, mechanical detail shown, technical reference style",
+      "tags": ["character", "multi_view", "action", "detail_heavy"],
+      "nsfw": false
+    },
+    {
+      "text": "rustic countryside cottage, thatched roof, ivy-covered stone walls, flower garden in bloom, wooden fence, cobblestone path, rolling green hills beyond, peaceful spring morning, soft natural lighting, studio ghibli inspired",
+      "tags": ["landscape", "interior", "day", "simple", "cinematic"],
+      "nsfw": false
+    },
+    {
+      "text": "underwater palace ruins, coral-covered marble columns, schools of tropical fish, rays of sunlight piercing through crystal-clear water, ancient statues, mysterious atmosphere, deep blue hues, digital painting",
+      "tags": ["landscape", "abstract", "detail_heavy", "day"],
+      "nsfw": false
+    },
+    {
+      "text": "steampunk airship workshop, massive brass gears and pipes, blueprints on the walls, steam vents hissing, inventor's workbench scattered with tools, warm gaslight, wide shot, intricate mechanical detail",
+      "tags": ["interior", "detail_heavy", "day", "abstract"],
+      "nsfw": false
+    },
+    {
+      "text": "japanese onsen in winter, snow-covered rocks, steaming hot spring water, bamboo fences, traditional wooden architecture, falling snowflakes, peaceful solitude, warm lantern glow, landscape painting",
+      "tags": ["landscape", "interior", "night", "simple", "cinematic"],
+      "nsfw": false
+    },
+    {
+      "text": "1girl, kunoichi, female ninja, dark purple hair in a ponytail, black and crimson stealth outfit, mesh armor, kunai in hand, poised on a bamboo branch, crescent moon, misty forest, dynamic pose, action shot, motion blur",
+      "tags": ["character", "action", "night", "landscape", "cinematic"],
+      "nsfw": false
+    },
+    {
+      "text": "an elderly fisherman mending nets at a wooden dock, weathered hands, leathery skin, wrinkles, golden hour sunset, calm lake, mountains in the distance, photorealistic, oil painting style",
+      "tags": ["character", "landscape", "photorealistic", "day", "simple"],
+      "nsfw": false
+    },
+    {
+      "text": "portrait of a barista at work, steam rising from an espresso machine, warm cafe lighting, focused expression, shallow depth of field, bokeh background, modern coffee shop, photorealistic, candid photography style",
+      "tags": ["character", "interior", "photorealistic", "day", "close_up"],
+      "nsfw": false
+    },
+    {
+      "text": "close-up of a hummingbird hovering near a hibiscus flower, wings frozen in mid-flap, vibrant iridescent feathers, macro photography, natural morning light, lush tropical garden background",
+      "tags": ["close_up", "day", "photorealistic", "simple", "landscape"],
+      "nsfw": false
+    },
+    {
+      "text": "a majestic snow leopard prowling across a rocky mountain ridge, snow-covered peaks in the background, dramatic clouds, piercing blue eyes, wildlife photography, telephoto lens look",
+      "tags": ["close_up", "landscape", "day", "photorealistic", "cinematic"],
+      "nsfw": false
+    },
+    {
+      "text": "busy tokyo street crossing at night, neon signs reflecting on wet pavement, crowds of pedestrians, umbrellas in light rain, motion blur on moving people, long exposure photography, cyberpunk aesthetic",
+      "tags": ["landscape", "night", "photorealistic", "cinematic", "detail_heavy"],
+      "nsfw": false
+    },
+    {
+      "text": "detailed fractal mandala, radiating geometric patterns, vibrant gradients from deep blue to gold, sacred geometry, highly detailed, symmetrical, mathematical beauty, abstract art",
+      "tags": ["abstract", "detail_heavy"],
+      "nsfw": false
+    },
+    {
+      "text": "surreal dreamscape, floating islands with upside-down forests, impossible waterfalls flowing upward, cotton candy clouds, pastel purple and pink sky, soft lighting, whimsical atmosphere, concept art",
+      "tags": ["abstract", "landscape", "day", "cinematic"],
+      "nsfw": false
+    },
+    {
+      "text": "minimalist geometric composition, interlocking triangles and circles, primary colors, Bauhaus style, clean lines, smooth gradients, modern graphic design, abstract",
+      "tags": ["abstract", "simple"],
+      "nsfw": false
+    },
+    {
+      "text": "opulent art nouveau doorway, intertwined botanical motifs, gold leaf details, stained glass transom window, marble steps, dramatic chiaroscuro lighting, museum quality",
+      "tags": ["interior", "detail_heavy", "day", "abstract"],
+      "nsfw": false
+    },
+    {
+      "text": "1girl, Sylvarie, elf, pointed ears, long platinum blonde hair, bright violet eyes, (large breasts:1.4), breast implants, round breasts, slender and curvaceous build, (Ahegao:1.5), eyes rolled back, tongue out, face red and flushed, sweat on skin, laying on a bed, legs wrapped tightly around Lian's waist, breasts bouncing and deformed by pressure, pussy juice, 1boy, Lian, (pointed ears:1.75), lean muscular build, slightly taller than Sylvarie, sweating, naked, on top of Sylvarie, gripping Sylvarie's hips firmly, deep penetration, hammering into Sylvarie, interior inn room, large double bed, white linen sheets, morning sunlight filtering through curtains, motion lines, impact lines, sweat, pussy juice, nsfw",
+      "tags": ["character", "couple", "nsfw", "interior", "day"],
+      "nsfw": true
+    },
+    {
+      "text": "1boy, Renzo, mature man, wolf man, (large wolf ears:2), (thick silver-grey wolf tail:1.75), amber eyes, broad athletic build, charcoal trousers undone and lowered around hips, (pressing Lyra against the wall:1.5), forehead touching hers, holding her thighs firmly, sweating, intense expression, standing in the hallway, 1girl, Lyra, mature woman, wolf girl, long silver hair, blue eyes, (huge breasts:1.4), breast implants, round breasts, (skindentation:1.3), breasts visible, oversized cream sweater, no pants, no panties, (legs wrapped around Renzo's waist:1.5), (pinned against the wall:1.5), (ahegao:1.5), ecstatic face, heavy blush, sweating, silver wolf ears, silver wolf tail, (deep penetration:1.5), pussy juice, cum spilling from her pussy, Renzo is penetrating Lyra from the front while she is pinned against the wall, legs locked around his waist, bodies pressed tightly together, intimate and raw atmosphere, dimly lit hallway, moonlight filtering through, domestic setting, white walls, sweat glistening on skin, motion lines, impact lines, nsfw",
+      "tags": ["character", "couple", "nsfw", "interior", "night"],
+      "nsfw": true
+    },
+    {
+      "text": "1girl, Sylvarie, elf, pointed ears, long platinum blonde hair, bright violet eyes, (large breasts:1.4), breast implants, round breasts, curvaceous, slender, wearing an egregious midnight-blue lace and silk set, sheer lace micro skirt barely clinging to hips, strapless breast binder made of sheer silk bands wrapping around chest and back, (underboob:1.3), tops of breasts exposed, thin strings connecting the bands between breasts, heavy cleavage, skindentation, velvet choker, shimmering blue flower hairclip, deep blush, embarrassed expression, shimmering violet eyes, trembling, stepping out from behind a heavy velvet curtain, clutching the hem of the skirt with one hand, standing in a luxury boutique with dim lighting and iridescent fabrics, nsfw",
+      "tags": ["character", "nsfw", "interior", "night", "close_up"],
+      "nsfw": true
+    },
+    {
+      "text": "1girl, Lyra, wolf girl, mature woman, long silver hair pulled into a messy bun, blue eyes, (huge breasts:1.4), wearing a sheer oversized white button-down shirt with only the bottom two buttons done, sleeves rolled to elbows, black lace panties visible, leaning against a kitchen counter, morning coffee in hand, soft morning sunlight through the window, domestic kitchen background, slightly tired expression, messy bed hair, intimate slice of life, anime style, nsfw",
+      "tags": ["character", "nsfw", "interior", "day", "simple"],
+      "nsfw": true
+    },
+    {
+      "text": "interstellar nebula, brilliant blues and magentas, newborn stars glowing within dust clouds, cosmic scale, deep space photography, Hubble telescope aesthetic, awe-inspiring, high resolution astrophotography",
+      "tags": ["abstract", "landscape", "photorealistic", "night", "cinematic"],
+      "nsfw": false
+    },
+    {
+      "text": "a sprawling vista of the Grand Canyon at golden hour, layered red rock formations stretching to the horizon, Colorado river glinting far below, dramatic cloud shadows moving across the landscape, national geographic style, ultra wide angle",
+      "tags": ["landscape", "day", "photorealistic", "cinematic"],
+      "nsfw": false
+    },
+    {
+      "text": "microscopic view of a butterfly wing, thousands of iridescent scales overlapping like roof tiles, electric blue to deep purple color shift, extreme macro photography, scientific detail, abstract natural pattern",
+      "tags": ["close_up", "abstract", "photorealistic", "day", "detail_heavy"],
+      "nsfw": false
+    },
+    {
+      "text": "1girl, female android, cyberpunk, (transparent mechanical limbs:1.5), visible circuitry, glowing neon data streams, sitting in a rain-soaked alley, drops pattering on chrome, moody purple and cyan lighting, concept art, detailed character illustration",
+      "tags": ["character", "night", "detail_heavy", "abstract", "cinematic"],
+      "nsfw": false
+    },
+    {
+      "text": "1boy, archer, male, tanned skin, lean build, leather vest, (drawing a longbow:1.3), aiming at an unseen target, forest clearing, golden hour light filtering through leaves, focused expression, sweat on brow, dynamic composition, tension, motion lines",
+      "tags": ["character", "action", "landscape", "day", "close_up"],
+      "nsfw": false
+    },
+    {
+      "text": "a dragon skeleton half-buried in desert sand, massive ribcage arching above dunes, ancient sword lodged in skull, vultures circling overhead, lonely atmosphere, vast empty desert, orange and purple sunset sky, digital painting",
+      "tags": ["landscape", "day", "cinematic", "abstract"],
+      "nsfw": false
+    },
+    {
+      "text": "a glassblowing workshop, artist shaping molten glass on a pipe, glowing orange sphere, intense heat visible, tools scattered on workbench, shelves of finished glass pieces in background, warm amber lighting, documentary photography style",
+      "tags": ["character", "interior", "day", "photorealistic", "detail_heavy"],
+      "nsfw": false
+    },
+    {
+      "text": "1girl, oni mask, female samurai, traditional red and black armor, kabuki-inspired makeup, (twin katanas drawn:1.5), cherry blossom petals swirling, moonlit temple courtyard, silent killing intent, rain-soaked ground, cinematic, high tension, anime style",
+      "tags": ["character", "action", "night", "cinematic", "detail_heavy"],
+      "nsfw": false
+    },
+    {
+      "text": "enormous treehouse city, wooden structures built into a colossal ancient oak, lantern-lit bridges spanning between branches, tiny silhouettes of people going about their day, massive scale, fantasy illustration with environmental storytelling, golden hour",
+      "tags": ["landscape", "day", "detail_heavy", "cinematic", "abstract"],
+      "nsfw": false
+    },
+    {
+      "text": "1boy, male priest, silver hair, white robes with gold embroidery, (casting a healing spell:1.3), gentle holy light, wounded soldier before him, cathedral interior with stained glass, peaceful and solemn atmosphere, dust motes in sunbeams, painterly style",
+      "tags": ["character", "interior", "day", "simple", "cinematic"],
+      "nsfw": false
+    },
+    {
+      "text": "close-up of a dewdrop on a blade of grass, macro lens, the dewdrop acts as a lens refracting the meadow behind it, spider web strands nearby, golden morning light, shallow depth of field, extreme detail, nature photography",
+      "tags": ["close_up", "day", "photorealistic", "landscape", "simple"],
+      "nsfw": false
+    },
+    {
+      "text": "1girl, cat girl, black hair, cat ears, yellow eyes, oversized hoodie, sitting at a desk covered in electronics and snacks, multiple monitors displaying code, dim room lit only by screens, late night programming session, comfy atmosphere, anime style slice of life",
+      "tags": ["character", "interior", "night", "simple"],
+      "nsfw": false
+    },
+    {
+      "text": "a kite festival on a coastal cliff, hundreds of colorful kites filling the sky, children running, couples watching, vibrant against a clear blue sky, ocean waves crashing below, festive atmosphere, wide shot, illustration",
+      "tags": ["landscape", "day", "detail_heavy", "simple"],
+      "nsfw": false
+    }
+  ]
+}

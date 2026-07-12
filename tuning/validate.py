@@ -32,10 +32,30 @@ from .utils import (
 from .forward import teacache_anima_forward
 
 
-def load_prompts(prompts_file: str, num_prompts: int) -> list:
-    path = Path(__file__).parent / prompts_file
-    lines = [l.strip() for l in path.read_text().splitlines() if l.strip()]
-    return lines[:num_prompts]
+from .prompt_loader import load_prompt_config, select_prompts, resolve_prompt
+
+
+def load_validation_prompts(tcfg: TuningConfig):
+    """Load and resolve prompts for validation based on config settings."""
+    cfg = tcfg.validation
+    prompt_config = load_prompt_config(
+        str(Path(__file__).parent / cfg["prompts_file"])
+    )
+    entries = select_prompts(
+        prompt_config,
+        method=cfg.get("prompt_selection", "from_top"),
+        count=cfg["num_prompts"],
+        tag_filter=cfg.get("prompt_tag_filter"),
+    )
+    resolved = []
+    for i, entry in enumerate(entries):
+        full, neg = resolve_prompt(
+            prompt_config, entry,
+            prefix_variant_idx=i % max(len(prompt_config.prefix_variants), 1),
+            negative_variant_idx=i % max(len(prompt_config.negative_variants), 1),
+        )
+        resolved.append({"prompt": full, "negative": neg, "entry": entry})
+    return resolved
 
 
 def patch_with_config(unet, cfg: TeacacheConfig):
@@ -73,21 +93,23 @@ def cleanup_patch(dm, unet):
 def validate_config(
     cfg: TeacacheConfig,
     unet, clip, vae,
-    prompts: List[str],
+    prompts: list,
     seeds: List[int],
     tcfg: TuningConfig,
     qm: QualityMetrics,
 ) -> ValidationResult:
-    """End-to-end validation of one configuration."""
+    """End-to-end validation of one configuration.
+
+    prompts: list of dicts with 'prompt' and 'negative' keys
+    """
     metric_names = qm.metric_names()
     all_scores: dict[str, list[float]] = {k: [] for k in metric_names}
     all_speedups: list[float] = []
     all_times: list[float] = []
 
-    for pi, prompt in enumerate(prompts):
+    for pi, pdata in enumerate(prompts):
         for seed in seeds:
             sp = f"p={pi} s={seed} thresh={cfg.rel_l1_thresh}"
-            item_text = "  " + sp
 
             # Baseline (no patching)
             torch.cuda.empty_cache()
@@ -95,14 +117,14 @@ def validate_config(
 
             t0 = time.time()
             img_base = sample(
-                unet, clip, vae, prompt,
+                unet, clip, vae, pdata["prompt"],
                 seed=seed, steps=tcfg.sampling.get("default_steps", 30),
                 cfg=tcfg.sampling["cfg"],
                 sampler_name=tcfg.sampling["sampler"],
                 scheduler=tcfg.sampling["scheduler"],
                 width=tcfg.sampling["width"],
                 height=tcfg.sampling["height"],
-                negative=tcfg.calibration.get("negative_prompt", ""),
+                negative=pdata["negative"],
             )
             t_base = time.time() - t0
 
@@ -113,14 +135,14 @@ def validate_config(
                 torch.cuda.empty_cache()
                 t0 = time.time()
                 img_tc = sample(
-                    unet, clip, vae, prompt,
+                    unet, clip, vae, pdata["prompt"],
                     seed=seed, steps=tcfg.sampling.get("default_steps", 30),
                     cfg=tcfg.sampling["cfg"],
                     sampler_name=tcfg.sampling["sampler"],
                     scheduler=tcfg.sampling["scheduler"],
                     width=tcfg.sampling["width"],
                     height=tcfg.sampling["height"],
-                    negative=tcfg.calibration.get("negative_prompt", ""),
+                    negative=pdata["negative"],
                 )
                 t_tc = time.time() - t0
             finally:
@@ -168,7 +190,7 @@ def validate_config(
 def sweep_thresholds(
     base_cfg: TeacacheConfig,
     unet, clip, vae,
-    prompts: List[str],
+    prompts: list,
     seeds: List[int],
     tcfg: TuningConfig,
     qm: QualityMetrics,
@@ -237,10 +259,7 @@ def main():
     )
 
     # Load prompts
-    prompts = load_prompts(
-        tcfg.validation["prompts_file"],
-        tcfg.validation["num_prompts"],
-    )
+    prompts = load_validation_prompts(tcfg)
     seeds = tcfg.validation["seeds"]
 
     # Select top-K diverse configs

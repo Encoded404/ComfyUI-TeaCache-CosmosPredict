@@ -26,11 +26,19 @@ from .forward import teacache_anima_forward
 from .optimize import simulate_config, fit_polynomial_coefficients, generate_candidate_configs
 
 
-SMOKE_PROMPT = (
+SMOKE_PREFIX = (
+    "masterpiece, best quality, score_7, newest, highres, absurdres, "
+    "anime screenshot, detailed anime style, "
+)
+SMOKE_FULL = (
     "a beautiful anime girl with long silver hair, blue eyes, "
     "cherry blossoms falling, soft afternoon lighting"
 )
-SMOKE_NEGATIVE = ""
+SMOKE_NEGATIVE = (
+    "worst quality, low quality, score_1, score_2, score_3, "
+    "artist name, multiple views"
+)
+SMOKE_FULL = SMOKE_PREFIX + SMOKE_FULL
 
 # ── Calibration runs — varied to produce diverse (rel_l1, out_rel) pairs  ──
 SMOKE_RUNS = [
@@ -83,7 +91,7 @@ def _run_calibration(unet, clip, vae, params, prompt_id):
     try:
         unet.set_model_unet_function_wrapper(wrapper)
         sample(
-            unet, clip, vae, SMOKE_PROMPT,
+            unet, clip, vae, SMOKE_FULL,
             seed=params["seed"], steps=steps,
             width=512, height=512,
             cfg=params["cfg"], sampler_name=params["sampler"],
@@ -138,7 +146,7 @@ def _run_teacache(unet, clip, vae, cfg: TeacacheConfig, seed, steps, sampler, sc
         unet.set_model_unet_function_wrapper(tc_wrapper)
         t0 = time.time()
         img = sample(
-            unet, clip, vae, SMOKE_PROMPT,
+            unet, clip, vae, SMOKE_FULL,
             seed=seed, steps=steps,
             width=512, height=512,
             cfg=cfg_val, sampler_name=sampler, scheduler=sched,
@@ -199,7 +207,7 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
     try:
         t0 = time.time()
         img_base = sample(
-            unet, clip, vae, SMOKE_PROMPT,
+            unet, clip, vae, SMOKE_FULL,
             seed=base_run["seed"], steps=base_run["steps"],
             width=512, height=512,
             cfg=base_run["cfg"], sampler_name=base_run["sampler"],

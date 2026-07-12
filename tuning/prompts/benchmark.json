@@ -1,0 +1,72 @@
+{
+  "default_prefix": "masterpiece, best quality, score_7, newest, highres, absurdres, anime screenshot, detailed anime style, ",
+  "default_negative": "worst quality, low quality, score_1, score_2, score_3, artist name, multiple views",
+  "prefix_variants": [
+    "masterpiece, best quality, score_7, newest, highres, absurdres, anime screenshot, detailed anime style, "
+  ],
+  "negative_variants": [
+    "worst quality, low quality, score_1, score_2, score_3, artist name, multiple views"
+  ],
+  "prompts": [
+    {
+      "text": "1girl, angel, female, white feathery wings spread wide, golden halo, descending from a stormy sky, rays of sunlight breaking through dark clouds, glowing white robes, serene expression, reaching out with one hand, cinematic lighting, religious painting inspired, high detail",
+      "tags": ["character", "action", "day", "cinematic", "detail_heavy"],
+      "nsfw": false
+    },
+    {
+      "text": "1boy, spellblade, male, half-elf, silver hair, heterochromia eyes blue and green, wielding a sword that channels lightning, mid-swing, streaks of electricity arcing off the blade, dark stone chamber, glowing runes on the floor, dynamic action shot, impact frame, particle effects, anime style",
+      "tags": ["character", "action", "interior", "night", "detail_heavy"],
+      "nsfw": false
+    },
+    {
+      "text": "crashing ocean waves against jagged cliffside rocks, seafoam spray, storm clouds gathering, lighthouse in the distance with its beacon piercing through the gloom, dramatic atmosphere, long exposure photography, moody",
+      "tags": ["landscape", "night", "photorealistic", "cinematic"],
+      "nsfw": false
+    },
+    {
+      "text": "1girl, femeon cyborg, smooth white ceramic faceplate with geometric golden inlays, one visible organic eye, the other a glowing optical sensor, exposed mechanical neck joints, sleek minimalist design, studio portrait lighting, concept art",
+      "tags": ["character", "close_up", "day", "abstract"],
+      "nsfw": false
+    },
+    {
+      "text": "enchanted forest at twilight, bioluminescent mushrooms in neon blues and greens, firefly swarm, ancient gnarled trees with glowing sap, a small wooden bridge over a trickling stream, magical atmosphere, fantasy illustration, wide landscape shot",
+      "tags": ["landscape", "night", "detail_heavy", "cinematic", "abstract"],
+      "nsfw": false
+    },
+    {
+      "text": "1boy, merchant, male, middle aged, spectacles, wool beret, counting gold coins at a wooden counter, shelves behind filled with exotic potions and scrolls, warm candlelight, dust and incense smoke, cozy fantasy shop, painterly style",
+      "tags": ["character", "interior", "night", "simple", "detail_heavy"],
+      "nsfw": false
+    },
+    {
+      "text": "a vintage steam locomotive crossing a high trestle bridge above a misty valley, autumn foliage in vibrant reds and oranges, thick white fog rolling through the gorge below, dramatic perspective from below the bridge, detailed illustrations, industrial romance",
+      "tags": ["landscape", "day", "detail_heavy", "cinematic"],
+      "nsfw": false
+    },
+    {
+      "text": "1girl, multi view, character reference, female knight, full armor front view, casual clothes three-quarter view, back view with flowing cape, helmet-holding portrait, expression set, neutral, battle cry, weary, organized on a clean parchment background, medieval illumination style borders",
+      "tags": ["character", "multi_view", "simple", "detail_heavy"],
+      "nsfw": false
+    },
+    {
+      "text": "ancient library deep underground, massive stone bookshelves carved into the cavern walls, a single beam of light from a crack in the ceiling illuminating a floating book, dust particles dancing in the light, silence and mystery, cinematic wide shot, digital painting",
+      "tags": ["interior", "night", "cinematic", "detail_heavy", "abstract"],
+      "nsfw": false
+    },
+    {
+      "text": "1girl, witch with a mechanical arm, asteampunk prosthetic arm with intricate brass gears and glowing blue tubes, the rest of the body human, warm skin tones, holding a bubbling potion that emits green smoke, standing in a cluttered alchemy lab, ingredient jars and hanging herbs, whimsical witchy atmosphere, anime style",
+      "tags": ["character", "interior", "night", "detail_heavy", "abstract"],
+      "nsfw": false
+    },
+    {
+      "text": "japanese temple garden in autumn, raked gravel zen garden with precise concentric circles, a solitary maple tree with brilliant red leaves, traditional wooden temple architecture in the background, soft overcast lighting, quiet and contemplative, photographic, high detail",
+      "tags": ["landscape", "day", "photorealistic", "interior", "simple"],
+      "nsfw": false
+    },
+    {
+      "text": "1boy, male barbarian, muscular build, fur cloak, dual wielding massive battle axes, standing at the mouth of a volcanic cave, lava glow reflecting on his armor, roaring challenge at an unseen foe, motion blur on swinging axes, epic dark fantasy illustration",
+      "tags": ["character", "action", "night", "cinematic"],
+      "nsfw": false
+    }
+  ]
+}
