@@ -328,7 +328,7 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
     # ── [5/8] Mini-optimizer ───────────────────────────────────────────
     print(f"\n[5/8] Mini-optimizer (running optimize.generate_candidate_configs + optimize)...")
     try:
-        candidates = generate_candidate_configs(tcfg)
+        candidates = generate_candidate_configs(tcfg, entries=all_entries)
         print(f"  Generated {len(candidates)} candidate configs")
 
         # Use the real optimizer (same code path as full pipeline)

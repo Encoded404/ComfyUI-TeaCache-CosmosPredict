@@ -208,10 +208,44 @@ def fit_polynomial_coefficients(
     return coeffs
 
 
-def generate_candidate_configs(tcfg: TuningConfig) -> List[TeacacheConfig]:
-    """Generate all candidate configurations to test."""
+def generate_candidate_configs(tcfg: TuningConfig,
+                                entries: Optional[List[CalibrationEntry]] = None,
+                                ) -> List[TeacacheConfig]:
+    """Generate all candidate configurations to test.
+
+    If entries is provided and auto_scale_target is set in config,
+    computes data-driven scale factors that push the average distance
+    for each source toward the target value. These are added as extra
+    scale candidates alongside the explicit scale list.
+    """
+    import random
+
     opt = tcfg.optimization
     configs = []
+
+    # ── Auto-scale (data-driven) ───────────────────────────────────────
+    auto_target = opt.get("auto_scale_target", None)
+    auto_scales: Dict[str, list] = {}
+    if auto_target is not None and entries:
+        for source in ["t_emb", "first_block_shift", "pooled_latent"]:
+            distances = []
+            for e in entries:
+                stats = get_source_stats(e, source)
+                if stats is None:
+                    continue
+                d = stats["mean"]  # raw mean distance
+                if d > 0:
+                    distances.append(d)
+            if distances:
+                avg_dist = sum(distances) / len(distances)
+                auto_scale = round(auto_target / avg_dist, 1)
+                auto_scales[source] = [auto_scale]
+                print(f"  [auto_scale] {source}: avg dist={avg_dist:.5f}  "
+                      f"\u2192  scale={auto_scale:.1f}  (target={auto_target})")
+            else:
+                auto_scales[source] = []
+
+    # ── Generate candidates ────────────────────────────────────────────
 
     for source in opt["sources"]:
         for metric_type in opt["metric_types"]:
@@ -245,6 +279,10 @@ def generate_candidate_configs(tcfg: TuningConfig) -> List[TeacacheConfig]:
 
                                 for schedule in opt["step_schedules"]:
                                     scales = opt["signal_scales"].get(source, [1.0])
+                                    # Append auto-computed scale if available
+                                    if source in auto_scales and auto_scales[source]:
+                                        extra = [s for s in auto_scales[source] if s not in scales]
+                                        scales = list(scales) + extra
                                     for scale in scales:
                                         for residual_strat in opt["residual_strategies"]:
                                             res_params_list = [{}]
@@ -278,6 +316,14 @@ def generate_candidate_configs(tcfg: TuningConfig) -> List[TeacacheConfig]:
                                                             block_params=block_params,
                                                         )
                                                         configs.append(cfg)
+
+    # ── Cap total candidates if configured ────────────────────────────
+    max_cap = opt.get("max_candidates", 0)
+    if max_cap > 0 and len(configs) > max_cap:
+        rng = random.Random(42)
+        rng.shuffle(configs)
+        configs = configs[:max_cap]
+        print(f"  [cap] Sampled {len(configs)}/{max_cap} candidates (full pool had {len(configs)})")
 
     print(f"[candidates] Generated {len(configs)} candidate configurations")
     return configs
