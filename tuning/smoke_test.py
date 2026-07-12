@@ -23,7 +23,7 @@ from .config_types import TeacacheConfig, TuningConfig, CalibrationEntry
 from .utils import load_models, sample, get_diffusion_model, QualityMetrics
 from .recorder import make_calibration_forward
 from .forward import teacache_anima_forward
-from .optimize import simulate_config, fit_polynomial_coefficients
+from .optimize import simulate_config, fit_polynomial_coefficients, generate_candidate_configs
 
 
 SMOKE_PROMPT = (
@@ -36,7 +36,9 @@ SMOKE_NEGATIVE = ""
 SMOKE_RUNS = [
     {"sampler": "er_sde",        "steps": 30, "cfg": 5.0, "scheduler": "normal", "seed": 42},
     {"sampler": "dpmpp_2m_sde",  "steps": 28, "cfg": 4.5, "scheduler": "simple", "seed": 7},
+    {"sampler": "dpmpp_2m_sde",  "steps": 30, "cfg": 5.0, "scheduler": "normal", "seed": 7},
     {"sampler": "euler_a",       "steps": 32, "cfg": 5.5, "scheduler": "normal", "seed": 99},
+    {"sampler": "euler_a",       "steps": 30, "cfg": 5.0, "scheduler": "simple", "seed": 64},
 ]
 
 
@@ -233,93 +235,86 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
         return False
 
     # ── [4/7] Mini-optimizer ───────────────────────────────────────────
-    print(f"\n[4/7] Mini-optimizer (running optimize.simulate_config)...")
+    print(f"\n[4/7] Mini-optimizer (running optimize.generate_candidate_configs + optimize)...")
     try:
-        candidates = []
-        for source in ["first_block_shift", "t_emb"]:
-            for metric_type in ["mean_only", "mean_and_max"]:
-                for mapping in ["identity", "polynomial"]:
-                    cfg = TeacacheConfig(
-                        source=source, metric_type=metric_type,
-                        metric_weights={"mean": 0.7, "max": 0.3}
-                        if metric_type == "mean_and_max" else {},
-                        signal_scale=1.0 if source == "first_block_shift" else 100.0,
-                        mapping_type=mapping, coefficients=[],
-                        accumulation_type="hard_reset", rel_l1_thresh=0.07,
-                        step_schedule="constant", start_percent=0.05, end_percent=0.95,
-                        residual_strategy="hard", block_mode="all_or_nothing",
-                    )
-                    if mapping == "polynomial":
-                        cfg.coefficients = fit_polynomial_coefficients(all_entries, cfg)
-                    skip, err, sp, qp = simulate_config(all_entries, cfg)
-                    candidates.append((cfg, skip, err, sp, qp))
+        candidates = generate_candidate_configs(tcfg)
+        print(f"  Generated {len(candidates)} candidate configs")
 
-        candidates.sort(key=lambda x: x[4] * x[3], reverse=True)
+        results = []
+        for cfg in candidates:
+            if cfg.mapping_type == "polynomial":
+                cfg.coefficients = fit_polynomial_coefficients(
+                    all_entries, cfg, degree=tcfg.optimization.get("poly_degree", 4)
+                )
+            skip, err, sp, qp = simulate_config(all_entries, cfg)
+            results.append({
+                "config": cfg, "skip": skip, "error": err,
+                "speedup": sp, "quality": qp, "score": sp * qp,
+            })
 
+        results.sort(key=lambda r: r["score"], reverse=True)
+
+        # Build Pareto frontier (no config is both faster AND higher quality)
+        pareto = []
+        for r in results:
+            dominated = False
+            for p in pareto:
+                if (p["speedup"] >= r["speedup"] and p["quality"] >= r["quality"]):
+                    if p["speedup"] > r["speedup"] or p["quality"] > r["quality"]:
+                        dominated = True
+                        break
+            if not dominated:
+                pareto.append(r)
+
+        pareto.sort(key=lambda r: r["speedup"])
+        print(f"  Pareto frontier: {len(pareto)} configs (from {len(results)} total)")
         print(f"  {'source':<22} {'metric':<14} {'map':<12} {'skip':>6} {'speed':>6} {'error':>8} {'score':>6}")
         print(f"  {'─' * 22} {'─' * 14} {'─' * 12} {'─' * 6} {'─' * 6} {'─' * 8} {'─' * 6}")
-        for cfg, skip, err, sp, qp in candidates[:8]:
-            print(f"  {cfg.source:<22} {cfg.metric_type:<14} {cfg.mapping_type:<12} "
-                  f"{skip:>5.1%}  {sp:>4.2f}x  {err:>7.4f}  {qp*sp:>5.3f}")
+        for r in results[:8]:
+            c = r["config"]
+            print(f"  {c.source:<22} {c.metric_type:<14} {c.mapping_type:<12} "
+                  f"{r['skip']:>5.1%}  {r['speedup']:>4.2f}x  {r['error']:>7.4f}  {r['score']:>5.3f}")
 
-        best = candidates[0]
-        best_cfg = best[0]
-        print(f"\n  Winner: {best_cfg.source} / {best_cfg.metric_type} / {best_cfg.mapping_type}")
-        if best_cfg.coefficients:
-            print(f"  Coeffs: {[f'{c:.4e}' for c in best_cfg.coefficients]}")
-            print(f"  Max |coeff|: {max(abs(c) for c in best_cfg.coefficients):.4e}")
+        # Pick up to 3 fairly-spaced configs from the Pareto frontier for real-world testing
+        n_pick = min(3, len(pareto))
+        indices = [0]
+        if n_pick >= 2:
+            indices.append(len(pareto) // 2)
+        if n_pick >= 3:
+            indices.append(len(pareto) - 1)
+        indices = sorted(set(indices))
 
-        # Sweep thresholds to find quality-tier picks
-        sweep = []
-        for t in sorted(set([0.03, 0.05, 0.07, 0.10, 0.15, 0.20, 0.30, 0.50, 0.70, 1.0])):
-            cfg_s = TeacacheConfig.from_dict(best_cfg.to_dict())
-            cfg_s.rel_l1_thresh = t
-            skip, err, sp, qp = simulate_config(all_entries, cfg_s)
-            sweep.append((t, sp, qp, skip, err))
-        sweep.sort(key=lambda x: x[0])
-
-        # Pick three points on the quality curve: conservative, balanced, aggressive
         picks = []
-        # Conservative: lowest simulated error (best quality)
-        conservative = min(sweep[1:], key=lambda x: x[4])  # skip t=0
-        # Aggressive: highest speedup
-        aggressive = max(sweep[1:], key=lambda x: x[1])
-        # Balanced: best product
-        balanced = max(sweep[1:], key=lambda x: x[1] * x[2])
-        for label, (t, sp, qp, sk, er) in [
-            ("conservative", conservative), ("balanced", balanced), ("aggressive", aggressive)
-        ]:
-            picks.append({"label": label, "thresh": t, "sim_speedup": sp, "sim_error": er})
+        labels = ["conservative", "balanced", "aggressive"]
+        for i, idx in enumerate(indices):
+            r = pareto[idx]
+            c = r["config"]
+            picks.append({
+                "label": labels[i],
+                "thresh": c.rel_l1_thresh,
+                "sim_speedup": r["speedup"],
+                "sim_error": r["error"],
+                "config": c,
+            })
 
-        # Deduplicate picks
-        seen = set()
-        picks_unique = []
+        print(f"\n  Selected {len(picks)} for end-to-end validation:")
+        print(f"  {'':>14} {'thresh':>8} {'speedup':>8} {'error':>8} {'source':<22}")
         for p in picks:
-            if p["thresh"] not in seen:
-                picks_unique.append(p)
-                seen.add(p["thresh"])
-
-        print(f"\n  Quality comparison picks (simulated):")
-        print(f"  {'':>14} {'thresh':>8} {'speedup':>8} {'error':>8}")
-        for p in picks_unique:
-            print(f"  {p['label']:>14} {p['thresh']:>8.3f} {p['sim_speedup']:>7.2f}x {p['sim_error']:>8.4f}")
+            c = p["config"]
+            print(f"  {p['label']:>14} {p['thresh']:>8.3f} {p['sim_speedup']:>7.2f}x {p['sim_error']:>8.4f} {c.source:<22}")
     except Exception as e:
         print(f"\n  FAILED mini-optimizer: {e}")
         import traceback; traceback.print_exc()
         return False
 
-    # ── [5/7] Baseline + TeaCache comparison runs ──────────────────────
-    print(f"\n[5/7] TeaCache comparison (3 thresholds) vs baseline...")
+    # ── [5/7] TeaCache comparison runs vs baseline ─────────────────────
+    print(f"\n[5/7] TeaCache comparison ({len(picks)} configs) vs baseline...")
     base_run = SMOKE_RUNS[0]
-
     comparison = {}
-    # Run baseline once (already done in [2/7])
-    comparison["baseline"] = {"time": t_base, "speedup": 1.0, "thresh": 0.0, "img": img_base}
 
-    for p in picks_unique:
+    for p in picks:
         label = p["label"]
-        cfg_cmp = TeacacheConfig.from_dict(best_cfg.to_dict())
-        cfg_cmp.rel_l1_thresh = p["thresh"]
+        cfg_cmp = p["config"]
 
         try:
             img, dt = _run_teacache(
@@ -329,8 +324,9 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
                 cfg_val=base_run["cfg"],
             )
             su = t_base / max(dt, 0.001)
-            print(f"  {label:>14}: thresh={p['thresh']:.3f}  {dt:.1f}s  speedup={su:.2f}x")
-            comparison[label] = {"time": dt, "speedup": su, "thresh": p["thresh"], "img": img}
+            print(f"  {label:>14}: thresh={cfg_cmp.rel_l1_thresh:.3f}  {dt:.1f}s  speedup={su:.2f}x  "
+                  f"({cfg_cmp.source} {cfg_cmp.metric_type} {cfg_cmp.mapping_type})")
+            comparison[label] = {"time": dt, "speedup": su, "thresh": cfg_cmp.rel_l1_thresh, "img": img}
         except Exception as e:
             print(f"  {label:>14}: FAILED — {e}")
             import traceback; traceback.print_exc()
@@ -415,22 +411,21 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
                       + " │ ".join(f"{m:>8}" for m in KEY_METRICS))
             print(header)
             print(f"  {'─' * 14}─┼─{'─' * 7}─┼─{'─' * 8}─┼─" + "─┼─".join("─" * 8 for _ in KEY_METRICS))
-            print(f"  {'baseline':>14} │ {'0':>7} │ {'1.00x':>8} │ "
-                  + " │ ".join(f"{'—':>8}" for _ in KEY_METRICS))
 
             for label, info in comparison.items():
                 scores = all_run_scores.get(label, {})
                 vals = " │ ".join(f"{scores.get(m, float('nan')):>8.4f}" for m in KEY_METRICS)
                 print(f"  {label:>14} │ {info['thresh']:>7.3f} │ {info['speedup']:>7.2f}x │ {vals}")
 
-            # Detailed breakdown for the balanced config
-            balanced_key = "balanced" if "balanced" in comparison else list(comparison.keys())[0]
-            bal_scores = all_run_scores.get(balanced_key, {})
-            bal_info = comparison.get(balanced_key, {})
+            # Detailed breakdown for the middle/balanced config
+            pick_labels = [p["label"] for p in picks]
+            detail_key = "balanced" if "balanced" in pick_labels else pick_labels[len(pick_labels)//2]
+            detail_scores = all_run_scores.get(detail_key, {})
+            detail_info = comparison.get(detail_key, {})
 
             excellent = acceptable = poor = 0
             for name, direction, _, good, mid in METRIC_LEGEND:
-                val = bal_scores.get(name, float("nan"))
+                val = detail_scores.get(name, float("nan"))
                 if val != val: continue
                 if direction == "↑":
                     if val >= good:   excellent += 1
@@ -441,8 +436,8 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
                     elif val <= mid:  acceptable += 1
                     else:             poor += 1
 
-            spd = bal_info.get("speedup", 0)
-            print(f"\n  Detailed breakdown ({balanced_key}, thresh={bal_info.get('thresh', '?'):.3f}, speedup={spd:.2f}x):")
+            spd = detail_info.get("speedup", 0)
+            print(f"\n  Detailed breakdown ({detail_key}, thresh={detail_info.get('thresh', '?'):.3f}, speedup={spd:.2f}x):")
             print(f"    {excellent} ✅ excellent   {acceptable} ✓ acceptable   {poor} ⚠ needs tuning\n")
 
             COL_SCORE = 8
@@ -454,7 +449,7 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
                         f"{rating:<{COL_RATING}}")
             score_rows = []
             for name, direction, _, good, mid in METRIC_LEGEND:
-                val = bal_scores.get(name, float("nan"))
+                val = detail_scores.get(name, float("nan"))
                 score_str = f"  {val:.4f}" if val == val else "    N/A"
                 if direction == "↑":
                     if val >= good:   rating = "✅ EXCELLENT"
