@@ -174,7 +174,30 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
         cfg.inject_into_transformer_options(to)
         to["enable_teacache"] = True
 
+        # Install step-tracking wrapper (same pattern as TeaCache.apply_teacache)
+        def tc_wrapper(model_function, kwargs):
+            c = kwargs["c"]
+            timestep = kwargs["timestep"]
+            c_to = c.setdefault("transformer_options", {})
+            sigmas = c_to.get("sample_sigmas")
+            if sigmas is not None:
+                matched = (sigmas == timestep[0]).nonzero()
+                if len(matched) > 0:
+                    step_idx = matched[0].item()
+                else:
+                    step_idx = 0
+                    for i in range(len(sigmas) - 1):
+                        if (sigmas[i] - timestep[0]) * (sigmas[i + 1] - timestep[0]) <= 0:
+                            step_idx = i
+                            break
+                c_to["current_percent"] = step_idx / max(len(sigmas) - 1, 1)
+                c_to["enable_teacache"] = (
+                    cfg.start_percent <= c_to["current_percent"] <= cfg.end_percent
+                )
+            return model_function(kwargs["input"], timestep, **c)
+
         try:
+            unet.set_model_unet_function_wrapper(tc_wrapper)
             t0 = time.time()
             img_tc = sample(
                 unet, clip, vae, SMOKE_PROMPT,
@@ -187,12 +210,14 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
                   f"speedup: {t_base/max(t_tc, 0.001):.2f}x")
         finally:
             dm._forward = original
+            unet.set_model_unet_function_wrapper(None)
             for k in list(to.keys()):
                 if k.startswith("tc_"):
                     del to[k]
             to.pop("enable_teacache", None)
             to.pop("rel_l1_thresh", None)
             to.pop("coefficients", None)
+            to.pop("current_percent", None)
     except Exception as e:
         print(f"\n  FAILED TeaCache forward: {e}")
         import traceback; traceback.print_exc()
