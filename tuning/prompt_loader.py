@@ -307,10 +307,16 @@ def _select_semantic_diversity(
     Picks prompts that are maximally distant in cosine space from all
     already-selected prompts.
 
-    This catches semantic drift that lexical (word-level) methods miss:
-    e.g. "samurai in bamboo forest at dawn" vs "elf archer in woods at
-    sunrise" — lexically different but semantically similar.
+    Falls back to text_diversity if sentence-transformers is not installed.
     """
+    try:
+        _get_semantic_model()
+    except ImportError:
+        print("  ⚠ sentence-transformers not installed. "
+              "Falling back to text_diversity for prompt selection.\n"
+              "    Install: pip install sentence-transformers")
+        return _select_text_diversity(pool, count, rng)
+
     import numpy as np
 
     count = min(count, len(pool))

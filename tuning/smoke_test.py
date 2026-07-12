@@ -24,6 +24,7 @@ from .utils import load_models, sample, get_diffusion_model, QualityMetrics
 from .recorder import make_calibration_forward
 from .forward import teacache_anima_forward
 from .optimize import simulate_config, fit_polynomial_coefficients, generate_candidate_configs
+from .prompt_loader import select_prompts, PromptEntry, PromptConfig
 
 
 SMOKE_PREFIX = (
@@ -49,6 +50,120 @@ SMOKE_RUNS = [
     {"sampler": "euler_a",       "steps": 32, "cfg": 5.5, "scheduler": "normal", "seed": 99},
     {"sampler": "euler_a",       "steps": 30, "cfg": 5.0, "scheduler": "simple", "seed": 64},
 ]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Prompt diversity test — 12 prompts designed to discriminate between
+#  tag_diversity, text_diversity, and semantic_diversity methods.
+# ═══════════════════════════════════════════════════════════════════════════
+
+DIVERSITY_TEST_PROMPTS = [
+    # A and B: same tags, lexically different, semantically very similar
+    PromptEntry(text="1girl, female elf archer, green cloak, aiming a bow in a sunlit forest clearing, sharp focus",
+                tags=["character", "action", "landscape", "day"]),
+    PromptEntry(text="1boy, male forest ranger, brown leather vest, drawing bowstring in a woodland glade at dawn, golden light",
+                tags=["character", "action", "landscape", "day"]),
+    # C and D: share some tags AND words (close-up, macro), different subjects
+    PromptEntry(text="close-up of a single dewdrop on a red rose petal, macro photography, golden morning light, shallow depth of field",
+                tags=["close_up", "photorealistic", "day", "landscape", "simple"]),
+    PromptEntry(text="extreme close-up of a hummingbird feeding from a pink hibiscus flower, vibrant colors, macro shot, wings frozen mid-flap",
+                tags=["close_up", "photorealistic", "day", "landscape", "action"]),
+    # E and F: completely different — no shared tags, words, or semantics
+    PromptEntry(text="futuristic cyberpunk mega-city at night, towering neon-lit skyscrapers, flying cars between buildings, rain-soaked streets, blade runner aesthetic",
+                tags=["landscape", "night", "cinematic", "detail_heavy"]),
+    PromptEntry(text="samurai warrior in traditional red armor standing in a misty bamboo forest, katana drawn, cherry blossoms drifting, dramatic monochrome ink wash painting style",
+                tags=["character", "action", "landscape", "day", "cinematic"]),
+    # G and H: share interior + character, different actions
+    PromptEntry(text="wizard casting a fireball spell in an ancient stone library, floating books and scrolls, magical orange glow, high vaulted ceilings",
+                tags=["character", "action", "interior", "night", "detail_heavy", "abstract"]),
+    PromptEntry(text="priest healing a wounded knight on the stone floor of a gothic cathedral, soft golden light from stained glass, peaceful atmosphere",
+                tags=["character", "couple", "interior", "day", "simple"]),
+    # I and J: share character format (1girl, hair, eyes) but different everything else
+    PromptEntry(text="1girl, Sylvarie, elf, long platinum blonde hair, bright violet eyes, pointed ears, wearing elegant silk gown, standing in a moonlit forest clearing",
+                tags=["character", "landscape", "night", "simple"]),
+    PromptEntry(text="1girl, Lyra, wolf girl, long silver hair, blue eyes, wolf ears, silver tail, oversized sweater, sitting on a futuristic city balcony at night, cyberpunk neon background",
+                tags=["character", "landscape", "night", "detail_heavy"]),
+    # K and L: multi-view prompts — share the tag, different characters
+    PromptEntry(text="1girl, multi view, character reference sheet, female android, chrome chassis, front, side, back, three-quarter views, expression set, technical blueprint style",
+                tags=["character", "multi_view", "simple", "abstract"]),
+    PromptEntry(text="1boy, multi view, turnaround, male barbarian, fur cloak, muscular, front view standing, side profile, back view, action pose with axe, war paint",
+                tags=["character", "multi_view", "simple", "action"]),
+]
+
+# Which pairs are designed to be close — each method should separate at least
+# some of these, but semantic_diversity should separate the most:
+#   (A, B): same tags, lexically different, semantically SIMILAR
+#   (C, D): share tags + some words, semantically DIFFERENT (dewdrop vs bird)
+#   (G, H): share interior/character, semantically SIMILAR (magic/intervention)
+#   (I, J): share character templates, semantically DIFFERENT (elf vs sci-fi)
+#   (K, L): share multi_view tag, lexically DIFFERENT (android vs barbarian)
+
+DIVERSITY_TEST_CONFIG = PromptConfig(
+    default_prefix="", default_negative="", prompts=DIVERSITY_TEST_PROMPTS
+)
+
+
+def _run_diversity_test():
+    """Test all three diversity methods on 12 crafted prompts, print analysis."""
+    print(f"\n{'─' * 60}")
+    print(f"  Prompt Diversity Test — tag vs text vs semantic")
+    print(f"{'─' * 60}")
+    print(f"  {len(DIVERSITY_TEST_PROMPTS)} prompts, picking 5 with each method\n")
+
+    # Print all prompts for reference
+    print(f"  Full pool:")
+    labels = "ABCDEFGHIJKL"
+    for i, p in enumerate(DIVERSITY_TEST_PROMPTS):
+        short = p.text[:75] + "..." if len(p.text) > 75 else p.text
+        print(f"    {labels[i]}: [{', '.join(p.tags[:4])}] {short}")
+    print()
+
+    methods = ["tag_diversity", "text_diversity", "semantic_diversity"]
+    descriptions = {
+        "tag_diversity":       "Maximizes unique tag coverage — picks different categories first",
+        "text_diversity":      "Maximizes word-level difference (Jaccard distance)",
+        "semantic_diversity":  "Maximizes semantic distance via MiniLM embeddings (80MB model)",
+    }
+
+    all_picks = {}
+    for method in methods:
+        picks = select_prompts(
+            DIVERSITY_TEST_CONFIG, method=method, count=5, seed=42
+        )
+        pick_labels = []
+        for p in picks:
+            for i, orig in enumerate(DIVERSITY_TEST_PROMPTS):
+                if p is orig:
+                    pick_labels.append(labels[i])
+                    break
+        all_picks[method] = pick_labels
+        print(f"  {method:>22}: {', '.join(pick_labels)}")
+        print(f"    {descriptions[method]}")
+
+    # Analysis
+    print(f"\n  Analysis:")
+    for method, picks in all_picks.items():
+        # Count how many of the designed pairs were separated
+        pairs = [("A", "B"), ("C", "D"), ("E", "F"), ("G", "H"),
+                 ("I", "J"), ("K", "L")]
+        separated = 0
+        for a, b in pairs:
+            if a in picks and b in picks:
+                separated += 0
+            elif a in picks or b in picks:
+                separated += 1
+        print(f"    {method:>22}: {separated}/6 designed pairs separated")
+
+    # Check semantic specifically
+    if "semantic_diversity" in all_picks:
+        sp = all_picks["semantic_diversity"]
+        # A vs B are semantically similar — they should NOT both be picked
+        ab_both = "A" in sp and "B" in sp
+        gh_both = "G" in sp and "H" in sp
+        print(f"    semantic: A/B both picked? {'yes (bad)' if ab_both else 'no (good)'}  "
+              f"G/H both picked? {'yes (bad)' if gh_both else 'no (good)'}")
+
+    print()
 
 
 def _run_calibration(unet, clip, vae, params, prompt_id):
@@ -193,17 +308,20 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
     print(f"  ComfyUI: {comfy_dir}")
     print(f"  Runs:    {len(SMOKE_RUNS)} varied (sampler, steps, cfg)")
 
-    # ── [1/7] Load models ──────────────────────────────────────────────
-    print("\n[1/7] Loading models...")
+    # ── [1/8] Load models ──────────────────────────────────────────────
+    print("\n[1/8] Loading models...")
     try:
         unet, clip, vae = load_models(comfy_dir, model_name, clip_name, clip_type, vae_name)
     except Exception as e:
         print(f"\n  FAILED to load models: {e}")
         return False
 
-    # ── [2/7] Baseline generation (no patching) ────────────────────────
+    # ── [2/8] Prompt diversity test ────────────────────────────────────
+    _run_diversity_test()
+
+    # ── [3/8] Baseline generation (no patching) ────────────────────────
     base_run = SMOKE_RUNS[0]
-    print(f"\n[2/7] Baseline generation ({base_run['steps']} steps, {base_run['sampler']}, cfg={base_run['cfg']})...")
+    print(f"\n[3/8] Baseline generation ({base_run['steps']} steps, {base_run['sampler']}, cfg={base_run['cfg']})...")
     try:
         t0 = time.time()
         img_base = sample(
@@ -220,8 +338,8 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
         import traceback; traceback.print_exc()
         return False
 
-    # ── [3/7] Calibration data collection ──────────────────────────────
-    print(f"\n[3/7] Collecting calibration data ({len(SMOKE_RUNS)} runs)...")
+    # ── [4/8] Calibration data collection ──────────────────────────────
+    print(f"\n[4/8] Collecting calibration data ({len(SMOKE_RUNS)} runs)...")
     all_entries = []
     try:
         for i, run in enumerate(SMOKE_RUNS):
@@ -243,8 +361,8 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
         import traceback; traceback.print_exc()
         return False
 
-    # ── [4/7] Mini-optimizer ───────────────────────────────────────────
-    print(f"\n[4/7] Mini-optimizer (running optimize.generate_candidate_configs + optimize)...")
+    # ── [5/8] Mini-optimizer ───────────────────────────────────────────
+    print(f"\n[5/8] Mini-optimizer (running optimize.generate_candidate_configs + optimize)...")
     try:
         candidates = generate_candidate_configs(tcfg)
         print(f"  Generated {len(candidates)} candidate configs")
@@ -332,8 +450,8 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
         import traceback; traceback.print_exc()
         return False
 
-    # ── [5/7] TeaCache comparison runs vs baseline ─────────────────────
-    print(f"\n[5/7] TeaCache comparison ({len(picks)} configs) vs baseline...")
+    # ── [6/8] TeaCache comparison runs vs baseline ─────────────────────
+    print(f"\n[6/8] TeaCache comparison ({len(picks)} configs) vs baseline...")
     base_run = SMOKE_RUNS[0]
     comparison = {}
 
@@ -357,8 +475,8 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
             import traceback; traceback.print_exc()
             return False
 
-    # ── [6/7] Quality check ────────────────────────────────────────────
-    print(f"\n[6/7] Quality check (all 12 metrics, Tier 3)...")
+    # ── [7/8] Quality check ────────────────────────────────────────────
+    print(f"\n[7/8] Quality check (all 12 metrics, Tier 3)...")
     try:
         qm = QualityMetrics(tier=3)
 
@@ -499,9 +617,9 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
     except Exception as e:
         print(f"  Could not compute metrics: {e}")
 
-    # ── [7/7] Summary ──────────────────────────────────────────────────
+    # ── [8/8] Summary ──────────────────────────────────────────────────
     print(f"\n{'=' * 60}")
-    print(f"  Smoke test PASSED — all 7 checks completed")
+    print(f"  Smoke test PASSED — all 8 checks completed")
     print(f"  Ready for full calibration run:")
     print(f"    PYTHONPATH='.:custom_nodes/ComfyUI-TeaCache-CosmosPredict'")
     print(f"    python -m tuning.calibrate --comfy-dir .")
