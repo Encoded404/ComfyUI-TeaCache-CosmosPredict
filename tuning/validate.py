@@ -216,15 +216,8 @@ def validate_config(
                 all_scores[k].append(scores.get(k, float("nan")))
 
             lpips = scores.get("lpips_alex", float("inf"))
-            item_text += f"speedup={speedup:.2f}x  LPIPS={lpips:.4f}"
-
-            # Show key Tier 2 metrics if available
-            if qm.tier >= 2:
-                item_text += "  FSIM={:.4f} VIF={:.3f}".format(
-                    scores.get("fsim", float("nan")),
-                    scores.get("vif", float("nan")),
-                )
-            print("  " + sp + f"speedup={speedup:.2f}x  LPIPS={lpips:.4f}")
+            print(f"  p={pi} s={seed} thresh={cfg.rel_l1_thresh} "
+                  f"speedup={speedup:.2f}x  LPIPS={lpips:.4f}")
 
     # Aggregate
     n = len(all_speedups)
