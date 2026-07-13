@@ -152,6 +152,7 @@ def run_single_teacache(
         )
         dt = time.time() - t0
     finally:
+        dm._forward = original
         cleanup_patch(dm, unet)
 
     return img, dt
