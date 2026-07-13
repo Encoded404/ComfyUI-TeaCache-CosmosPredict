@@ -39,6 +39,50 @@ from .config_types import (
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  Quality scoring functions
+# ═══════════════════════════════════════════════════════════════════════════
+
+def compute_quality_score(error: float, scoring: dict) -> float:
+    """Convert simulated accumulated error to a quality score (0-1).
+
+    scoring types:
+      "linear":       1/(1+error) — mild penalty, no params
+      "exponential":  exp(-error/target) — strong penalty beyond target
+      "gaussian":     exp(-0.5*(error/target)^2) — very strong beyond
+      "step":         1.0 if error < target else 0.0 — hard cutoff
+      "power":        1/(1+(error/target)^power) — configurable steepness
+
+    target: error threshold where quality drops significantly.
+      exponential: target → quality=0.37 (e^-1)
+      gaussian:    target → quality=0.61 (e^-0.5)
+      step:        target → hard quality=0
+      power:       target → quality=0.50
+    """
+    stype = scoring.get("type", "exponential")
+    target = max(scoring.get("target", 0.05), 1e-8)
+
+    if stype == "linear":
+        return 1.0 / (1.0 + error)
+
+    if stype == "exponential":
+        return math.exp(-error / target)
+
+    if stype == "gaussian":
+        x = error / target
+        return math.exp(-0.5 * x * x)
+
+    if stype == "step":
+        return 1.0 if error < target else 0.0
+
+    if stype == "power":
+        p = scoring.get("power", 2.0)
+        x = error / target
+        return 1.0 / (1.0 + x ** p)
+
+    return 1.0 / (1.0 + error)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  Pre-computed polynomial fit cache
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -460,8 +504,11 @@ def optimize(configs: List[TeacacheConfig],
     last_log = 0
     sim_entries = holdout_entries if do_cv else entries
     thresholds = opt.get("candidate_thresholds", [0.07])
+    scoring_config = opt.get("quality_scoring", {"type": "exponential", "target": 0.05})
 
     print(f"  Candidate thresholds: {thresholds}")
+    print(f"  Quality scoring:      {scoring_config['type']} "
+          f"(target={scoring_config.get('target', 0.05)})")
 
     # ── Pre-compute all unique polynomial fits ──────────────────────────
     t_pre = time_mod.time()
@@ -508,7 +555,8 @@ def optimize(configs: List[TeacacheConfig],
             ):
                 cfg = configs[idx]
                 cfg.rel_l1_thresh = best_thresh
-                score = sp * qp
+                quality = compute_quality_score(err, scoring_config)
+                score = sp * quality
                 results[idx] = OptimizationResult(
                     config=cfg, skip_rate=skip, estimated_speedup=sp,
                     accumulated_error=err, score=score,
@@ -550,7 +598,8 @@ def optimize(configs: List[TeacacheConfig],
                     best_skip, best_err, best_sp, best_qp = skip_rate, avg_error, speedup, quality
 
             cfg.rel_l1_thresh = best_thresh
-            score = best_sp * best_qp
+            quality = compute_quality_score(best_err, scoring_config)
+            score = best_sp * quality
             results[i] = OptimizationResult(
                 config=cfg, skip_rate=best_skip, estimated_speedup=best_sp,
                 accumulated_error=best_err, score=score,
@@ -624,7 +673,7 @@ def optimize(configs: List[TeacacheConfig],
         for t in sweep_values:
             cfg.rel_l1_thresh = t
             skip, err, sp, qp = simulate_config(sim_entries, cfg)
-            sc = sp * qp
+            sc = sp * compute_quality_score(err, scoring_config)
             if sc > best_sc:
                 best_sc = sc
                 best_t = t
