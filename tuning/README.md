@@ -222,15 +222,19 @@ The forward function (`forward.py`) implements every TeaCache parameter we searc
 
 | # | Knob | Values | Location |
 |---|------|--------|----------|
-| 1 | Signal source | t_emb, first_block_shift, pooled_latent (fixed-grid) | `forward.py:306-315` |
-| 2 | Distance metric | mean_only, mean_and_max, mean_max_std, weighted_sum | `forward.py:39-76` |
-| 3 | Signal scale | manual values + auto_scale_target | `forward.py:350` |
-| 4 | Mapping | identity, polynomial, power_law, softplus | `forward.py:92-134` |
-| 5 | Accumulation | hard_reset, carry_over, leaky, windowed | `forward.py:141-178` |
-| 6 | Threshold | swept per config | `forward.py:441` |
-| 7 | Step schedule | constant, cosine, linear_ramp, linear_decay, bell | `forward.py:200-230` |
-| 8 | Block mode | all_or_nothing, split_fraction, split_groups | `forward.py:230-285` |
-| 9 | Residual | hard, blended, scaled | `forward.py:297-318` |
-| 10 | Cross-feed | enabled, strength 0-1 | `forward.py:432-441` |
+| 1 | Signal source | t_emb, first_block_shift, pooled_latent | `forward.py:422-443` |
 
 All fallthrough branches log warnings so missing options are immediately visible.
+
+### Pooled latent mode (`pooled_latent_mode`)
+
+When using `source: pooled_latent`, two pooling strategies are available:
+
+| Mode | Description | Speed | Resolution independence |
+|------|-------------|-------|------------------------|
+| `mean` (default) | Simple `x.mean(dim=(1,2))` — single CUDA reduction | **10-20× faster** | Yes, via ratio cancellation |
+| `fixed_grid` | AdaptiveAvgPool2d to 16×16 grid | Slow (permute + pool2d + reshape) | Explicitly resolution-normalized |
+
+**Why `mean` is resolution-independent**: The TeaCache distance metric is `rel_l1 = |curr - prev| / |prev|`. Both numerator and denominator are computed from the same pooled tensor, so token count scales them identically — the ratio cancels out. Fixed-grid pooling was originally added assuming absolute magnitude mattered, but it doesn't for a ratio metric.
+
+To use `fixed_grid`: set `"pooled_latent_mode": "fixed_grid"` in the config's `mapping_params_scenarios` for pooled_latent source configs. Only runs when TeaCache is active (not on start/end percent steps).

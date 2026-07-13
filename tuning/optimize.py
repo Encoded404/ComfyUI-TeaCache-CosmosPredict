@@ -408,6 +408,11 @@ def generate_candidate_configs(tcfg: TuningConfig,
                         mapping_params_list = [{}]  # no extra params, coefficients from fit
 
                     for mapping_params in mapping_params_list:
+                        # Merge source-level config into mapping_params
+                        if source == "pooled_latent":
+                            pl_mode = opt.get("pooled_latent_mode", "mean")
+                            if "pooled_latent_mode" not in mapping_params:
+                                mapping_params = dict(mapping_params, pooled_latent_mode=pl_mode)
                         for accum_type in opt["accumulation_types"]:
                             for accum_params_dict in opt["accumulation_params"]:
                                 if accum_type == "hard_reset" and accum_params_dict != {}:
