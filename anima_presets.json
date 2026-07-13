@@ -1,0 +1,37 @@
+{
+    "_description": "Pre-tuned TeaCache configurations for Anima/Cosmos-Predict2. Calibrated at 30 steps, 512². Slope maps quality slider (0-100) to threshold via exponential interpolation between control points.",
+    "_tuning": "12 prompts × 2 seeds × 5 step variants, pooled_latent source, carry_over, bell schedule",
+
+    "defaults": {
+        "source": "pooled_latent",
+        "metric_type": "mean_only",
+        "metric_weights": {"mean": 1.0},
+        "signal_scale": 1.0,
+        "mapping_type": "identity",
+        "coefficients": [],
+        "accumulation_type": "carry_over",
+        "accumulation_params": {},
+        "step_schedule": "bell",
+        "start_percent": 0.05,
+        "end_percent": 0.95,
+        "block_mode": "all_or_nothing",
+        "residual_strategy": "hard",
+        "cross_feed_enabled": false
+    },
+
+    "quality_zones": [
+        {
+            "quality_range": [0, 100],
+            "label": "Pooled latent + carry-over",
+            "thresh_curve": "exponential",
+            "control_points": [
+                {"quality": 0,   "thresh": 0.03, "speedup": 1.01, "lpips": 0.003},
+                {"quality": 25,  "thresh": 0.20, "speedup": 1.08, "lpips": 0.015},
+                {"quality": 50,  "thresh": 0.51, "speedup": 1.34, "lpips": 0.070},
+                {"quality": 75,  "thresh": 0.70, "speedup": 1.50, "lpips": 0.120},
+                {"quality": 100, "thresh": 1.00, "speedup": 1.96, "lpips": 0.220}
+            ],
+            "config_overrides": {}
+        }
+    ]
+}
