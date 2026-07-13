@@ -101,10 +101,9 @@ def _build_config(quality: float) -> TeacacheConfig:
 def _apply_teacache(model, cfg: TeacacheConfig):
     """Apply a TeaCache config as the model's _forward.
 
-    Uses the same patching mechanism as nodes.py's TeaCache.apply_teacache,
-    but targeted at the Anima/Cosmos MiniTrainDIT architecture.
+    Patches MiniTrainDIT._forward directly (no unittest.mock needed).
+    Same pattern used by the tuning pipeline (calibrate.py, validate.py).
     """
-    import comfy.patcher_extension as patch
     from .tuning.forward import teacache_anima_forward
 
     new_model = model.clone()
@@ -114,12 +113,9 @@ def _apply_teacache(model, cfg: TeacacheConfig):
     to = new_model.model_options.setdefault("transformer_options", {})
     cfg.inject_into_transformer_options(to)
 
-    # Patch the _forward method
-    context = patch.multiple(
-        diffusion_model,
-        _forward=teacache_anima_forward.__get__(
-            diffusion_model, diffusion_model.__class__
-        ),
+    # Patch the _forward method directly on the instance
+    diffusion_model._forward = teacache_anima_forward.__get__(
+        diffusion_model, diffusion_model.__class__
     )
 
     # Wrapper to track step index and enable/disable TeaCache
@@ -131,7 +127,6 @@ def _apply_teacache(model, cfg: TeacacheConfig):
         sigmas = c_to.get("sample_sigmas")
 
         if sigmas is not None:
-            # Find current step index from sigma matching
             matched = (sigmas == timestep[0]).nonzero()
             if len(matched) > 0:
                 step_idx = matched[0].item()
@@ -146,8 +141,7 @@ def _apply_teacache(model, cfg: TeacacheConfig):
                 cfg.start_percent <= c_to["current_percent"] <= cfg.end_percent
             )
 
-        with context:
-            return model_function(input_x, timestep, **c)
+        return model_function(input_x, timestep, **c)
 
     new_model.set_model_unet_function_wrapper(unet_wrapper)
     return new_model
