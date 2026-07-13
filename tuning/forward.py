@@ -419,25 +419,34 @@ def teacache_anima_forward(
     )
     t_embedding_B_T_D = self.t_embedding_norm(t_embedding_B_T_D)
 
-    cache_device = transformer_options.get("cache_device", x_B_T_H_W_D.device)
-
     # ── 2. Select modulated input (Knob 1) ──
+    # prev_mod must always match the source type (used for state tracking
+    # even when TeaCache is disabled). For pooled_latent, use the fast
+    # simple mean when TeaCache is off to avoid overhead.
     if cfg.source == "first_block_shift":
         adaln_self = self.blocks[0].adaln_modulation_self_attn(t_embedding_B_T_D)
         if adaln_lora_B_T_3D is not None and getattr(self, "use_adaln_lora", False):
             adaln_self = adaln_self + adaln_lora_B_T_3D
         modulated_inp = adaln_self.chunk(3, dim=-1)[0].to(cache_device)
     elif cfg.source == "pooled_latent":
-        # Fixed-grid pooling: resolution-independent via AdaptiveAvgPool2d
-        try:
-            import torch.nn.functional as F
-            N, T, H, W, D = x_B_T_H_W_D.shape
-            x_resh = x_B_T_H_W_D.permute(0, 2, 3, 1, 4).reshape(N * T, H, W, D)
-            x_resh = x_resh.permute(0, 3, 1, 2)  # (N*T, D, H, W)
-            pooled = F.adaptive_avg_pool2d(x_resh.float(), (16, 16))  # 16×16 fixed grid
-            pooled = pooled.permute(0, 2, 3, 1).reshape(N, T, 16 * 16, D).mean(dim=2)
-            modulated_inp = pooled.to(cache_device)
-        except Exception:
+        # Default: simple spatial mean (10-20× faster than AdaptiveAvgPool2d).
+        # Resolution-independent because rel_l1 is a ratio — both numerator
+        # (|diff|) and denominator (|prev|) scale identically with token count.
+        # For explicit fixed-grid pooling, set pooled_latent_mode: "fixed_grid"
+        # in mapping_params.
+        pooled_mode = cfg.mapping_params.get("pooled_latent_mode", "mean")
+        if transformer_options.get("enable_teacache", True) and pooled_mode == "fixed_grid":
+            try:
+                import torch.nn.functional as F
+                N, T, H, W, D = x_B_T_H_W_D.shape
+                x_resh = x_B_T_H_W_D.permute(0, 2, 3, 1, 4).reshape(N * T, H, W, D)
+                x_resh = x_resh.permute(0, 3, 1, 2)
+                pooled = F.adaptive_avg_pool2d(x_resh.float(), (16, 16))
+                pooled = pooled.permute(0, 2, 3, 1).reshape(N, T, 16 * 16, D).mean(dim=2)
+                modulated_inp = pooled.to(cache_device)
+            except Exception:
+                modulated_inp = x_B_T_H_W_D.mean(dim=(1, 2)).to(cache_device)
+        else:
             modulated_inp = x_B_T_H_W_D.mean(dim=(1, 2)).to(cache_device)
     else:
         modulated_inp = t_embedding_B_T_D.to(cache_device)
