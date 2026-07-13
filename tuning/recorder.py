@@ -86,8 +86,8 @@ def make_calibration_forward(source_hint: str = "all"):
             shift_raw = shift_raw + adaln_lora
         shift_val = shift_raw.chunk(3, dim=-1)[0]  # (B, D) — just the shift
 
-        # Pooled latent
-        latent_pooled = x_B_T_H_W_D.mean(dim=(1, 2))  # (B, D)
+        # Pooled latent — mean over all spatial dims (T=1, H, W)
+        latent_pooled = x_B_T_H_W_D.mean(dim=(1, 2, 3))  # (B, D)
 
         to = kwargs.get("transformer_options", {})
         cache_device = to.get("cache_device", x_B_T_H_W_D.device)

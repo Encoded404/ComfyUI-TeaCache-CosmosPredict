@@ -456,9 +456,9 @@ def teacache_anima_forward(
                 pooled = pooled.permute(0, 2, 3, 1).reshape(N, T, 16 * 16, D).mean(dim=2)
                 modulated_inp = pooled.to(cache_device)
             except Exception:
-                modulated_inp = x_B_T_H_W_D.mean(dim=(1, 2)).to(cache_device)
+                modulated_inp = x_B_T_H_W_D.mean(dim=(1, 2, 3)).to(cache_device)
         else:
-            modulated_inp = x_B_T_H_W_D.mean(dim=(1, 2)).to(cache_device)
+            modulated_inp = x_B_T_H_W_D.mean(dim=(1, 2, 3)).to(cache_device)
     else:
         modulated_inp = t_embedding_B_T_D.to(cache_device)
 
@@ -540,16 +540,19 @@ def teacache_anima_forward(
     if not hasattr(self, "_tc_diag_runs"):
         self._tc_diag_runs = 0
         self._tc_diag_skips = 0
+        self._tc_diag_first_mod = None
     self._tc_diag_runs += 1
     if not should_calc_global:
         self._tc_diag_skips += 1
-    if transformer_options.get("current_percent", 0) >= 0.98:
+    # Print summary on the last cache-eligible step (before end_percent cutoff)
+    cp = transformer_options.get("current_percent", 0)
+    if cp > 0 and cp >= cfg.end_percent and self._tc_diag_runs > 1 and not hasattr(self, "_tc_diag_final"):
+        self._tc_diag_final = True
         total = self._tc_diag_runs
         skipped = self._tc_diag_skips
-        if total > 0 and not hasattr(self, "_tc_diag_final"):
-            self._tc_diag_final = True
-            print(f"  [TeaCache] Cache summary: {skipped}/{total} blocks skipped "
-                  f"({skipped/total*100:.0f}% cached)")
+        print(f"  [TeaCache] Cache: {skipped}/{total} blocks skipped "
+              f"({skipped/total*100:.0f}% cached)  "
+              f"thresh={cfg.rel_l1_thresh}  src={cfg.source}")
 
     # ── 6. Block execution (Knob 8) or residual skip (Knob 9) ──
     block_kwargs = {
