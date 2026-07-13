@@ -314,17 +314,12 @@ def main():
     prompts = load_validation_prompts(tcfg)
     seeds = tcfg.validation["seeds"]
 
-    # Select top-K diverse configs
-    # Pick from different points on the Pareto frontier
-    sorted_by_speed = sorted(pareto_configs, key=lambda r: r.estimated_speedup)
-    selected = []
+    # Select top-K configs by score (best quality-speedup tradeoff first)
+    sorted_by_score = sorted(pareto_configs, key=lambda r: r.score, reverse=True)
+    n = min(args.top_k, len(sorted_by_score))
+    selected = sorted_by_score[:n]
 
-    # Pick configs evenly distributed along the frontier
-    n = min(args.top_k, len(sorted_by_speed))
-    indices = [int(i * (len(sorted_by_speed) - 1) / max(n - 1, 1)) for i in range(n)]
-    selected = [sorted_by_speed[i] for i in sorted(set(indices))]
-
-    print(f"\nValidating {len(selected)} configurations...")
+    print(f"\nValidating {len(selected)} configurations (top-{n} by score)...")
 
     all_results = []
     for idx, opt_result in enumerate(selected):
