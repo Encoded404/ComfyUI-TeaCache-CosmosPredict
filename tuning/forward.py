@@ -390,6 +390,15 @@ def teacache_anima_forward(
     transformer_options = kwargs.get("transformer_options", {})
     cfg = TeacacheConfig.from_transformer_options(transformer_options)
 
+    # One-time diagnostic: confirm TeaCache is active
+    if not hasattr(self, "_tc_diag_printed"):
+        self._tc_diag_printed = True
+        steps_info = transformer_options.get("sample_sigmas")
+        n_steps = len(steps_info) if steps_info is not None else "?"
+        print(f"  [TeaCache] Active: src={cfg.source} thresh={cfg.rel_l1_thresh} "
+              f"acc={cfg.accumulation_type} sched={cfg.step_schedule} "
+              f"steps={n_steps} start={cfg.start_percent} end={cfg.end_percent}")
+
     # ── 1. Preamble (copied from MiniTrainDIT._forward) ──
     orig_shape = list(x.shape)
 
@@ -526,6 +535,21 @@ def teacache_anima_forward(
         )
     else:
         should_calc_global = True
+
+    # Diagnostic: track cache decisions
+    if not hasattr(self, "_tc_diag_runs"):
+        self._tc_diag_runs = 0
+        self._tc_diag_skips = 0
+    self._tc_diag_runs += 1
+    if not should_calc_global:
+        self._tc_diag_skips += 1
+    if transformer_options.get("current_percent", 0) >= 0.98:
+        total = self._tc_diag_runs
+        skipped = self._tc_diag_skips
+        if total > 0 and not hasattr(self, "_tc_diag_final"):
+            self._tc_diag_final = True
+            print(f"  [TeaCache] Cache summary: {skipped}/{total} blocks skipped "
+                  f"({skipped/total*100:.0f}% cached)")
 
     # ── 6. Block execution (Knob 8) or residual skip (Knob 9) ──
     block_kwargs = {
