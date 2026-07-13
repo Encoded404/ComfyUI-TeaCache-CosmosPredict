@@ -102,17 +102,30 @@ def _init_worker(shared_entries, shared_poly_cache, shared_opt):
 
 
 def _process_config(idx_and_cfg: tuple) -> tuple:
-    """Process a single config in a worker process. Returns (idx, skip, err, sp, qp)."""
+    """Process a single config in a worker process. Sweeps candidate thresholds.
+
+    Returns (idx, skip, err, sp, qp, best_thresh).
+    """
     idx, cfg = idx_and_cfg
     global _worker_entries, _worker_poly_cache, _worker_opt
 
-    # Look up pre-computed coefficients
     if cfg.mapping_type == "polynomial":
         key = _poly_fit_key(cfg)
         cfg.coefficients = _worker_poly_cache.get(key, [])
 
-    skip, err, sp, qp = simulate_config(_worker_entries, cfg)
-    return idx, skip, err, sp, qp
+    thresholds = _worker_opt.get("candidate_thresholds", [0.07])
+    best_score = -1.0
+    best = (0.0, 0.0, 1.0, 1.0, 0.07)
+
+    for t in thresholds:
+        cfg.rel_l1_thresh = t
+        skip, err, sp, qp = simulate_config(_worker_entries, cfg)
+        sc = sp * qp
+        if sc > best_score:
+            best_score = sc
+            best = (skip, err, sp, qp, t)
+
+    return idx, *best
 from .forward import (
     compute_distance, apply_mapping, accumulate_distance,
     step_schedule_multiplier,
@@ -446,6 +459,9 @@ def optimize(configs: List[TeacacheConfig],
     total = len(configs)
     last_log = 0
     sim_entries = holdout_entries if do_cv else entries
+    thresholds = opt.get("candidate_thresholds", [0.07])
+
+    print(f"  Candidate thresholds: {thresholds}")
 
     # ── Pre-compute all unique polynomial fits ──────────────────────────
     t_pre = time_mod.time()
@@ -487,10 +503,11 @@ def optimize(configs: List[TeacacheConfig],
             initializer=_init_worker,
             initargs=(sim_entries, poly_cache, opt),
         ) as pool:
-            for idx, skip, err, sp, qp in pool.imap_unordered(
+            for idx, skip, err, sp, qp, best_thresh in pool.imap_unordered(
                 _process_config, indexed, chunksize=chunksz
             ):
                 cfg = configs[idx]
+                cfg.rel_l1_thresh = best_thresh
                 score = sp * qp
                 results[idx] = OptimizationResult(
                     config=cfg, skip_rate=skip, estimated_speedup=sp,
@@ -515,13 +532,28 @@ def optimize(configs: List[TeacacheConfig],
             if cfg.mapping_type == "polynomial":
                 cfg.coefficients = poly_cache.get(_poly_fit_key(cfg), [])
 
-            skip_rate, avg_error, speedup, quality = simulate_config(
-                sim_entries, cfg
-            )
-            score = speedup * quality
+            best_score = -1.0
+            best_thresh = thresholds[0]
+            best_skip = best_err = 0.0
+            best_sp = 1.0
+            best_qp = 1.0
+
+            for t in thresholds:
+                cfg.rel_l1_thresh = t
+                skip_rate, avg_error, speedup, quality = simulate_config(
+                    sim_entries, cfg
+                )
+                sc = speedup * quality
+                if sc > best_score:
+                    best_score = sc
+                    best_thresh = t
+                    best_skip, best_err, best_sp, best_qp = skip_rate, avg_error, speedup, quality
+
+            cfg.rel_l1_thresh = best_thresh
+            score = best_sp * best_qp
             results[i] = OptimizationResult(
-                config=cfg, skip_rate=skip_rate, estimated_speedup=speedup,
-                accumulated_error=avg_error, score=score,
+                config=cfg, skip_rate=best_skip, estimated_speedup=best_sp,
+                accumulated_error=best_err, score=score,
             )
 
             elapsed = time_mod.time() - t0
@@ -569,6 +601,43 @@ def optimize(configs: List[TeacacheConfig],
           f"in {p_elapsed:.1f}s")
     print(f"[time]   {elapsed:.1f}s total, {elapsed/total*1000:.1f}ms/config, "
           f"{elapsed/len(configs)*1000:.1f}ms/candidate")
+
+    # ── Pareto threshold sweep ─────────────────────────────────────────
+    # Fine-tune each Pareto winner's threshold across the full range.
+    # This replaces the coarse candidate_thresholds with the individually
+    # optimal threshold for each frontier config.
+    pareto_range = opt.get("pareto_threshold_range", [0.001, 10.0])
+    pareto_count = opt.get("pareto_threshold_count", 300)
+    t_sweep_start = time_mod.time()
+    import numpy as _np
+    sweep_values = _np.geomspace(*pareto_range, num=pareto_count).tolist()
+
+    print(f"\n  Pareto threshold sweep: {pareto_count} values "
+          f"[{pareto_range[0]:.3f}..{pareto_range[1]:.1f}] on {len(pareto)} configs...")
+
+    for r in pareto:
+        cfg = r.config
+        best_t = cfg.rel_l1_thresh
+        best_sc = r.score
+        best_sk, best_er, best_sp = r.skip_rate, r.accumulated_error, r.estimated_speedup
+
+        for t in sweep_values:
+            cfg.rel_l1_thresh = t
+            skip, err, sp, qp = simulate_config(sim_entries, cfg)
+            sc = sp * qp
+            if sc > best_sc:
+                best_sc = sc
+                best_t = t
+                best_sk, best_er, best_sp = skip, err, sp
+
+        cfg.rel_l1_thresh = best_t
+        r.skip_rate = best_sk
+        r.accumulated_error = best_er
+        r.estimated_speedup = best_sp
+        r.score = best_sc
+
+    t_sweep_elapsed = time_mod.time() - t_sweep_start
+    print(f"  Pareto sweep complete in {t_sweep_elapsed:.1f}s\n")
 
     return results, pareto
 

@@ -86,8 +86,9 @@
                 {"always_groups": [0, 1, 2], "cache_groups": []}
             ]
         },
-        "threshold_range": [0.01, 10.0],
-        "threshold_count": 300,
+        "candidate_thresholds": [0.01, 0.07, 0.20],
+        "pareto_threshold_range": [0.001, 10.0],
+        "pareto_threshold_count": 300,
         "poly_degree": 4,
         "cross_validate": true,
         "cv_holdout_fraction": 0.2,
