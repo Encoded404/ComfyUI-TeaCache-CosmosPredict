@@ -419,6 +419,8 @@ def teacache_anima_forward(
     )
     t_embedding_B_T_D = self.t_embedding_norm(t_embedding_B_T_D)
 
+    cache_device = transformer_options.get("cache_device", x_B_T_H_W_D.device)
+
     # ── 2. Select modulated input (Knob 1) ──
     # prev_mod must always match the source type (used for state tracking
     # even when TeaCache is disabled). For pooled_latent, use the fast
