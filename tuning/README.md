@@ -14,34 +14,51 @@ python -m tuning.smoke_test --comfy-dir .
 
 ## Pipeline
 
-1. **Smoke test** (`smoke_test.py`) — 8 quick checks, ~5 min
-2. **Calibration** (`calibrate.py`) — records per-step data, 1-4 hours
-3. **Optimization** (`optimize.py`) — offline config search, 1-30 min CPU
-4. **Validation** (`validate.py`) — end-to-end quality metrics, 30 min
+1. **Smoke test** (`smoke_test.py`) — 8 quick checks including diversity test, mini-optimizer, daraskme reference. ~6 min on V100 at 512².
+2. **Calibration** (`calibrate.py`) — records per-step (rel_l1, out_rel) pairs across diverse prompts, seeds, step counts, samplers, and CFGs. Shows run schedule with time/disk estimates before starting. 30 min–4 hours.
+3. **Optimization** (`optimize.py`) — offline config search. Pre-computes polynomial fits, sweeps candidate thresholds, builds Pareto frontier, fine-tunes winner thresholds. Multi-core CPU, 3–30 min.
+4. **Validation** (`validate.py`) — end-to-end quality metrics (PSNR, SSIM, LPIPS, DISTS, MS-SSIM, FSIM, VIF, GMSD). Shows comparison table and recommendation.
 
-## Configuration
+```bash
+# Phase 1 — calibration (run on V100)
+python -m tuning.calibrate --comfy-dir .
 
-All settings are in `config.json`. Key sections:
+# Phase 2 — optimization (run on CPU after Phase 1)
+python -m tuning.optimize --data outputs/<timestamp>/calibration_data.jsonl
 
-### Prompt filtering (`config.json` → `calibration.prompt_tag_filter`)
+# Phase 3 — validation (run on V100 after Phase 2)
+python -m tuning.validate --comfy-dir . \
+    --pareto outputs/optimization/pareto_frontier.json \
+    --top-k 10 --tier 2 --extra-sweep
+```
+
+## Architecture
+
+```
+calibrate.py  ──→  calibration_data.jsonl  ──→  optimize.py  ──→  pareto_frontier.json
+                                                                    │
+validate.py  ←──────────────────────────────────────────────────────┘
+    │
+    └── validation_results.json
+```
+
+The smoke test runs all three phases on a tiny dataset to verify everything works.
+
+---
+
+## Configuration Reference
+
+All settings are in `config.json`.
+
+### Prompt filtering (`calibration.prompt_tag_filter`)
 
 Control which prompts are used for calibration. Tags are defined in the prompt JSON files.
 
 ```json
-// Use ALL prompts:
-"prompt_tag_filter": null
-
-// Exclude NSFW content:
-"prompt_tag_filter": ["-nsfw"]
-
-// Only character prompts, exclude NSFW:
-"prompt_tag_filter": ["character", "-nsfw"]
-
-// Only landscape and interior scenes:
-"prompt_tag_filter": ["landscape", "interior"]
-
-// Exclude multiple tags:
-"prompt_tag_filter": ["-nsfw", "-abstract", "-multi_view"]
+"prompt_tag_filter": null              // Use ALL prompts
+"prompt_tag_filter": ["-nsfw"]         // Exclude NSFW
+"prompt_tag_filter": ["character", "-nsfw"]  // Character prompts, no NSFW
+"prompt_tag_filter": ["landscape", "interior"]  // Only landscapes/interiors
 ```
 
 **Tag reference** (defined in `prompt_loader.py`):
@@ -64,53 +81,156 @@ Control which prompts are used for calibration. Tags are defined in the prompt J
 | `cinematic` | Film-like composition |
 | `close_up` | Close-up shot |
 
-### Prompt selection method (`config.json` → `calibration.prompt_selection`)
+### Prompt selection methods (`calibration.prompt_selection`)
 
 ```json
 "prompt_selection": "from_top"          // Take first N (deterministic)
-"prompt_selection": "text_diversity"    // Maximize word-level variety
+"prompt_selection": "text_diversity"    // Maximize word-level variety (Jaccard)
 "prompt_selection": "tag_diversity"     // Maximize tag coverage
-"prompt_selection": "semantic_diversity" // Maximize meaning variety (needs sentence-transformers)
+"prompt_selection": "semantic_diversity" // MiniLM embeddings (needs sentence-transformers)
 "prompt_selection": "random"            // Random selection
 ```
 
-### Search space limits
+### Calibration variety (`sampling`)
 
-If optimization takes too long, cap the candidate count:
+The calibrator cycles sampler, scheduler, and CFG per prompt for training data diversity:
 
 ```json
-"max_candidates": 5000   // Randomly sample 5000 configs (seeded, reproducible)
-"max_candidates": 0      // Unlimited (may take hours with large config spaces)
+"sampler_variants": ["er_sde", "dpmpp_2m_sde", "euler_a"],
+"scheduler_variants": ["normal", "simple"],
+"cfg_variants": [4.0, 4.5, 5.0, 5.5]
+```
+
+Each calibration entry records which sampler/scheduler was used, enabling sampler-aware tuning in the future.
+
+### Optimization search space (`optimization`)
+
+**Dimensions swept**: source signals, distance metrics, mapping functions, accumulation strategies, step schedules, signal scales, residual strategies, block splitting modes.
+
+```json
+"sources": ["t_emb", "first_block_shift", "pooled_latent"],
+"mapping_types": ["identity", "polynomial", "power_law", "softplus"],
+"accumulation_types": ["hard_reset", "carry_over", "leaky", "windowed"],
+"residual_strategies": ["hard", "blended", "scaled"],
+"step_schedules": ["constant", "cosine", "linear_ramp", "linear_decay", "bell"],
+"block_modes": ["all_or_nothing", "split_fraction", "split_groups"]
+```
+
+### Threshold sweeping (`optimization`)
+
+Two-phase sweep gives precise optimal thresholds:
+
+```json
+"candidate_thresholds": [0.01, 0.07, 0.20],  // Tested on EVERY candidate
+"pareto_threshold_range": [0.001, 10.0],      // Fine sweep for winners only
+"pareto_threshold_count": 300                 // Log-spaced steps
+```
+
+### Quality scoring (`optimization.quality_scoring`)
+
+Controls how simulated error is mapped to quality (0-1). The scoring function determines which configs the Pareto frontier favors.
+
+```json
+"quality_scoring": {
+    "type": "exponential",   // Type (see below)
+    "target": 0.05           // Error threshold where quality drops ~60%
+}
+```
+
+| Type | Formula | Description |
+|------|---------|-------------|
+| `linear` | `1/(1+error)` | Mild penalty — speedup dominates at all ranges |
+| `exponential` | `exp(-error/target)` | Strong discrimination — error beyond target is heavily penalized |
+| `gaussian` | `exp(-0.5*(error/target)²)` | Very strong — even moderate errors are penalized |
+| `step` | `1.0 if error < target else 0.0` | Hard cutoff — only configs below target qualify |
+| `power` | `1/(1+(error/target)^power)` | Configurable — add `"power": 2.0` for steepness |
+
+**Effect at different error levels (target=0.05)**:
+
+| error | linear | exponential | gaussian | step | power(2) |
+|-------|--------|-------------|----------|------|----------|
+| 0.001 | 0.999 | 0.980 | 1.000 | 1.0 | 1.000 |
+| 0.025 | 0.976 | 0.607 | 0.882 | 1.0 | 0.800 |
+| 0.050 | 0.952 | 0.368 | 0.607 | 1.0 | 0.500 |
+| 0.100 | 0.909 | 0.135 | 0.135 | 0.0 | 0.200 |
+
+Default is `exponential` for a balanced tradeoff.
+
+### Search space limits
+
+```json
+"max_candidates": 0      // 0 = unlimited. Set to e.g. 5000 for faster runs.
+"auto_scale_target": 0.3 // Data-driven scale: scale = target / avg_distance
 ```
 
 ### Performance tuning
 
 - Set `width: 512, height: 512` for calibration — 4x faster than 1024²
-- Reduce `num_prompts` for faster calibration
+- Reduce `num_prompts` and `seeds` count for faster calibration
 - Set `max_candidates: 5000` to cap the optimizer
-- The `auto_scale_target` computes data-driven scale factors
+- The optimizer uses **pre-computed polynomial fits** — ~60 unique fits replace 400K redundant polyfit calls
+- The optimizer uses **multiprocessing (spawn)** when total work > 10M entry-iterations (~2s serial). Chunksize auto-tuned for ~30 IPC rounds.
+- **Two-phase threshold sweep**: candidate phase runs 3 thresholds per config (0.01, 0.07, 0.20), Pareto phase fine-tunes winners across 300 values
 
 ### Adding new prompts
 
-Prompts are stored in `prompts/calibration.json` and `prompts/benchmark.json`.
-Each prompt needs a `text` field and a `tags` list:
+Prompts are stored in `prompts/calibration.json` (43 prompts) and `prompts/benchmark.json` (12 prompts). Each prompt needs a `text` field, `tags` list, and optional `nsfw` / `background_only` flags:
 
 ```json
 {
-  "text": "1girl, elf archer, forest background, ...",
+  "text": "1girl, elf archer, forest background, sunlit clearing...",
+  "prefix": null,
+  "negative": null,
   "tags": ["character", "action", "landscape", "day"],
   "nsfw": false
 }
 ```
 
-## Architecture
+Prefix/negative can be overridden per-prompt or use the global defaults from the file header.
 
-```
-calibrate.py  ──→  calibration_data.jsonl  ──→  optimize.py  ──→  pareto_frontier.json
-                                                                    │
-validate.py  ←──────────────────────────────────────────────────────┘
-    │
-    └── validation_results.json
-```
+---
 
-The smoke test runs all three phases on a tiny dataset to verify everything works before committing to a multi-hour calibration run.
+## How the Optimizer Works
+
+### Pre-computed polynomial fits
+
+The optimizer extracts all unique `(source, metric_type, weights, scale)` combinations from the ~800K candidates — only ~60 are unique. Each is fitted once via `numpy.polyfit`, then stored in a lookup dict. The simulation loop just does a dict lookup instead of calling `numpy.polyfit` 400K times.
+
+### Parallel execution
+
+When `total_configs × entries > 10M`, the optimizer spawns workers using `multiprocessing.spawn()` (avoids CUDA fork crashes). Each worker gets a read-only copy of the calibration data and the polyfit cache. `OMP_NUM_THREADS=1` is set at module level before any numpy import to prevent BLAS thread contention. Progress shows worker count and ETA.
+
+### Two-phase threshold sweep
+
+**Phase 1 — candidate**: Every config is simulated at 3 thresholds (`candidate_thresholds`). The best-scoring threshold per config is kept. Costs 3× the per-config time but adds meaningful threshold data.
+
+**Phase 2 — Pareto**: After the frontier is built from candidate results, each of the ~60-120 winning configs is simulated across 300 logarithmically-spaced thresholds. The individually optimal threshold replaces the coarse candidate value. Costs ~3s for 120 configs.
+
+### Pareto frontier (O(n log n) skyline)
+
+Results are filtered (skip_rate ≥ 1%), sorted by speedup descending, and walked linearly. Each config is kept only if its error is strictly better than any previously-seen config at the same or higher speedup. Down from O(n²) to O(n log n).
+
+### Quality scoring
+
+The score for each config is `speedup × quality_score` where `quality_score` is a configurable function of the simulated accumulated error. See the quality scoring section above for the 5 available types and their tradeoffs.
+
+---
+
+## The 10-Knob TeaCache Forward
+
+The forward function (`forward.py`) implements every TeaCache parameter we search over:
+
+| # | Knob | Values | Location |
+|---|------|--------|----------|
+| 1 | Signal source | t_emb, first_block_shift, pooled_latent (fixed-grid) | `forward.py:306-315` |
+| 2 | Distance metric | mean_only, mean_and_max, mean_max_std, weighted_sum | `forward.py:39-76` |
+| 3 | Signal scale | manual values + auto_scale_target | `forward.py:350` |
+| 4 | Mapping | identity, polynomial, power_law, softplus | `forward.py:92-134` |
+| 5 | Accumulation | hard_reset, carry_over, leaky, windowed | `forward.py:141-178` |
+| 6 | Threshold | swept per config | `forward.py:441` |
+| 7 | Step schedule | constant, cosine, linear_ramp, linear_decay, bell | `forward.py:200-230` |
+| 8 | Block mode | all_or_nothing, split_fraction, split_groups | `forward.py:230-285` |
+| 9 | Residual | hard, blended, scaled | `forward.py:297-318` |
+| 10 | Cross-feed | enabled, strength 0-1 | `forward.py:432-441` |
+
+All fallthrough branches log warnings so missing options are immediately visible.
