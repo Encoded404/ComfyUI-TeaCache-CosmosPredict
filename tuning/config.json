@@ -92,8 +92,9 @@
         "pareto_threshold_count": 500,
         "poly_degree": 4,
         "quality_scoring": {
-            "type": "exponential",
-            "target": 0.05
+            "type": "thresholded_power",
+            "target": 0.05,
+            "power": 3.0
         },
         "cross_validate": true,
         "cv_holdout_fraction": 0.2,

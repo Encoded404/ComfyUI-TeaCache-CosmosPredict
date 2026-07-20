@@ -29,7 +29,6 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
 import argparse
-import copy
 import json
 import math
 import sys
@@ -55,19 +54,24 @@ def compute_quality_score(error: float, scoring: dict) -> float:
     """Convert simulated accumulated error to a quality score (0-1).
 
     scoring types:
-      "linear":       1/(1+error) — mild penalty, no params
-      "exponential":  exp(-error/target) — strong penalty beyond target
-      "gaussian":     exp(-0.5*(error/target)^2) — very strong beyond
-      "step":         1.0 if error < target else 0.0 — hard cutoff
-      "power":        1/(1+(error/target)^power) — configurable steepness
+      "linear":              1/(1+error) — mild penalty, no params
+      "exponential":         exp(-error/target) — strong after target
+      "gaussian":            exp(-0.5*(error/target)^2) — very strong after
+      "step":                1.0 if error < target else 0.0 — hard cutoff
+      "power":               1/(1+(error/target)^power) — configurable
+      "thresholded_power":   1/(1+(max(0,error-target)/target)^power)
+                               Zero penalty below target, then power-law ramp.
+                               This is what you want when target means "errors
+                               up to this value should cost near-nothing."
 
-    target: error threshold where quality drops significantly.
-      exponential: target → quality=0.37 (e^-1)
-      gaussian:    target → quality=0.61 (e^-0.5)
-      step:        target → hard quality=0
-      power:       target → quality=0.50
+    target interpretation by type:
+      exponential:       target → quality=0.37 (e^-1)
+      gaussian:          target → quality=0.61 (e^-0.5)
+      step:              target → hard quality=0 boundary
+      power:             target → quality=0.50
+      thresholded_power: target → quality=1.00 (zero penalty below)
     """
-    stype = scoring.get("type", "exponential")
+    stype = scoring.get("type", "thresholded_power")
     target = max(scoring.get("target", 0.05), 1e-8)
 
     if stype == "linear":
@@ -88,6 +92,12 @@ def compute_quality_score(error: float, scoring: dict) -> float:
         x = error / target
         return 1.0 / (1.0 + x ** p)
 
+    if stype == "thresholded_power":
+        p = scoring.get("power", 3.0)
+        excess = max(0.0, error - target) / target
+        return 1.0 / (1.0 + excess ** p)
+
+    # fallback
     return 1.0 / (1.0 + error)
 
 
@@ -236,7 +246,7 @@ def _process_config(idx_and_cfg: tuple) -> tuple:
 
     thresholds = _worker_opt.get("candidate_thresholds", [0.07])
     scoring_config = _worker_opt.get("quality_scoring",
-                                      {"type": "exponential", "target": 0.05})
+                                      {"type": "thresholded_power", "target": 0.05, "power": 3.0})
     best_score = -1.0
     best = (0.0, 0.0, 1.0, 1.0, 0.07)
 
@@ -464,7 +474,7 @@ def optimize(configs: List[TeacacheConfig],
     # ── 5. Simulate unique signal configs ───────────────────────────────
     thresholds = opt.get("candidate_thresholds", [0.07])
     scoring_config = opt.get("quality_scoring",
-                              {"type": "exponential", "target": 0.05})
+                              {"type": "thresholded_power", "target": 0.05, "power": 3.0})
     print(f"  Candidate thresholds: {thresholds}")
     print(f"  Quality scoring:      {scoring_config['type']} "
           f"(target={scoring_config.get('target', 0.05)})")
@@ -565,17 +575,31 @@ def optimize(configs: List[TeacacheConfig],
     all_results: List[OptimizationResult] = []
     for sig, group in signal_groups.items():
         base = sim_results[sig]
+        bc = base.config  # template — signal fields, don't mutate
         for full_cfg in group:
-            result_cfg = copy.deepcopy(base.config)
-            # Restore cosmetic fields from the full config
-            result_cfg.block_mode = full_cfg.block_mode
-            result_cfg.block_params = full_cfg.block_params
-            result_cfg.residual_strategy = full_cfg.residual_strategy
-            result_cfg.residual_params = full_cfg.residual_params
-            result_cfg.cross_feed_enabled = full_cfg.cross_feed_enabled
-            result_cfg.cross_feed_strength = full_cfg.cross_feed_strength
+            # Clone by explicit field copy — avoids deepcopy on 862K configs
+            result_cfg = TeacacheConfig(
+                source=bc.source,
+                metric_type=bc.metric_type,
+                metric_weights=dict(bc.metric_weights),
+                signal_scale=bc.signal_scale,
+                mapping_type=bc.mapping_type,
+                coefficients=list(bc.coefficients),
+                mapping_params=dict(bc.mapping_params),
+                accumulation_type=bc.accumulation_type,
+                accumulation_params=dict(bc.accumulation_params),
+                step_schedule=bc.step_schedule,
+                rel_l1_thresh=bc.rel_l1_thresh,
+                start_percent=bc.start_percent,
+                end_percent=bc.end_percent,
+                block_mode=full_cfg.block_mode,
+                block_params=full_cfg.block_params,
+                residual_strategy=full_cfg.residual_strategy,
+                residual_params=full_cfg.residual_params,
+                cross_feed_enabled=full_cfg.cross_feed_enabled,
+                cross_feed_strength=full_cfg.cross_feed_strength,
+            )
 
-            # Recompute speedup with the actual block fraction
             bf = _block_fraction(result_cfg)
             sp = (1.0 / (1.0 - base.skip_rate * bf)
                   if bf > 0 and base.skip_rate * bf < 1.0 else 1.0)
