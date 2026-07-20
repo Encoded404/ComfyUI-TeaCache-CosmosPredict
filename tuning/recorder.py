@@ -216,6 +216,19 @@ def make_calibration_forward(source_hint: str = "all"):
             state["prev_out"]      = curr_out
             state["prev_residual"] = curr_res
 
+        # ── Per-block cos_sim attachment ──
+        if track_per_block:
+            cos_sim_map = {}
+            for bi in range(len(self.blocks)):
+                if bi < len(self._calib_block_deltas) and self._calib_block_deltas[bi]:
+                    cos_sim_map[bi] = self._calib_block_deltas[bi][-1]
+            if cos_sim_map:
+                for entry in reversed(self.calibration_log):
+                    if entry.step == current_step:
+                        entry.block_cos_sims = dict(cos_sim_map)
+                    if entry.step < current_step:
+                        break
+
         # ── Final layer + unpatchify ──
         x_out = self.final_layer(
             x_B_T_H_W_D.to(crossattn_emb.dtype),

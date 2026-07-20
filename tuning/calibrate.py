@@ -55,7 +55,8 @@ def load_calibration_prompts(tcfg: TuningConfig):
     return resolved
 
 
-def patch_for_calibration(unet, steps: int, prompt_id: int, seed: int):
+def patch_for_calibration(unet, steps: int, prompt_id: int, seed: int,
+                          track_per_block: bool = False):
     """Patch the model's _forward with the calibration recorder and inject metadata.
 
     The recorder reads calibration_step and calibration_total_steps from
@@ -73,7 +74,10 @@ def patch_for_calibration(unet, steps: int, prompt_id: int, seed: int):
 
     # Reset calibration state
     if hasattr(diffusion_model, "_calib_state"):
-        delattr(diffusion_model, "_calib_state")
+        # Also reset per-block tracking state if switching modes
+        for attr in ("_calib_state", "_calib_block_prev", "_calib_block_deltas"):
+            if hasattr(diffusion_model, attr):
+                delattr(diffusion_model, attr)
     diffusion_model.calibration_log = []
 
     # Inject metadata into transformer_options
@@ -82,6 +86,7 @@ def patch_for_calibration(unet, steps: int, prompt_id: int, seed: int):
     to["calibration_total_steps"] = steps
     to["calibration_prompt_id"] = prompt_id
     to["calibration_seed"] = seed
+    to["track_per_block"] = track_per_block
 
     # Add a wrapper to update step index
     def wrapper(model_function, kwargs):
@@ -115,7 +120,7 @@ def restore_model(diffusion_model, original_fwd, unet):
     unet.set_model_unet_function_wrapper(None)
     to = unet.model_options.get("transformer_options", {})
     for k in list(to.keys()):
-        if k.startswith("calibration_"):
+        if k.startswith("calibration_") or k == "track_per_block":
             del to[k]
 
 
@@ -227,7 +232,8 @@ def run_calibration(comfy_dir: str, config_path: str = None):
                 torch.cuda.reset_peak_memory_stats()
 
                 dm, original_fwd = patch_for_calibration(
-                    unet, steps, prompt_id=pi, seed=seed
+                    unet, steps, prompt_id=pi, seed=seed,
+                    track_per_block=bool(tcfg.calibration.get("track_per_block", False)),
                 )
 
                 try:
