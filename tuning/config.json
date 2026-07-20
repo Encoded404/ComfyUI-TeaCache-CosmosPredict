@@ -94,7 +94,7 @@
         "quality_scoring": {
             "type": "thresholded_power",
             "target": 0.05,
-            "power": 3.0
+            "power": 4.0
         },
         "cross_validate": true,
         "cv_holdout_fraction": 0.2,
