@@ -94,7 +94,14 @@ def compute_quality_score(error: float, scoring: dict) -> float:
 
     if stype == "thresholded_power":
         p = scoring.get("power", 3.0)
-        excess = max(0.0, error - target) / target
+        tq = scoring.get("target_quality", 1.0)
+        if tq >= 1.0:
+            effective_target = target
+        else:
+            # Shift so quality = target_quality at error = target
+            ratio = max((1.0 - tq) / tq, 1e-12)
+            effective_target = target / (1.0 + ratio ** (1.0 / p))
+        excess = max(0.0, error - effective_target) / effective_target
         return 1.0 / (1.0 + excess ** p)
 
     # fallback
