@@ -10,6 +10,10 @@ pyiqa>=0.1.12
 # prompt_selection is "semantic_diversity" (80 MB model, CPU only)
 sentence-transformers>=3.0
 
+# Numba JIT — optional acceleration for the offline optimizer
+# (gracefully degrades to pure-Python fallback when not installed)
+numba>=0.60
+
 # Core numerical dependencies (already in ComfyUI, listed for completeness)
 numpy>=1.26
 torch>=2.4

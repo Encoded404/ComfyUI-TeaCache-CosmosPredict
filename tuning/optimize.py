@@ -12,6 +12,11 @@ sequence of delta stats, measuring:
 
 The output is a Pareto frontier + ranked list of optimal configurations.
 
+Configurations that differ only in block_mode, residual_strategy, or other
+cosmetic fields produce identical simulation results.  These are deduplicated
+by signal-space signature before simulation and replicated afterwards,
+giving a ~49× reduction in simulation work for the default search space.
+
 Usage:
     python -m tuning.optimize --data outputs/20260711-120000/calibration_data.jsonl
 """
@@ -24,6 +29,7 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
 import argparse
+import copy
 import json
 import math
 import sys
@@ -36,7 +42,10 @@ import numpy as np
 from .config_types import (
     CalibrationEntry, TeacacheConfig, OptimizationResult, TuningConfig,
 )
-
+from .sim_data import SimData
+from .sim_runner import simulate_config as _simulate_config_sd
+from .sim_runner import _get_source_stats as _get_group_stats
+from .sim_runner import _compute_distance, _block_fraction
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Quality scoring functions
@@ -83,7 +92,34 @@ def compute_quality_score(error: float, scoring: dict) -> float:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Pre-computed polynomial fit cache
+#  Signal-space deduplication
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _signal_signature(cfg: TeacacheConfig) -> tuple:
+    """Hashable key for the simulation-relevant subset of a config.
+
+    Fields like block_mode, residual_strategy, cross_feed do NOT affect
+    the skip/error simulation — only speedup estimation (which we recompute
+    per cosmetic variant using _block_fraction).
+
+    Coefficients are NOT included because they are derived from the polyfit
+    (keyed by source + metric_type + weights + scale) and populated later.
+    """
+    return (
+        cfg.source,
+        cfg.metric_type,
+        tuple(sorted(cfg.metric_weights.items())),
+        cfg.signal_scale,
+        cfg.mapping_type,
+        tuple(sorted(cfg.mapping_params.items())),
+        cfg.accumulation_type,
+        tuple(sorted(cfg.accumulation_params.items())),
+        cfg.step_schedule,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Polynomial fit (SimData-backed)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _poly_fit_key(cfg: TeacacheConfig) -> tuple:
@@ -96,9 +132,53 @@ def _poly_fit_key(cfg: TeacacheConfig) -> tuple:
     )
 
 
+def fit_polynomial_coefficients(
+    sim_data: SimData,
+    cfg: TeacacheConfig,
+    degree: int = 4,
+    quiet: bool = False,
+) -> List[float]:
+    """Fit polynomial coefficients using precomputed SimData arrays."""
+    xs_list, ys_list = [], []
+
+    for group in sim_data.groups:
+        stats = _get_group_stats(group, cfg.source)
+        if stats is None:
+            continue
+
+        dist = _compute_distance(stats, cfg)
+        if cfg.signal_scale != 1.0:
+            dist *= cfg.signal_scale
+
+        y = np.where(group.out_rel > 0, group.out_rel, group.res_rel)
+        mask = np.isfinite(dist) & np.isfinite(y) & (dist > 0) & (y > 0)
+        if mask.any():
+            xs_list.append(dist[mask])
+            ys_list.append(y[mask])
+
+    if not xs_list:
+        return [0.0, 0.0, 0.0, 1.0, 0.0]
+
+    xs = np.concatenate(xs_list)
+    ys = np.concatenate(ys_list)
+
+    if len(xs) < 50:
+        return [0.0, 0.0, 0.0, 1.0, 0.0]
+
+    coeffs = np.polyfit(xs, ys, deg=degree).tolist()
+    predicted = np.polyval(coeffs, xs)
+    rmse = float(np.sqrt(np.mean((ys - predicted) ** 2)))
+
+    if not quiet:
+        print(f"  [fit] n={len(xs)}  range=[{xs.min():.5f}, {xs.max():.5f}]  "
+              f"RMSE={rmse:.4f}  max|coeff|={max(abs(c) for c in coeffs):.3e}")
+
+    return coeffs
+
+
 def precompute_polyfits(
     configs: List[TeacacheConfig],
-    entries: List[CalibrationEntry],
+    sim_data: SimData,
     poly_degree: int = 4,
 ) -> Dict[tuple, list]:
     """Fit polynomial coefficients for every unique (source, metric, scale) combo.
@@ -113,7 +193,6 @@ def precompute_polyfits(
 
     cache = {}
     for key in sorted(unique_keys):
-        # Create a dummy config with the right fields for fitting
         dummy = TeacacheConfig(
             source=key[0],
             metric_type=key[1],
@@ -121,10 +200,8 @@ def precompute_polyfits(
             signal_scale=key[3],
             mapping_type="polynomial",
         )
-        coefs = fit_polynomial_coefficients(
-            entries, dummy, degree=poly_degree, quiet=True
-        )
-        cache[key] = coefs
+        coeffs = fit_polynomial_coefficients(sim_data, dummy, degree=poly_degree, quiet=True)
+        cache[key] = coeffs
     return cache
 
 
@@ -132,49 +209,52 @@ def precompute_polyfits(
 #  Multiprocessing worker (module-level for pickling)
 # ═══════════════════════════════════════════════════════════════════════════
 
-_worker_entries = None
-_worker_poly_cache = None
-_worker_opt = {}
+_worker_sim_data: Optional[SimData] = None
+_worker_poly_cache: Dict = {}
+_worker_opt: dict = {}
 
 
-def _init_worker(shared_entries, shared_poly_cache, shared_opt):
-    """Called once per worker process to share read-only calibration data."""
-    global _worker_entries, _worker_poly_cache, _worker_opt
-    _worker_entries = shared_entries
-    _worker_poly_cache = shared_poly_cache
-    _worker_opt = shared_opt
+def _init_worker(sim_data: SimData, poly_cache: dict, opt: dict):
+    """Called once per worker process to share read-only simulation data."""
+    global _worker_sim_data, _worker_poly_cache, _worker_opt
+    _worker_sim_data = sim_data
+    _worker_poly_cache = poly_cache
+    _worker_opt = opt
 
 
 def _process_config(idx_and_cfg: tuple) -> tuple:
     """Process a single config in a worker process. Sweeps candidate thresholds.
 
-    Returns (idx, skip, err, sp, qp, best_thresh).
+    Returns (idx, skip, err, sp, quality, best_thresh).
     """
     idx, cfg = idx_and_cfg
-    global _worker_entries, _worker_poly_cache, _worker_opt
+    global _worker_sim_data, _worker_poly_cache, _worker_opt
 
     if cfg.mapping_type == "polynomial":
         key = _poly_fit_key(cfg)
         cfg.coefficients = _worker_poly_cache.get(key, [])
 
     thresholds = _worker_opt.get("candidate_thresholds", [0.07])
+    scoring_config = _worker_opt.get("quality_scoring",
+                                      {"type": "exponential", "target": 0.05})
     best_score = -1.0
     best = (0.0, 0.0, 1.0, 1.0, 0.07)
 
     for t in thresholds:
         cfg.rel_l1_thresh = t
-        skip, err, sp, qp = simulate_config(_worker_entries, cfg)
-        sc = sp * qp
+        skip, err, sp, _qp = _simulate_config_sd(_worker_sim_data, cfg)
+        quality = compute_quality_score(err, scoring_config)
+        sc = sp * quality
         if sc > best_score:
             best_score = sc
-            best = (skip, err, sp, qp, t)
+            best = (skip, err, sp, quality, t)
 
     return idx, *best
-from .forward import (
-    compute_distance, apply_mapping, accumulate_distance,
-    step_schedule_multiplier,
-)
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Data loading
+# ═══════════════════════════════════════════════════════════════════════════
 
 def load_calibration_data(data_path: str) -> List[CalibrationEntry]:
     entries = []
@@ -185,170 +265,14 @@ def load_calibration_data(data_path: str) -> List[CalibrationEntry]:
                 entries.append(CalibrationEntry.from_dict(json.loads(line)))
     print(f"[load] {len(entries)} calibration entries from {data_path}")
 
-    # Filter to valid entries (have output change data)
     valid = [e for e in entries if e.out_rel > 0 or e.res_rel > 0]
     print(f"[load] {len(valid)} valid entries (with ground truth output change)")
     return valid
 
 
-def get_source_stats(entry: CalibrationEntry, source: str) -> dict:
-    """Extract delta stats for a specific source signal."""
-    if source == "t_emb" and entry.t_emb is not None:
-        return {
-            "mean": entry.t_emb.mean, "max": entry.t_emb.max,
-            "std": entry.t_emb.std, "p95": entry.t_emb.p95,
-            "median": entry.t_emb.median, "min": entry.t_emb.min,
-            "denom": entry.t_emb.denom,
-        }
-    if source == "first_block_shift" and entry.shift is not None:
-        return {
-            "mean": entry.shift.mean, "max": entry.shift.max,
-            "std": entry.shift.std, "p95": entry.shift.p95,
-            "median": entry.shift.median, "min": entry.shift.min,
-            "denom": entry.shift.denom,
-        }
-    if source == "pooled_latent" and entry.latent is not None:
-        return {
-            "mean": entry.latent.mean, "max": entry.latent.max,
-            "std": entry.latent.std, "p95": entry.latent.p95,
-            "median": entry.latent.median, "min": entry.latent.min,
-            "denom": entry.latent.denom,
-        }
-    return None
-
-
-def simulate_config(
-    entries: List[CalibrationEntry],
-    cfg: TeacacheConfig,
-) -> Tuple[float, float, float, float]:
-    """Simulate one TeacacheConfig on recorded data.
-
-    Returns (skip_rate, accumulated_error, estimated_speedup).
-
-    The simulation replays the accumulator logic on sequences of entries
-    grouped by (prompt_id, seed, cond). For each group, it steps through
-    entries in order, simulating the distance → mapping → accumulation →
-    decision pipeline.
-
-    skip_rate: fraction of entries where should_calc = False
-    accumulated_error: sum of out_rel for skipped entries (proxy for quality loss)
-    estimated_speedup: 1.0 / (1.0 - skip_rate * block_cost_ratio)
-      where block_cost_ratio ≈ 0.85 (blocks are ~85% of forward compute)
-    """
-    BLOCK_COST_RATIO = 0.85
-
-    # Group entries by (prompt_id, seed, cond)
-    groups: Dict[Tuple[int, int, int, int], List[CalibrationEntry]] = {}
-    for e in entries:
-        key = (e.prompt_id, e.seed, e.cond, e.total_steps)
-        groups.setdefault(key, []).append(e)
-
-    # Sort each group by step
-    for key in groups:
-        groups[key].sort(key=lambda e: e.step)
-
-    total_entries = 0
-    skip_count = 0
-    total_error = 0.0
-
-    for key, group in groups.items():
-        accumulated = 0.0
-        total_entries += len(group)
-
-        for entry in group:
-            # Get stats for the chosen source
-            stats = get_source_stats(entry, cfg.source)
-            if stats is None:
-                continue
-
-            # Knob 2+3: Distance metric
-            distance = compute_distance(stats, cfg.metric_type, cfg.metric_weights)
-            if cfg.signal_scale != 1.0:
-                distance *= cfg.signal_scale
-
-            # Knob 4: Mapping
-            predicted = apply_mapping(
-                distance, cfg.mapping_type, cfg.coefficients, cfg.mapping_params
-            )
-
-            # Knob 7: Step schedule
-            mult = step_schedule_multiplier(
-                entry.step_fraction, cfg.step_schedule
-            )
-            effective_thresh = cfg.rel_l1_thresh * mult
-
-            # Knob 5: Accumulation
-            new_acc, should_calc = accumulate_distance(
-                accumulated, predicted, effective_thresh,
-                cfg.accumulation_type, cfg.accumulation_params,
-            )
-            accumulated = new_acc
-
-            if not should_calc:
-                skip_count += 1
-                # Quality penalty: use out_rel as proxy for quality loss
-                total_error += entry.out_rel if entry.out_rel > 0 else entry.res_rel
-
-    skip_rate = skip_count / max(total_entries, 1)
-    avg_error = total_error / max(total_entries, 1)
-    # estimated_speedup: higher skip rate + LOW error = good
-    quality_proxy = 1.0 / (1.0 + avg_error)
-    speedup = 1.0 / (1.0 - skip_rate * BLOCK_COST_RATIO)
-
-    return skip_rate, avg_error, speedup, quality_proxy
-
-
-def fit_polynomial_coefficients(
-    entries: List[CalibrationEntry],
-    cfg: TeacacheConfig,
-    degree: int = 4,
-    quiet: bool = False,
-) -> List[float]:
-    """Fit polynomial coefficients for a given configuration (source, metric, scale).
-
-    Uses all valid entries to build (rel_l1_scaled, out_rel) pairs and fit
-    numpy.polyfit of the requested degree.
-    """
-    xs = []
-    ys = []
-
-    for entry in entries:
-        stats = get_source_stats(entry, cfg.source)
-        if stats is None:
-            continue
-
-        distance = compute_distance(stats, cfg.metric_type, cfg.metric_weights)
-        if cfg.signal_scale != 1.0:
-            distance *= cfg.signal_scale
-
-        y_val = entry.out_rel if entry.out_rel > 0 else entry.res_rel
-        if y_val <= 0:
-            continue
-
-        xs.append(distance)
-        ys.append(y_val)
-
-    if len(xs) < 50:
-        # Not enough data for polyfit; return identity coefficients
-        return [0.0, 0.0, 0.0, 1.0, 0.0]
-
-    xs = np.array(xs, dtype=np.float64)
-    ys = np.array(ys, dtype=np.float64)
-    mask = np.isfinite(xs) & np.isfinite(ys) & (xs > 0) & (ys > 0)
-
-    if mask.sum() < 50:
-        return [0.0, 0.0, 0.0, 1.0, 0.0]
-
-    coeffs = np.polyfit(xs[mask], ys[mask], deg=degree).tolist()
-    predicted = np.polyval(coeffs, xs[mask])
-    rmse = float(np.sqrt(np.mean((ys[mask] - predicted) ** 2)))
-
-    if not quiet:
-        print(f"  [fit] n={int(mask.sum())}  range=[{xs[mask].min():.5f}, {xs[mask].max():.5f}]  "
-              f"RMSE={rmse:.4f}  max|coeff|={max(abs(c) for c in coeffs):.3e}")
-
-    return coeffs
-
+# ═══════════════════════════════════════════════════════════════════════════
+#  Candidate generation  (unchanged from prior version)
+# ═══════════════════════════════════════════════════════════════════════════
 
 def generate_candidate_configs(tcfg: TuningConfig,
                                 entries: Optional[List[CalibrationEntry]] = None,
@@ -372,10 +296,11 @@ def generate_candidate_configs(tcfg: TuningConfig,
         for source in ["t_emb", "first_block_shift", "pooled_latent"]:
             distances = []
             for e in entries:
-                stats = get_source_stats(e, source)
-                if stats is None:
+                attr = {"t_emb": e.t_emb, "first_block_shift": e.shift,
+                        "pooled_latent": e.latent}.get(source)
+                if attr is None:
                     continue
-                d = stats["mean"]  # raw mean distance
+                d = attr.mean
                 if d > 0:
                     distances.append(d)
             if distances:
@@ -392,23 +317,20 @@ def generate_candidate_configs(tcfg: TuningConfig,
     for source in opt["sources"]:
         for metric_type in opt["metric_types"]:
             for metric_weights_scenario in opt["metric_weights_scenarios"]:
-                # Skip incompatible combinations
                 if metric_type == "mean_only" and metric_weights_scenario != {"mean": 1.0}:
                     continue
                 if metric_type == "mean_and_max" and set(metric_weights_scenario.keys()) != {"mean", "max"}:
                     continue
 
                 for mapping_type in opt["mapping_types"]:
-                    # Determine mapping params to sweep
                     mapping_params_list = [{}]
                     mapping_type_key = opt.get("mapping_params_scenarios", {}).get(mapping_type, [])
                     if mapping_type_key:
                         mapping_params_list = mapping_type_key
                     elif mapping_type == "polynomial":
-                        mapping_params_list = [{}]  # no extra params, coefficients from fit
+                        mapping_params_list = [{}]
 
                     for mapping_params in mapping_params_list:
-                        # Merge source-level config into mapping_params
                         if source == "pooled_latent":
                             pl_mode = opt.get("pooled_latent_mode", "mean")
                             if "pooled_latent_mode" not in mapping_params:
@@ -426,7 +348,6 @@ def generate_candidate_configs(tcfg: TuningConfig,
 
                                 for schedule in opt["step_schedules"]:
                                     scales = opt["signal_scales"].get(source, [1.0])
-                                    # Append auto-computed scale if available
                                     if source in auto_scales and auto_scales[source]:
                                         extra = [s for s in auto_scales[source] if s not in scales]
                                         scales = list(scales) + extra
@@ -470,55 +391,68 @@ def generate_candidate_configs(tcfg: TuningConfig,
         rng = random.Random(42)
         rng.shuffle(configs)
         configs = configs[:max_cap]
-        print(f"  [cap] Sampled {len(configs)}/{max_cap} candidates (full pool had {len(configs)})")
+        print(f"  [cap] Sampled {len(configs)}/{max_cap} candidates "
+              f"(full pool had {len(configs)})")
 
     print(f"[candidates] Generated {len(configs)} candidate configurations")
     return configs
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  Main optimization routine
+# ═══════════════════════════════════════════════════════════════════════════
+
 def optimize(configs: List[TeacacheConfig],
              entries: List[CalibrationEntry],
-             tcfg: TuningConfig) -> List[OptimizationResult]:
+             tcfg: TuningConfig) -> Tuple[List[OptimizationResult], List[OptimizationResult]]:
     """Simulate all candidate configs, compute scores, build Pareto frontier.
 
-    If cross_validate is True in config, splits entries by prompt_id:
-    fits polynomial on train set, evaluates on holdout set.
+    Uses signal-space deduplication: configs that differ only in block_mode /
+    residual_strategy produce identical simulation results and are grouped
+    together, giving a ~49× reduction for the default search space.
+
+    Scoring is consistent across all phases: candidate threshold selection,
+    final score computation, and Pareto sweeping all use the same
+    compute_quality_score function.
     """
     import random
     opt = tcfg.optimization
-    results: List[OptimizationResult] = []
     t0 = time_mod.time()
 
-    # Cross-validation split
+    # ── 1. Build SimData (once) ────────────────────────────────────────
+    sim_data = SimData.from_entries(entries)
+
+    # ── 2. CV split ────────────────────────────────────────────────────
     do_cv = opt.get("cross_validate", False)
     cv_fraction = opt.get("cv_holdout_fraction", 0.2)
-    train_entries = entries
-    holdout_entries = entries
     if do_cv:
         prompt_ids = sorted(set(e.prompt_id for e in entries))
         rng = random.Random(42)
         rng.shuffle(prompt_ids)
         n_holdout = max(1, int(len(prompt_ids) * cv_fraction))
         holdout_ids = set(prompt_ids[:n_holdout])
-        train_entries = [e for e in entries if e.prompt_id not in holdout_ids]
-        holdout_entries = [e for e in entries if e.prompt_id in holdout_ids]
-        print(f"  CV: {len(train_entries)} train / {len(holdout_entries)} holdout "
+        train_sd = sim_data.filter_by_prompt_ids(set(prompt_ids) - holdout_ids)
+        holdout_sd = sim_data.filter_by_prompt_ids(holdout_ids)
+        print(f"  CV: {train_sd.n_entries} train / {holdout_sd.n_entries} holdout "
               f"(split by prompt, {cv_fraction:.0%} holdout)")
+    else:
+        train_sd = holdout_sd = sim_data
 
-    total = len(configs)
-    last_log = 0
-    sim_entries = holdout_entries if do_cv else entries
-    thresholds = opt.get("candidate_thresholds", [0.07])
-    scoring_config = opt.get("quality_scoring", {"type": "exponential", "target": 0.05})
+    # ── 3. Deduplicate by signal-space ─────────────────────────────────
+    signal_groups: Dict[tuple, List[TeacacheConfig]] = {}
+    for cfg in configs:
+        sig = _signal_signature(cfg)
+        signal_groups.setdefault(sig, []).append(cfg)
 
-    print(f"  Candidate thresholds: {thresholds}")
-    print(f"  Quality scoring:      {scoring_config['type']} "
-          f"(target={scoring_config.get('target', 0.05)})")
+    unique_signal_configs = [group[0] for group in signal_groups.values()]
+    ratio = len(configs) / max(len(unique_signal_configs), 1)
+    print(f"  Dedup: {len(configs)} → {len(unique_signal_configs)} "
+          f"unique signal-space configs ({ratio:.1f}× reduction)")
 
-    # ── Pre-compute all unique polynomial fits ──────────────────────────
+    # ── 4. Polynomial fits ─────────────────────────────────────────────
     t_pre = time_mod.time()
     poly_cache = precompute_polyfits(
-        configs, train_entries,
+        unique_signal_configs, train_sd,
         poly_degree=opt.get("poly_degree", 4),
     )
     n_fits = len(poly_cache)
@@ -528,45 +462,50 @@ def optimize(configs: List[TeacacheConfig],
               f"in {t_pre_elapsed:.1f}s "
               f"({t_pre_elapsed/max(n_fits,1)*1000:.0f}ms each)")
 
-    results = [None] * total
+    # ── 5. Simulate unique signal configs ───────────────────────────────
+    thresholds = opt.get("candidate_thresholds", [0.07])
+    scoring_config = opt.get("quality_scoring",
+                              {"type": "exponential", "target": 0.05})
+    print(f"  Candidate thresholds: {thresholds}")
+    print(f"  Quality scoring:      {scoring_config['type']} "
+          f"(target={scoring_config.get('target', 0.05)})")
 
-    # ── Decide serial vs parallel ───────────────────────────────────────
-    # Only use multiprocessing when the total work is large enough
-    # that spawn/pickle overhead is worth it. Rough heuristic: 10M
-    # entry-iterations (≈2s of serial work).
-    iter_count = total * len(sim_entries)
-    use_parallel = iter_count > 10_000_000  # ~10M → ~2s serial
+    total = len(unique_signal_configs)
+    iter_count = total * holdout_sd.n_entries
+    use_parallel = iter_count > 10_000_000
+
+    # Simulate unique configs → collect (sig, OptimizationResult) pairs
+    sim_results: Dict[tuple, OptimizationResult] = {}
 
     if use_parallel:
         n_workers = min(os.cpu_count() or 4, 16)
-        # Aim for ~20-30 IPC rounds total. Each chunk should be 0.5-2s
-        # of work so pickle/transfer overhead is negligible.
         chunksz = max(50, min(5000, total // (n_workers * 25)))
         print(f"  [parallel] {n_workers} workers × {total} configs, "
               f"chunksize={chunksz} ({iter_count//1_000_000}M entry-iterations, "
               f"~{total/(n_workers*chunksz):.0f} rounds)")
 
-        indexed = list(enumerate(configs))
+        indexed = list(enumerate(unique_signal_configs))
+        results_list = [None] * total
         done_count = 0
+        last_log = 0
+
         import multiprocessing as mp
         ctx = mp.get_context("spawn")
         with ctx.Pool(
             processes=n_workers,
             initializer=_init_worker,
-            initargs=(sim_entries, poly_cache, opt),
+            initargs=(holdout_sd, poly_cache, opt),
         ) as pool:
-            for idx, skip, err, sp, qp, best_thresh in pool.imap_unordered(
+            for idx, skip, err, sp, quality, best_thresh in pool.imap_unordered(
                 _process_config, indexed, chunksize=chunksz
             ):
-                cfg = configs[idx]
+                cfg = unique_signal_configs[idx]
                 cfg.rel_l1_thresh = best_thresh
-                quality = compute_quality_score(err, scoring_config)
                 score = sp * quality
-                results[idx] = OptimizationResult(
+                results_list[idx] = OptimizationResult(
                     config=cfg, skip_rate=skip, estimated_speedup=sp,
                     accumulated_error=err, score=score,
                 )
-                # Progress — O(1) counter, NOT O(N) scan
                 done_count += 1
                 elapsed = time_mod.time() - t0
                 do_log = done_count % 50 == 0 or done_count == 1 or done_count == total
@@ -579,71 +518,97 @@ def optimize(configs: List[TeacacheConfig],
                           f"[{n_workers} workers]  "
                           f"sp={sp:.2f}x  score={score:.3f}",
                           end="", flush=True)
+
+        for i, r in enumerate(results_list):
+            cfg = unique_signal_configs[i]
+            sig = _signal_signature(cfg)
+            sim_results[sig] = r
     else:
-        # ── Serial (fast enough for small workloads) ────────────────────
-        for i, cfg in enumerate(configs):
+        for i, cfg in enumerate(unique_signal_configs):
             if cfg.mapping_type == "polynomial":
-                cfg.coefficients = poly_cache.get(_poly_fit_key(cfg), [])
+                key = _poly_fit_key(cfg)
+                cfg.coefficients = poly_cache.get(key, [])
 
             best_score = -1.0
             best_thresh = thresholds[0]
             best_skip = best_err = 0.0
             best_sp = 1.0
-            best_qp = 1.0
+            best_quality = 1.0
 
             for t in thresholds:
-                cfg.rel_l1_thresh = t
-                skip_rate, avg_error, speedup, quality = simulate_config(
-                    sim_entries, cfg
-                )
-                sc = speedup * quality
+                skip, err, sp, _ = _simulate_config_sd(holdout_sd, cfg, t)
+                quality = compute_quality_score(err, scoring_config)
+                sc = sp * quality
                 if sc > best_score:
                     best_score = sc
                     best_thresh = t
-                    best_skip, best_err, best_sp, best_qp = skip_rate, avg_error, speedup, quality
+                    best_skip, best_err, best_sp, best_quality = skip, err, sp, quality
 
             cfg.rel_l1_thresh = best_thresh
-            quality = compute_quality_score(best_err, scoring_config)
-            score = best_sp * quality
-            results[i] = OptimizationResult(
+            score = best_sp * best_quality
+            sim_results[_signal_signature(cfg)] = OptimizationResult(
                 config=cfg, skip_rate=best_skip, estimated_speedup=best_sp,
                 accumulated_error=best_err, score=score,
             )
 
             elapsed = time_mod.time() - t0
             do_log = (i + 1) % 50 == 0 or i == 0 or (i + 1) == total
-            if do_log and (i + 1) != last_log:
-                last_log = i + 1
+            if do_log:
                 eta = elapsed / (i + 1) * (total - i - 1) if i > 0 else 0
                 print(f"\r  [{i+1:>5d}/{total}] "
                       f"{(i+1)/total*100:5.1f}%  "
                       f"elapsed={elapsed:.0f}s  ETA={eta:.0f}s  "
                       f"last: src={cfg.source} {cfg.metric_type} {cfg.mapping_type} "
-                      f"skip={skip_rate:.1%} sp={speedup:.2f}x score={score:.3f}",
+                      f"skip={best_skip:.1%} sp={best_sp:.2f}x score={score:.3f}",
                       end="", flush=True)
 
+    # ── 6. Replicate results to full config space ──────────────────────
+    all_results: List[OptimizationResult] = []
+    for sig, group in signal_groups.items():
+        base = sim_results[sig]
+        for full_cfg in group:
+            result_cfg = copy.deepcopy(base.config)
+            # Restore cosmetic fields from the full config
+            result_cfg.block_mode = full_cfg.block_mode
+            result_cfg.block_params = full_cfg.block_params
+            result_cfg.residual_strategy = full_cfg.residual_strategy
+            result_cfg.residual_params = full_cfg.residual_params
+            result_cfg.cross_feed_enabled = full_cfg.cross_feed_enabled
+            result_cfg.cross_feed_strength = full_cfg.cross_feed_strength
+
+            # Recompute speedup with the actual block fraction
+            bf = _block_fraction(result_cfg)
+            sp = (1.0 / (1.0 - base.skip_rate * bf)
+                  if bf > 0 and base.skip_rate * bf < 1.0 else 1.0)
+            quality = compute_quality_score(base.accumulated_error, scoring_config)
+            score = sp * quality
+
+            all_results.append(OptimizationResult(
+                config=result_cfg,
+                skip_rate=base.skip_rate,
+                estimated_speedup=sp,
+                accumulated_error=base.accumulated_error,
+                score=score,
+            ))
+
+    # ── 7. Sort + Pareto frontier ──────────────────────────────────────
     elapsed = time_mod.time() - t0
-    print()  # newline after progress bar
     mode = "parallel" if use_parallel else "serial"
+    print()  # newline after progress bar
     print(f"  Complete ({mode}): {elapsed:.1f}s "
-          f"({elapsed/total*1000:.1f} ms per config)")
+          f"({elapsed/len(configs)*1000:.1f}ms per full config, "
+          f"{elapsed/len(unique_signal_configs)*1000:.1f}ms per unique)")
 
-    results.sort(key=lambda r: r.score, reverse=True)
+    all_results.sort(key=lambda r: r.score, reverse=True)
 
-    # ── Fast O(n log n) Pareto frontier ─────────────────────────────────
-    # Filter out zero-skip configs, then sort by speedup descending.
-    # Walk through: keep configs whose quality exceeds the best seen so far.
-    # A config with lower quality than a previously-seen config is dominated
-    # (previous config has equal or higher speedup AND higher quality).
     p_start = time_mod.time()
-    candidates_for_pareto = [r for r in results if r.skip_rate >= 0.01]
+    candidates_for_pareto = [r for r in all_results if r.skip_rate >= 0.01]
     candidates_for_pareto.sort(
         key=lambda r: (-r.estimated_speedup, -r.accumulated_error)
     )
     pareto = []
-    best_quality = float("inf")  # lower accumulated_error is better quality
+    best_quality = float("inf")
     for r in candidates_for_pareto:
-        # accumulated_error: lower is better for quality
         if r.accumulated_error < best_quality:
             pareto.append(r)
             best_quality = r.accumulated_error
@@ -651,20 +616,22 @@ def optimize(configs: List[TeacacheConfig],
     p_elapsed = time_mod.time() - p_start
     print(f"\n[pareto] {len(pareto)} Pareto-optimal configurations "
           f"(from {len(candidates_for_pareto)} with skip>=1% / "
-          f"{len(results)} total, {len(configs)} candidates) "
+          f"{len(all_results)} total, {len(configs)} candidates) "
           f"in {p_elapsed:.1f}s")
-    print(f"[time]   {elapsed:.1f}s total, {elapsed/total*1000:.1f}ms/config, "
-          f"{elapsed/len(configs)*1000:.1f}ms/candidate")
+    print(f"[time]   {elapsed:.1f}s total, "
+          f"{elapsed/len(configs)*1000:.1f}ms/full-config")
 
-    # ── Pareto threshold sweep ─────────────────────────────────────────
-    # Fine-tune each Pareto winner's threshold across the full range.
-    # This replaces the coarse candidate_thresholds with the individually
-    # optimal threshold for each frontier config.
-    pareto_range = opt.get("pareto_threshold_range", [0.001, 10.0])
-    pareto_count = opt.get("pareto_threshold_count", 300)
+    # ── 8. Pareto threshold sweep ──────────────────────────────────────
+    # Refine each Pareto winner's threshold.  Floor at the smallest
+    # candidate threshold so the sweep cannot rediscover the "do nothing"
+    # trivial solution (skip_rate=0, error=0, score=1.0).
+    min_cand = min(opt.get("candidate_thresholds", [0.07]))
+    pareto_range = opt.get("pareto_threshold_range", [min_cand, 10.0])
+    pareto_range[0] = max(pareto_range[0], min_cand)
+    pareto_count = opt.get("pareto_threshold_count", 500)
+
     t_sweep_start = time_mod.time()
-    import numpy as _np
-    sweep_values = _np.geomspace(*pareto_range, num=pareto_count).tolist()
+    sweep_values = np.geomspace(*pareto_range, num=pareto_count).tolist()
 
     print(f"\n  Pareto threshold sweep: {pareto_count} values "
           f"[{pareto_range[0]:.3f}..{pareto_range[1]:.1f}] on {len(pareto)} configs...")
@@ -676,8 +643,7 @@ def optimize(configs: List[TeacacheConfig],
         best_sk, best_er, best_sp = r.skip_rate, r.accumulated_error, r.estimated_speedup
 
         for t in sweep_values:
-            cfg.rel_l1_thresh = t
-            skip, err, sp, qp = simulate_config(sim_entries, cfg)
+            skip, err, sp, _ = _simulate_config_sd(holdout_sd, cfg, t)
             sc = sp * compute_quality_score(err, scoring_config)
             if sc > best_sc:
                 best_sc = sc
@@ -693,8 +659,12 @@ def optimize(configs: List[TeacacheConfig],
     t_sweep_elapsed = time_mod.time() - t_sweep_start
     print(f"  Pareto sweep complete in {t_sweep_elapsed:.1f}s\n")
 
-    return results, pareto
+    return all_results, pareto
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  CLI entry point
+# ═══════════════════════════════════════════════════════════════════════════
 
 def main():
     parser = argparse.ArgumentParser(description="TeaCache Offline Optimizer")
@@ -727,7 +697,7 @@ def main():
         sys.exit(1)
 
     # Generate candidates
-    configs = generate_candidate_configs(tcfg)
+    configs = generate_candidate_configs(tcfg, entries)
 
     # Optimize
     results, pareto = optimize(configs, entries, tcfg)
