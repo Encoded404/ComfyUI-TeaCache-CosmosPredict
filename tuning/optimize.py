@@ -611,6 +611,7 @@ def optimize(configs: List[TeacacheConfig],
                       end="", flush=True)
 
     # ── 6. Replicate results to full config space ──────────────────────
+    print("  Replicating to full config space...", flush=True)
     all_results: List[OptimizationResult] = []
     for sig, group in signal_groups.items():
         base = sim_results[sig]
@@ -760,6 +761,9 @@ def optimize(configs: List[TeacacheConfig],
     t_sweep_elapsed = time_mod.time() - t_sweep_start
     print(f"  Pareto sweep complete in {t_sweep_elapsed:.1f}s\n")
 
+    # Re-sort — Pareto sweep mutates scores in-place on shared objects
+    all_results.sort(key=lambda r: r.score, reverse=True)
+
     return all_results, pareto
 
 
@@ -813,24 +817,26 @@ def main():
 
     # Print top 10
     print(f"\n  Top 10 configurations:")
-    print(f"  {'─' * 60}")
+    print(f"  {'─' * 100}")
     for i, r in enumerate(results[:10]):
         c = r.config
         print(f"  {i+1:>2}. src={c.source:<20} metric={c.metric_type:<15} "
               f"map={c.mapping_type:<12} acc={c.accumulation_type:<12} "
-               f"scale={c.signal_scale:>6.4g}  "
+              f"scale={c.signal_scale:>6.4g}  "
               f"skip={r.skip_rate:.1%}  speedup={r.estimated_speedup:.2f}x  "
-              f"error={r.accumulated_error:.4f}  score={r.score:.3f}")
+              f"error={r.accumulated_error:.4f}  score={r.score:.3f}  "
+              f"block={c.block_mode:<16} res={c.residual_strategy}")
 
     # Print Pareto in order of speedup
     pareto_sorted = sorted(pareto, key=lambda r: r.estimated_speedup)
     print(f"\n  Pareto frontier ({len(pareto)} configs):")
-    print(f"  {'─' * 60}")
+    print(f"  {'─' * 100}")
     for r in pareto_sorted:
         c = r.config
         print(f"  speedup={r.estimated_speedup:.2f}x  error={r.accumulated_error:.4f}  "
               f"src={c.source} metric={c.metric_type} map={c.mapping_type} "
-               f"acc={c.accumulation_type} scale={c.signal_scale:.4g}")
+              f"acc={c.accumulation_type} scale={c.signal_scale:.4g}  "
+              f"block={c.block_mode} res={c.residual_strategy}")
 
     print(f"\n  Results saved to: {out_dir}")
 
