@@ -26,7 +26,7 @@ from pathlib import Path
 import torch
 
 from .config_types import CalibrationEntry, TuningConfig
-from .utils import load_models, sample, get_diffusion_model
+from .utils import load_models, sample, get_diffusion_model, estimate_calibration_time, detect_gpu
 from .recorder import make_calibration_forward
 from .prompt_loader import load_prompt_config, select_prompts, resolve_prompt
 
@@ -135,10 +135,13 @@ def run_calibration(comfy_dir: str, config_path: str = None):
     print("=" * 60)
     print("  TeaCache Calibration — Phase 1")
     print("=" * 60)
+    gpu_display, gpu_speed = detect_gpu()
+    print(f"  GPU:            {gpu_display}  (×{gpu_speed:.1f} vs V100)")
     print(f"  ComfyUI:        {tcfg.comfy_dir}")
     print(f"  Model:          {tcfg.model_name}")
     print(f"  Steps:          {tcfg.sampling['step_variants']}")
     print(f"  Weights:        {tcfg.sampling['step_weights']}")
+    print(f"  Resolution:     {tcfg.sampling['width']}×{tcfg.sampling['height']}")
     print(f"  Prompts:        {tcfg.calibration['num_prompts']}")
     print(f"  Seeds:          {tcfg.calibration['seeds']}")
     print(f"  Output:         {out_dir}")
@@ -172,17 +175,24 @@ def run_calibration(comfy_dir: str, config_path: str = None):
     # Estimate entries: each run produces ~ (steps - 1) × 2 cond slots
     avg_steps = sum(step_variants) / max(len(step_variants), 1)
     est_entries = int(total_runs * (avg_steps - 1) * 2)
-    # Estimate time: ~12s per run at 512² on V100, ~2.5s at 512² faster card
-    est_time = total_runs * 12
+
+    # Estimate time based on real GPU, step mix, and resolution
+    w = tcfg.sampling["width"]
+    h = tcfg.sampling["height"]
+    est_seconds, gpu_name, gpu_factor = estimate_calibration_time(
+        total_runs, step_variants, step_weights, w, h,
+    )
 
     print(f"\n  {'─' * 56}")
     print(f"  Run schedule")
     print(f"  {'─' * 56}")
     print(f"  Permutation:  {len(prompts)} prompts × {len(seeds)} seeds × {len(step_variants)} step variants")
     print(f"                = {total_runs} total generations")
-    print(f"  Resolution:   {tcfg.sampling['width']}×{tcfg.sampling['height']}")
+    print(f"  GPU:          {gpu_name}  (×{gpu_factor:.1f} vs V100)")
+    print(f"  Resolution:   {w}×{h}")
+    print(f"  Avg. steps:   {avg_steps:.1f} (weighted)")
     print(f"  Est. entries: ~{est_entries} ({int(est_entries/1000)}k) calibration data points")
-    print(f"  Est. time:    ~{est_time//60}m {est_time%60}s  (V100 at 512²)")
+    print(f"  Est. time:    ~{int(est_seconds // 60)}m {int(est_seconds % 60)}s")
     print(f"  Est. disk:    ~{est_entries * 300 // 1000}k kB  (JSONL)")
     print(f"  Output dir:   {out_dir}")
     print(f"  {'─' * 56}\n")

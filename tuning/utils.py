@@ -303,6 +303,157 @@ def print_metrics_legend():
     print(f"  ╚{'═' * (w + 2)}╝")
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  GPU detection + timing estimates
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Baseline: V100 (125 FP16 TFLOPS) does 30 steps at 512² in ~12 seconds
+# for Anima/Cosmos-Predict2.  That gives ~0.40 s/step at 512².
+_V100_SECONDS_PER_STEP_AT_512SQ = 0.40
+
+# Speed factors relative to V100 (1.0 = 12 s/30 steps at 512²).
+#
+# For GPUs ≤ ~350 TFLOPS: near-linear scaling (factor ≈ TFLOPS / 125).
+# For GPUs > ~350 TFLOPS: diminishing returns — execution latency, memory
+#   bandwidth, and CPU-GPU overhead dominate, so raw TFLOPS stop translating
+#   1:1 into faster inference past a certain point.
+#
+# Factors are calibrated against real-world Anima/Cosmos DiT inference
+# timings where available; otherwise estimated from TFLOPS data.
+#
+# Matched by case-insensitive substring search against torch.cuda.get_device_name().
+# First match wins — order more-specific substrings before less-specific ones.
+_GPU_SPEED_FACTORS: list[tuple[str, float]] = [
+    # ── Datacenter / enterprise ──────────────────────────────────────
+    ("b200",             5.5),    # 18000 TFLOPS — massive but latency-bound
+    ("h200",             4.2),    # 1979 TFLOPS
+    ("h100",             4.0),    # 1979 TFLOPS
+    ("h800",             3.8),
+    ("mi300x",           3.5),    # 1307 TFLOPS
+    ("mi325x",           3.5),
+    ("b100",             3.5),    # earlier Blackwell
+    ("rtx pro 6000",     2.8),    # 1000 TFLOPS (Blackwell)
+    ("rtx 6000 ada",     2.4),    # 364 TFLOPS
+    ("a100",             2.3),    # 312 TFLOPS — well-characterised
+    ("l40s",             2.4),    # 362 TFLOPS
+    ("l40",              1.5),    # ~200 TFLOPS
+    ("l4",               0.95),   # 121 TFLOPS
+    ("a6000",            2.4),    # 364 TFLOPS (GA102)
+    ("a5000",            1.4),
+    ("a40",              1.8),    # lower-clocked A100 sibling
+    ("a10",              1.0),
+    ("a2",               0.7),
+    ("t4",               0.4),    # 65 TFLOPS
+    ("p100",             0.35),
+    ("p40",              0.25),
+    ("p4",               0.15),
+    ("v100",             1.0),    # 125 TFLOPS — baseline
+
+    # ── Consumer (RTX) — order by most-specific substrings first ─────
+    ("rtx 5090",         2.3),    # 335 TFLOPS — plateaus despite high TFLOPS
+    ("rtx 4090",         2.3),    # 330 TFLOPS (165 BF16, but DiT uses FP16)
+    ("rtx 4080 super",   2.0),
+    ("rtx 4080",         1.9),
+    ("rtx 4070 ti super", 1.7),
+    ("rtx 4070 ti",      1.5),
+    ("rtx 4070 super",   1.4),
+    ("rtx 4070",         1.3),
+    ("rtx 4060 ti",      1.0),
+    ("rtx 4060",         0.8),
+    ("rtx 4050",         0.6),
+    ("rtx 3090 ti",      1.15),
+    ("rtx 3090",         1.1),    # 142 TFLOPS — near-linear with V100
+    ("rtx 3080 ti",      0.95),
+    ("rtx 3080",         0.80),
+    ("rtx 3070 ti",      0.65),
+    ("rtx 3070",         0.60),
+    ("rtx 3060 ti",      0.50),
+    ("rtx 3060",         0.45),
+    ("rtx 3050",         0.30),
+    ("rtx 2080 ti",      0.55),
+    ("rtx 2080 super",   0.50),
+    ("rtx 2080",         0.45),
+    ("rtx 2070 super",   0.40),
+    ("rtx 2070",         0.35),
+    ("rtx 2060 super",   0.30),
+    ("rtx 2060",         0.25),
+
+    # ── AMD ──────────────────────────────────────────────────────────
+    ("radeon ai pro r9700", 1.5),
+    ("rx 9070 xt",       1.3),    # 194 TFLOPS
+    ("rx 9070",          1.1),
+    ("mi250x",           1.8),
+    ("mi250",            1.5),
+    ("mi210",            1.2),
+    ("mi100",            1.0),
+    ("mi50",             0.2),    # 26.5 TFLOPS
+    ("radeon vii",       0.3),
+    ("6900 xt",          0.25),
+    ("6800 xt",          0.2),
+]
+
+
+def detect_gpu() -> tuple[str, float]:
+    """Detect the primary CUDA GPU and return (display_name, speed_factor).
+
+    speed_factor is relative to a V100 (1.0).  Unknown GPUs are estimated
+    from VRAM capacity as a rough heuristic.  Returns ("N/A", 1.0) when
+    CUDA is unavailable.
+    """
+    if not torch.cuda.is_available():
+        return ("N/A", 1.0)
+
+    name = torch.cuda.get_device_name(0) or "Unknown"
+    name_lower = name.lower()
+
+    for pattern, factor in _GPU_SPEED_FACTORS:
+        if pattern in name_lower:
+            return (name, factor)
+
+    # Unknown GPU — guess from VRAM as a rough heuristic
+    try:
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        if vram_gb >= 75:
+            return (name, 3.0)
+        if vram_gb >= 40:
+            return (name, 2.0)
+        if vram_gb >= 22:
+            return (name, 1.5)
+        if vram_gb >= 14:
+            return (name, 1.0)
+        return (name, 0.5)
+    except Exception:
+        return (name, 1.0)
+
+
+def estimate_calibration_time(
+    total_runs: int,
+    step_variants: list,
+    step_weights: list | None = None,
+    width: int = 512,
+    height: int = 512,
+) -> tuple[float, str, float]:
+    """Return (total_seconds, gpu_name, gpu_factor) for calibration planning.
+
+    Accounts for the actual weighted mix of step counts, the image resolution,
+    and the detected GPU's speed relative to V100.
+    """
+    gpu_name, gpu_factor = detect_gpu()
+
+    if step_weights and len(step_weights) == len(step_variants):
+        ws = step_weights
+    else:
+        ws = [1.0 / len(step_variants)] * len(step_variants)
+
+    avg_steps = sum(s * w for s, w in zip(step_variants, ws)) / sum(ws)
+    pixel_ratio = (width * height) / (512.0 * 512.0)
+
+    seconds = (total_runs * avg_steps * pixel_ratio *
+               _V100_SECONDS_PER_STEP_AT_512SQ / max(gpu_factor, 0.1))
+
+    return seconds, gpu_name, gpu_factor
+
+
 def score_from_legend(name: str, val: float) -> str:
     """Rate a metric value using the shared legend thresholds."""
     for n, direction, _, good, mid in METRIC_LEGEND:
