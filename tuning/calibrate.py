@@ -149,6 +149,8 @@ def run_calibration(comfy_dir: str, config_path: str = None):
     print(f"  Resolution:     {tcfg.sampling['width']}×{tcfg.sampling['height']}")
     print(f"  Prompts:        {tcfg.calibration['num_prompts']}")
     print(f"  Seeds:          {tcfg.calibration['seeds']}")
+    record_blocks = bool(tcfg.calibration.get("record_block_data", False))
+    print(f"  Block data:     {'ON  (per-block deltas recorded)' if record_blocks else 'OFF'}")
     print(f"  Output:         {out_dir}")
     print("=" * 60)
 
@@ -233,7 +235,7 @@ def run_calibration(comfy_dir: str, config_path: str = None):
 
                 dm, original_fwd = patch_for_calibration(
                     unet, steps, prompt_id=pi, seed=seed,
-                    track_per_block=bool(tcfg.calibration.get("track_per_block", False)),
+                    track_per_block=record_blocks,
                 )
 
                 try:
@@ -295,6 +297,9 @@ def run_calibration(comfy_dir: str, config_path: str = None):
     print(f"  Throughput:      {speed_str}  ({total_runs} runs)")
     print(f"  Total entries:   {len(all_entries)}")
     print(f"  Valid entries:   {len(valid_all)}  (with out_rel)")
+    if record_blocks:
+        block_entries = sum(1 for e in all_entries if e.block_cos_sims is not None)
+        print(f"  Block entries:   {block_entries}  (per-block cos_sim data)")
     print(f"  Data saved to:   {data_file}")
     print(f"{'=' * 60}")
 
