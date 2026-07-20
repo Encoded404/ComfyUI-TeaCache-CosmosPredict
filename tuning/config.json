@@ -26,7 +26,6 @@
         "num_prompts": 30,
         "seeds": [34635345, 53453634, 267454, 123],
         "negative_prompt": "",
-        "track_per_block": true,
         "record_block_data": true
     },
 
