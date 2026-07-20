@@ -40,6 +40,11 @@ class GroupData:
     shift_stats: Optional[Dict[str, np.ndarray]]
     latent_stats: Optional[Dict[str, np.ndarray]]
 
+    # Per-block cosine similarity — shape (n_blocks, n_steps) or None.
+    # Only populated when calibration had track_per_block enabled.
+    block_cos_sim: Optional[np.ndarray] = None
+    n_blocks: int = 0
+
     # Precomputed threshold multipliers for all 5 schedule types
     step_mult: Dict[str, np.ndarray]  # {"constant": (n,), "cosine": (n,), ...}
 
@@ -59,6 +64,12 @@ class SimData:
         Groups are formed by (prompt_id, seed, cond, total_steps).  Each group is
         sorted by step index so that sequential accumulation replays the timeline.
         """
+        # Detect whether any entry has per-block data
+        max_n_blocks = 0
+        for e in entries:
+            if e.block_cos_sims is not None:
+                max_n_blocks = max(max_n_blocks, max(e.block_cos_sims.keys()) + 1)
+
         # 1. Group entries
         bucket: Dict[Tuple[int, int, int, int], List[CalibrationEntry]] = defaultdict(list)
         for e in entries:
@@ -91,6 +102,9 @@ class SimData:
             # Precompute step schedule multipliers
             step_mult = _compute_schedule_mults(step_frac)
 
+            # Extract per-block cosine similarity if available
+            block_cos_sim = _extract_block_cos_sim(g_entries, max_n_blocks)
+
             groups.append(GroupData(
                 n_steps=n,
                 prompt_id=prompt_id,
@@ -102,10 +116,17 @@ class SimData:
                 t_emb_stats=t_emb,
                 shift_stats=shift,
                 latent_stats=latent,
+                block_cos_sim=block_cos_sim,
+                n_blocks=max_n_blocks,
                 step_mult=step_mult,
             ))
 
         return cls(groups=tuple(groups), n_entries=total)
+
+    @property
+    def has_per_block_data(self) -> bool:
+        """True if any group has per-block cosine similarity data."""
+        return self.n_entries > 0 and any(g.block_cos_sim is not None for g in self.groups)
 
     def filter_by_prompt_ids(self, keep_ids: set) -> "SimData":
         """Return new SimData containing only groups whose prompt_id is in keep_ids."""
@@ -143,6 +164,25 @@ def _extract_stats(
             arr[i] = getattr(src, field, np.nan) if src is not None else np.nan
         result[field] = arr
     return result
+
+
+def _extract_block_cos_sim(
+    entries: List[CalibrationEntry], n_blocks: int
+) -> Optional[np.ndarray]:
+    """Extract per-block cosine similarity. Returns (n_blocks, n_steps) or None."""
+    if n_blocks == 0:
+        return None
+    n = len(entries)
+    has_any = any(e.block_cos_sims is not None for e in entries)
+    if not has_any:
+        return None
+    arr = np.full((n_blocks, n), np.nan, dtype=np.float64)
+    for i, e in enumerate(entries):
+        if e.block_cos_sims is not None:
+            for bi, cos_sim in e.block_cos_sims.items():
+                if bi < n_blocks:
+                    arr[bi, i] = cos_sim
+    return arr
 
 
 def _compute_schedule_mults(step_frac: np.ndarray) -> Dict[str, np.ndarray]:
