@@ -241,8 +241,7 @@ def _process_config(idx_and_cfg: tuple) -> tuple:
     best = (0.0, 0.0, 1.0, 1.0, 0.07)
 
     for t in thresholds:
-        cfg.rel_l1_thresh = t
-        skip, err, sp, _qp = _simulate_config_sd(_worker_sim_data, cfg)
+        skip, err, sp, _qp = _simulate_config_sd(_worker_sim_data, cfg, t)
         quality = compute_quality_score(err, scoring_config)
         sc = sp * quality
         if sc > best_score:
