@@ -277,6 +277,34 @@ def _process_config(idx_and_cfg: tuple) -> tuple:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  Pareto sweep worker (module-level for pickling, reuses _worker_sim_data)
+# ═══════════════════════════════════════════════════════════════════════════
+
+_worker_sweep_values: list = []
+_worker_scoring: dict = {}
+
+
+def _init_sweep_worker(sim_data: SimData, sweep_values: list, scoring_config: dict):
+    """Called once per worker process to share read-only sweep data."""
+    global _worker_sim_data, _worker_sweep_values, _worker_scoring
+    _worker_sim_data = sim_data
+    _worker_sweep_values = sweep_values
+    _worker_scoring = scoring_config
+
+
+def _sweep_pareto_config(idx_and_cfg: tuple) -> tuple:
+    """Sweep all thresholds for one Pareto config.
+    Returns (idx, skip, err, sp, best_t)."""
+    idx, cfg = idx_and_cfg
+    global _worker_sim_data, _worker_sweep_values, _worker_scoring
+
+    skip, err, sp, _quality, best_t = _best_threshold(
+        _worker_sim_data, cfg, _worker_sweep_values, _worker_scoring,
+    )
+    return idx, skip, err, sp, best_t
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  Data loading
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -659,29 +687,68 @@ def optimize(configs: List[TeacacheConfig],
 
     t_sweep_start = time_mod.time()
     sweep_values = np.geomspace(*pareto_range, num=pareto_count).tolist()
+    n_ps = len(pareto)
 
-    print(f"\n  Pareto threshold sweep: {pareto_count} values "
-          f"[{pareto_range[0]:.3f}..{pareto_range[1]:.1f}] on {len(pareto)} configs...")
+    print(f"\n  Pareto sweep: {pareto_count} thresholds "
+          f"[{pareto_range[0]:.3f}..{pareto_range[1]:.1f}] × {n_ps} configs")
 
-    for r in pareto:
-        cfg = r.config
-        best_t = cfg.rel_l1_thresh
-        best_sc = r.score
-        best_sk, best_er, best_sp = r.skip_rate, r.accumulated_error, r.estimated_speedup
+    use_parallel_ps = n_ps * pareto_count > 5000
 
-        for t in sweep_values:
-            skip, err, sp, _ = _simulate_config_sd(holdout_sd, cfg, t)
-            sc = sp * compute_quality_score(err, scoring_config)
-            if sc > best_sc:
-                best_sc = sc
-                best_t = t
-                best_sk, best_er, best_sp = skip, err, sp
+    if use_parallel_ps:
+        n_workers = min(os.cpu_count() or 4, 16)
+        indexed = [(i, r.config) for i, r in enumerate(pareto)]
+        done = 0
+        best_overall_sp = 1.0
 
-        cfg.rel_l1_thresh = best_t
-        r.skip_rate = best_sk
-        r.accumulated_error = best_er
-        r.estimated_speedup = best_sp
-        r.score = best_sc
+        import multiprocessing as mp
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(
+            processes=n_workers,
+            initializer=_init_sweep_worker,
+            initargs=(holdout_sd, sweep_values, scoring_config),
+        ) as pool:
+            for idx, skip, err, sp, best_t in pool.imap_unordered(
+                _sweep_pareto_config, indexed, chunksize=1
+            ):
+                r = pareto[idx]
+                r.config.rel_l1_thresh = best_t
+                r.skip_rate = skip
+                r.accumulated_error = err
+                r.estimated_speedup = sp
+                r.score = sp * compute_quality_score(err, scoring_config)
+
+                done += 1
+                if sp > best_overall_sp:
+                    best_overall_sp = sp
+                elapsed = time_mod.time() - t_sweep_start
+                eta = elapsed / done * (n_ps - done) if done > 0 else 0
+                print(f"\r  [{done:>3d}/{n_ps}] "
+                      f"{done/n_ps*100:5.1f}%  "
+                      f"elapsed={elapsed:.0f}s  ETA={eta:.0f}s",
+                      end="", flush=True)
+                print(f"\n{' ' * 22}best: {best_overall_sp:.2f}x                           ",
+                      end="", flush=True)
+                print(f"\033[F", end="")  # cursor back up for next update
+        print()
+    else:
+        for i, r in enumerate(pareto):
+            best_skip, best_err, best_sp, _quality, best_t = _best_threshold(
+                holdout_sd, r.config, sweep_values, scoring_config,
+            )
+            r.config.rel_l1_thresh = best_t
+            r.skip_rate = best_skip
+            r.accumulated_error = best_err
+            r.estimated_speedup = best_sp
+            r.score = best_sp * compute_quality_score(best_err, scoring_config)
+
+            elapsed = time_mod.time() - t_sweep_start
+            eta = elapsed / (i + 1) * (n_ps - i - 1) if i > 0 else 0
+            print(f"\r  [{i+1:>3d}/{n_ps}] "
+                  f"{(i+1)/n_ps*100:5.1f}%  "
+                  f"elapsed={elapsed:.0f}s  ETA={eta:.0f}s  "
+                  f"last={best_sp:.2f}x",
+                  end="", flush=True)
+        print()
 
     t_sweep_elapsed = time_mod.time() - t_sweep_start
     print(f"  Pareto sweep complete in {t_sweep_elapsed:.1f}s\n")
