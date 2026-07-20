@@ -510,7 +510,7 @@ def teacache_anima_forward(
 
             # Knob 7: Step schedule
             mult = step_schedule_multiplier(current_percent, cfg.step_schedule)
-            effective_thresh = cfg.rel_l1_thresh * mult
+            effective_thresh = cfg.rel_l1_thresh * mult * cfg.signal_scale * cfg.signal_scale
 
             # Knob 5+6: Accumulation + threshold
             new_acc, should_calc = accumulate_distance(
@@ -568,7 +568,7 @@ def teacache_anima_forward(
     if not should_calc_global:
         # ── Knob 9: Apply cached residual(s) ──
         mult = step_schedule_multiplier(current_percent, cfg.step_schedule)
-        effective_thresh = cfg.rel_l1_thresh * mult
+        effective_thresh = cfg.rel_l1_thresh * mult * cfg.signal_scale
 
         for i, k in enumerate(cond_or_uncond):
             state = self.teacache_state[k]

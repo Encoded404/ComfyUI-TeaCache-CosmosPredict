@@ -117,7 +117,7 @@ def simulate_config(
 
         # ── Vectorized: effective thresholds ──
         step_mult = group.step_mult.get(cfg.step_schedule, group.step_mult["constant"])
-        thresholds = threshold * step_mult
+        thresholds = threshold * step_mult * cfg.signal_scale
 
         # ── Precompute merged penalty array (out_rel > 0 ? out_rel : res_rel) ──
         penalties = np.where(group.out_rel > 0, group.out_rel, group.res_rel)
