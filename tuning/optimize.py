@@ -232,6 +232,27 @@ def _init_worker(sim_data: SimData, poly_cache: dict, opt: dict):
     _worker_opt = opt
 
 
+def _best_threshold(
+    sim_data: SimData,
+    cfg: TeacacheConfig,
+    thresholds: list,
+    scoring_config: dict,
+) -> tuple:
+    """Sweep thresholds for one config.  Returns (skip, err, sp, quality, best_t)."""
+    best_sc = -1.0
+    best = (0.0, 0.0, 1.0, 1.0, thresholds[0])
+
+    for t in thresholds:
+        skip, err, sp, _ = _simulate_config_sd(sim_data, cfg, t)
+        quality = compute_quality_score(err, scoring_config)
+        sc = sp * quality
+        if sc > best_sc:
+            best_sc = sc
+            best = (skip, err, sp, quality, t)
+
+    return best
+
+
 def _process_config(idx_and_cfg: tuple) -> tuple:
     """Process a single config in a worker process. Sweeps candidate thresholds.
 
@@ -247,18 +268,12 @@ def _process_config(idx_and_cfg: tuple) -> tuple:
     thresholds = _worker_opt.get("candidate_thresholds", [0.07])
     scoring_config = _worker_opt.get("quality_scoring",
                                       {"type": "thresholded_power", "target": 0.05, "power": 3.0})
-    best_score = -1.0
-    best = (0.0, 0.0, 1.0, 1.0, 0.07)
 
-    for t in thresholds:
-        skip, err, sp, _qp = _simulate_config_sd(_worker_sim_data, cfg, t)
-        quality = compute_quality_score(err, scoring_config)
-        sc = sp * quality
-        if sc > best_score:
-            best_score = sc
-            best = (skip, err, sp, quality, t)
+    skip, err, sp, quality, best_t = _best_threshold(
+        _worker_sim_data, cfg, thresholds, scoring_config,
+    )
 
-    return idx, *best
+    return idx, skip, err, sp, quality, best_t
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -538,20 +553,9 @@ def optimize(configs: List[TeacacheConfig],
                 key = _poly_fit_key(cfg)
                 cfg.coefficients = poly_cache.get(key, [])
 
-            best_score = -1.0
-            best_thresh = thresholds[0]
-            best_skip = best_err = 0.0
-            best_sp = 1.0
-            best_quality = 1.0
-
-            for t in thresholds:
-                skip, err, sp, _ = _simulate_config_sd(holdout_sd, cfg, t)
-                quality = compute_quality_score(err, scoring_config)
-                sc = sp * quality
-                if sc > best_score:
-                    best_score = sc
-                    best_thresh = t
-                    best_skip, best_err, best_sp, best_quality = skip, err, sp, quality
+            best_skip, best_err, best_sp, best_quality, best_thresh = _best_threshold(
+                holdout_sd, cfg, thresholds, scoring_config,
+            )
 
             cfg.rel_l1_thresh = best_thresh
             score = best_sp * best_quality
