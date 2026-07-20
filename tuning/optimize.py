@@ -575,7 +575,7 @@ def optimize(configs: List[TeacacheConfig],
                           f"{done_count/total*100:5.1f}%  "
                           f"elapsed={elapsed:.0f}s  ETA={eta:.0f}s  "
                           f"[{n_workers} workers]  "
-                          f"sp={sp:.2f}x  score={score:.3f}",
+                          f"sp={sp:.2f}x  score={score:.3f}      ",
                           end="", flush=True)
 
         for i, r in enumerate(results_list):
@@ -607,7 +607,7 @@ def optimize(configs: List[TeacacheConfig],
                       f"{(i+1)/total*100:5.1f}%  "
                       f"elapsed={elapsed:.0f}s  ETA={eta:.0f}s  "
                       f"last: src={cfg.source} {cfg.metric_type} {cfg.mapping_type} "
-                      f"skip={best_skip:.1%} sp={best_sp:.2f}x score={score:.3f}",
+                      f"skip={best_skip:.1%} sp={best_sp:.2f}x score={score:.3f}      ",
                       end="", flush=True)
 
     # ── 6. Replicate results to full config space ──────────────────────
@@ -732,7 +732,7 @@ def optimize(configs: List[TeacacheConfig],
                 eta = elapsed / done * (n_ps - done) if done > 0 else 0
                 print(f"\r  [{done:>3d}/{n_ps}] "
                       f"{done/n_ps*100:5.1f}%  "
-                      f"elapsed={elapsed:.0f}s  ETA={eta:.0f}s",
+                      f"elapsed={elapsed:.0f}s  ETA={eta:.0f}s      ",
                       end="", flush=True)
                 print(f"\n{' ' * 22}best: {best_overall_sp:.2f}x                           ",
                       end="", flush=True)
@@ -754,7 +754,7 @@ def optimize(configs: List[TeacacheConfig],
             print(f"\r  [{i+1:>3d}/{n_ps}] "
                   f"{(i+1)/n_ps*100:5.1f}%  "
                   f"elapsed={elapsed:.0f}s  ETA={eta:.0f}s  "
-                  f"last={best_sp:.2f}x",
+                  f"last={best_sp:.2f}x      ",
                   end="", flush=True)
         print()
 
@@ -823,9 +823,9 @@ def main():
         print(f"  {i+1:>2}. src={c.source:<20} metric={c.metric_type:<15} "
               f"map={c.mapping_type:<12} acc={c.accumulation_type:<12} "
               f"scale={c.signal_scale:>6.4g}  "
+              f"block={c.block_mode:<16} res={c.residual_strategy:<8}  "
               f"skip={r.skip_rate:.1%}  speedup={r.estimated_speedup:.2f}x  "
-              f"error={r.accumulated_error:.4f}  score={r.score:.3f}  "
-              f"block={c.block_mode:<16} res={c.residual_strategy}")
+              f"error={r.accumulated_error:.4f}  score={r.score:.3f}")
 
     # Print Pareto in order of speedup
     pareto_sorted = sorted(pareto, key=lambda r: r.estimated_speedup)
