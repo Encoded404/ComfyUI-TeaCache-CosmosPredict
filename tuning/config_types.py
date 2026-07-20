@@ -47,6 +47,7 @@ class TeacacheConfig:
     # Knob 8: Block skipping
     block_mode: str = "all_or_nothing"
     block_params: Dict = field(default_factory=dict)
+    cosim_threshold: float = 0.95  # for dynamic mode: cosine-sim threshold for caching a block
 
     # Knob 9: Residual strategy
     residual_strategy: str = "hard"
@@ -77,6 +78,7 @@ class TeacacheConfig:
             "residual_params": self.residual_params,
             "cross_feed_enabled": self.cross_feed_enabled,
             "cross_feed_strength": self.cross_feed_strength,
+            "cosim_threshold": self.cosim_threshold,
         }
 
     @classmethod
@@ -101,6 +103,7 @@ class TeacacheConfig:
             residual_params=d.get("residual_params", {}),
             cross_feed_enabled=d.get("cross_feed_enabled", False),
             cross_feed_strength=d.get("cross_feed_strength", 0.5),
+            cosim_threshold=d.get("cosim_threshold", 0.95),
         )
 
     @classmethod
@@ -116,6 +119,7 @@ class TeacacheConfig:
             "block_mode", "block_params",
             "residual_strategy", "residual_params",
             "cross_feed_enabled", "cross_feed_strength",
+            "cosim_threshold",
         ]:
             if f"tc_{key}" in to:
                 d[key] = to[f"tc_{key}"]
@@ -164,6 +168,10 @@ class CalibrationEntry:
     out_rel_std: float = 0.0
     res_rel: float = 0.0
 
+    # Per-block cosine similarity (block_idx -> cos_sim) at this step.
+    # Populated when track_per_block is enabled during calibration.
+    block_cos_sims: Optional[Dict[int, float]] = None
+
     # Sampler/scheduler identity (for sampler-specific tuning)
     sampler: str = ""
     scheduler: str = ""
@@ -179,6 +187,8 @@ class CalibrationEntry:
             "out_rel_std": self.out_rel_std,
             "res_rel": self.res_rel,
         }
+        if self.block_cos_sims is not None:
+            d["block_cos_sims"] = {str(k): v for k, v in self.block_cos_sims.items()}
         for src_name in ["t_emb", "shift", "latent"]:
             stats = getattr(self, src_name)
             if stats is not None:
@@ -201,6 +211,10 @@ class CalibrationEntry:
                 p95=s["p95"], median=s["median"], min=s["min"],
                 denom=s["denom"],
             )
+        def _parse_block_cos_sims(raw) -> Optional[Dict[int, float]]:
+            if raw is None or not isinstance(raw, dict):
+                return None
+            return {int(k): float(v) for k, v in raw.items()}
         return cls(
             step=d["step"], step_fraction=d["step_fraction"],
             prompt_id=d["prompt_id"], seed=d["seed"],
@@ -213,6 +227,7 @@ class CalibrationEntry:
             out_rel_max=d.get("out_rel_max", 0.0),
             out_rel_std=d.get("out_rel_std", 0.0),
             res_rel=d.get("res_rel", 0.0),
+            block_cos_sims=_parse_block_cos_sims(d.get("block_cos_sims")),
         )
 
 
