@@ -86,7 +86,11 @@ def patch_for_calibration(unet, steps: int, prompt_id: int, seed: int,
     to["calibration_total_steps"] = steps
     to["calibration_prompt_id"] = prompt_id
     to["calibration_seed"] = seed
-    to["track_per_block"] = track_per_block
+
+    # Per-block tracking state lives on the model directly, not in
+    # transformer_options, to avoid interfering with model-specific
+    # WrapperExecutor chains (Cosmos Predict2, etc.).
+    diffusion_model._calib_track_per_block = track_per_block
 
     # Add a wrapper to update step index
     def wrapper(model_function, kwargs):
@@ -120,7 +124,7 @@ def restore_model(diffusion_model, original_fwd, unet):
     unet.set_model_unet_function_wrapper(None)
     to = unet.model_options.get("transformer_options", {})
     for k in list(to.keys()):
-        if k.startswith("calibration_") or k == "track_per_block":
+        if k.startswith("calibration_"):
             del to[k]
 
 
