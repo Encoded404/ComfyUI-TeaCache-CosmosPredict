@@ -205,6 +205,7 @@ def run_calibration(comfy_dir: str, config_path: str = None):
 
     all_entries: list[CalibrationEntry] = []
     run_idx = 0
+    wall_start = time.time()
 
     data_file = out_dir / "calibration_data.jsonl"
 
@@ -273,12 +274,22 @@ def run_calibration(comfy_dir: str, config_path: str = None):
                 )
 
     # Summary
+    wall_elapsed = time.time() - wall_start
     valid_all = [e for e in all_entries if e.out_rel > 0]
+
+    it_per_sec = total_runs / wall_elapsed if wall_elapsed > 0 else 0.0
+    if it_per_sec >= 1.0:
+        speed_str = f"{it_per_sec:.1f} it/s"
+    else:
+        speed_str = f"{wall_elapsed / total_runs:.1f} s/it" if total_runs > 0 else "N/A"
+
     print(f"\n{'=' * 60}")
     print(f"  Calibration complete")
-    print(f"  Total entries: {len(all_entries)}")
-    print(f"  Valid entries (with out_rel): {len(valid_all)}")
-    print(f"  Data saved to: {data_file}")
+    print(f"  Total time:      {int(wall_elapsed // 60)}m {int(wall_elapsed % 60)}s")
+    print(f"  Throughput:      {speed_str}  ({total_runs} runs)")
+    print(f"  Total entries:   {len(all_entries)}")
+    print(f"  Valid entries:   {len(valid_all)}  (with out_rel)")
+    print(f"  Data saved to:   {data_file}")
     print(f"{'=' * 60}")
 
     return str(data_file)
