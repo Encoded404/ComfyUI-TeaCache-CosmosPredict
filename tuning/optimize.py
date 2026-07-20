@@ -740,7 +740,7 @@ def main():
         c = r.config
         print(f"  {i+1:>2}. src={c.source:<20} metric={c.metric_type:<15} "
               f"map={c.mapping_type:<12} acc={c.accumulation_type:<12} "
-              f"scale={c.signal_scale:>6.0f}  "
+               f"scale={c.signal_scale:>6.4g}  "
               f"skip={r.skip_rate:.1%}  speedup={r.estimated_speedup:.2f}x  "
               f"error={r.accumulated_error:.4f}  score={r.score:.3f}")
 
@@ -752,7 +752,7 @@ def main():
         c = r.config
         print(f"  speedup={r.estimated_speedup:.2f}x  error={r.accumulated_error:.4f}  "
               f"src={c.source} metric={c.metric_type} map={c.mapping_type} "
-              f"acc={c.accumulation_type} scale={c.signal_scale:.0f}")
+               f"acc={c.accumulation_type} scale={c.signal_scale:.4g}")
 
     print(f"\n  Results saved to: {out_dir}")
 
