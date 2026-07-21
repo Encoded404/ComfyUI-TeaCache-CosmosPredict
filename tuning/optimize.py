@@ -1397,7 +1397,7 @@ def optimize(configs: List[TeacacheConfig],
     # Refine each Pareto winner's threshold.  Floor at the smallest
     # candidate threshold so the sweep cannot rediscover the "do nothing"
     # trivial solution (skip_rate=0, error=0, score=1.0).
-    min_cand = min(opt.get("candidate_thresholds", [0.07]))
+    min_cand = min(expand_thresholds(opt.get("candidate_thresholds", [0.07])))
     pareto_range = opt.get("pareto_threshold_range", [min_cand, 10.0])
     pareto_range[0] = max(pareto_range[0], min_cand)
     pareto_count = opt.get("pareto_threshold_count", 500)
