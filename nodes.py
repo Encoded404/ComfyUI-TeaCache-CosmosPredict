@@ -1021,36 +1021,6 @@ def patch_same_meta():
     post_grad.same_meta = new_same_meta
     new_same_meta._patched = True
 
-
-def patch_ggml_for_dynamo():
-    try:
-        import comfy.ops
-        _tag = "_teacache_no_compile"
-
-        for cls_name in ("RMSNorm", "LayerNorm"):
-            cls = getattr(comfy.ops, cls_name, None)
-            if cls is None:
-                continue
-            fn = getattr(cls, "forward_comfy_cast_weights", None)
-            if fn is None or getattr(fn, _tag, False):
-                continue
-            cls.forward_comfy_cast_weights = torch.compiler.disable(fn)
-            setattr(cls.forward_comfy_cast_weights, _tag, True)
-
-        print("[TeaCache] Patched comfy norm layers for GGUF/Dynamo compatibility.")
-    except ImportError:
-        pass
-
-
-def _model_uses_gguf(model):
-    diffusion_model = model.get_model_object("diffusion_model")
-    for param in diffusion_model.parameters():
-        name = type(param).__name__
-        if "GGML" in name or "Ggml" in name:
-            return True
-    return False
-
-
 class CompileModel:
     @classmethod
     def INPUT_TYPES(s):
@@ -1073,14 +1043,8 @@ class CompileModel:
     def apply_compile(self, model, mode: str, backend: str, fullgraph: bool, dynamic: bool):
         patch_optimized_module()
         patch_same_meta()
-        patch_ggml_for_dynamo()
         torch._dynamo.config.suppress_errors = True
-
-        if fullgraph and _model_uses_gguf(model):
-            print("[TeaCache] GGUF model detected — fullgraph=True is "
-                  "incompatible with GGUF tensors, forcing fullgraph=False.")
-            fullgraph = False
-
+        
         new_model = model.clone()
         new_model.add_object_patch(
                                 "diffusion_model",
