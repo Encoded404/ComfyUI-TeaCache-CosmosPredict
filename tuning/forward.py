@@ -494,7 +494,17 @@ def teacache_anima_forward(
                 "prev_residual": None,
                 "prev_residual_late": None,   # for block splitting
                 "accum_state": {},             # for windowed accumulation
+                "per_group": None,             # per-group accum state for dynamic+per_group
             }
+        if cfg.block_mode == "dynamic" and cfg.block_level == "per_group":
+            groups = detect_block_groups(self.blocks)
+            if self.teacache_state[k].get("per_group") is None:
+                self.teacache_state[k]["per_group"] = {
+                    "accumulated": [0.0] * len(groups),
+                    "should_calc": [True] * len(groups),
+                    "accum_state": [{} for _ in groups],
+                    "prev_residuals": [None] * len(groups),
+                }
 
     # ── 3b. Determine current step index ──
     sigmas = transformer_options.get("sample_sigmas", None)
@@ -524,6 +534,7 @@ def teacache_anima_forward(
                 cfg.coefficients,
                 cfg.mapping_params,
             )
+            state["last_predicted"] = float(predicted) if isinstance(predicted, (int, float)) else float(predicted.item())
 
             # Knob 7: Step schedule
             mult = step_schedule_multiplier(current_percent, cfg.step_schedule)
@@ -542,6 +553,32 @@ def teacache_anima_forward(
             state["should_calc"] = should_calc
 
         state["prev_mod"] = curr_mod
+
+    # ── 4b. Per-group accumulation (dynamic + per_group only) ──
+    if cfg.block_mode == "dynamic" and cfg.block_level == "per_group":
+        groups = detect_block_groups(self.blocks)
+        pg_cfgs = cfg.block_params.get("per_group", {}).get("groups", [])
+        for i, k in enumerate(cond_or_uncond):
+            pg_state = self.teacache_state[k].get("per_group")
+            if pg_state is None:
+                continue
+            for gi in range(len(groups)):
+                if gi >= len(pg_cfgs):
+                    continue
+                gc = pg_cfgs[gi]
+                sched = gc.get("step_schedule", cfg.step_schedule)
+                mult = step_schedule_multiplier(current_percent, sched)
+                eff = cfg.rel_l1_thresh * mult * cfg.signal_scale * cfg.signal_scale
+                new_acc, should = accumulate_distance(
+                    pg_state["accumulated"][gi],
+                    self.teacache_state[k].get("last_predicted", 0.0),
+                    eff,
+                    gc["accumulation_type"],
+                    gc.get("accumulation_params", {}),
+                    accum_state=pg_state["accum_state"][gi],
+                )
+                pg_state["accumulated"][gi] = new_acc
+                pg_state["should_calc"][gi] = should
 
     # ── 5. Global decision ──
     enable_teacache = transformer_options.get("enable_teacache", True)
@@ -598,19 +635,30 @@ def teacache_anima_forward(
                         x_B_T_H_W_D[i * b : (i + 1) * b], resid,
                         cfg.residual_strategy, confidence=confidence, params=cfg.residual_params,
                     )
-            elif cfg.block_mode in ("split_fraction", "split_groups", "dynamic"):
-                # Run always-run blocks, then apply cached late residual
-                always_blocks, cache_blocks = _get_block_split(self.blocks, cfg)
-                for blk in always_blocks:
-                    x_B_T_H_W_D = blk(x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, **block_kwargs)
-                resid_late = state.get("prev_residual_late")
-                if resid_late is not None:
-                    confidence = min(state["accumulated"] / max(effective_thresh, 1e-8), 1.0)
-                    x_B_T_H_W_D[i * b : (i + 1) * b] = apply_residual(
-                        x_B_T_H_W_D[i * b : (i + 1) * b], resid_late,
-                        cfg.residual_strategy, confidence=confidence, params=cfg.residual_params,
+            elif cfg.block_mode == "dynamic" and cfg.block_level == "per_group":
+                groups = detect_block_groups(self.blocks)
+                for gi, (s, e) in enumerate(groups):
+                    any_calc = any(
+                        (self.teacache_state[k].get("per_group") or {}).get("should_calc", [True] * len(groups))[gi]
+                        for k in cond_or_uncond
                     )
-    else:
+                    if any_calc:
+                        for bi in range(s, e):
+                            x_B_T_H_W_D = self.blocks[bi](x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, **block_kwargs)
+                    else:
+                        for i, k in enumerate(cond_or_uncond):
+                            pg = self.teacache_state[k].get("per_group")
+                            if pg is None:
+                                continue
+                            resid = pg.get("prev_residuals", [None] * len(groups))[gi]
+                            if resid is not None:
+                                acc = pg["accumulated"][gi]
+                                eff = cfg.rel_l1_thresh * step_schedule_multiplier(current_percent, cfg.step_schedule) * cfg.signal_scale
+                                conf = min(acc / max(eff, 1e-8), 1.0)
+                                x_B_T_H_W_D[i * b : (i + 1) * b] = apply_residual(
+                                    x_B_T_H_W_D[i * b : (i + 1) * b], resid,
+                                    cfg.residual_strategy, confidence=conf, params=cfg.residual_params,
+                                )
         # ── Knob 8: Run blocks (with optional splitting for residuals) ──
         ori_x = x_B_T_H_W_D.to(cache_device)
 
@@ -635,6 +683,21 @@ def teacache_anima_forward(
             for i, k in enumerate(cond_or_uncond):
                 self.teacache_state[k]["prev_residual"] = residual_early[i * b : (i + 1) * b]
                 self.teacache_state[k]["prev_residual_late"] = residual_late[i * b : (i + 1) * b]
+
+        elif cfg.block_mode == "dynamic" and cfg.block_level == "per_group":
+            groups = detect_block_groups(self.blocks)
+            group_residuals = []
+            prev_x = ori_x
+            for _gi, (s, e) in enumerate(groups):
+                for bi in range(s, e):
+                    x_B_T_H_W_D = self.blocks[bi](x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, **block_kwargs)
+                curr_x = x_B_T_H_W_D.to(cache_device)
+                group_residuals.append(curr_x - prev_x)
+                prev_x = curr_x
+            for i, k in enumerate(cond_or_uncond):
+                pg = self.teacache_state[k]["per_group"]
+                pg["prev_residuals"] = [r[i * b : (i + 1) * b] for r in group_residuals]
+                pg["accumulated"] = [0.0] * len(groups)
 
         # ── Knob 10: Cross-feed ──
         if cfg.cross_feed_enabled:
