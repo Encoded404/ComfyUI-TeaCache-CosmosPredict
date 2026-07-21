@@ -273,6 +273,10 @@ class TeaCacheAnima:
       quality=0 → min error tolerance → near-lossless (LPIPS≈0.01)
       quality=50 → balanced (~1.3x speedup)
       quality=100 → max error tolerance → max speed (~2x speedup)
+
+    Optional overrides let you change discrete parameters (residual strategy,
+    block mode, accumulation type, step schedule) without leaving the auto
+    slider. Left at "auto", they use the preset's own value.
     """
 
     @classmethod
@@ -286,14 +290,54 @@ class TeaCacheAnima:
                                         "display": "slider",
                                         "tooltip": "0 = max quality (lossless), 50 = balanced, 100 = max speed"}),
             },
+            "optional": {
+                "residual_strategy": (
+                    ["auto", "hard", "blended", "scaled"],
+                    {"default": "auto",
+                     "tooltip": "Override residual application. 'auto' uses the preset's strategy."},
+                ),
+                "block_mode": (
+                    ["auto", "all_or_nothing", "split_fraction", "split_groups"],
+                    {"default": "auto",
+                     "tooltip": "Override which blocks to cache. 'auto' uses the preset's mode."},
+                ),
+                "accumulation_type": (
+                    ["auto", "hard_reset", "carry_over", "leaky", "windowed"],
+                    {"default": "auto",
+                     "tooltip": "Override how distance accumulates. 'auto' uses the preset's type."},
+                ),
+                "step_schedule": (
+                    ["auto", "constant", "cosine", "linear_ramp", "linear_decay", "bell"],
+                    {"default": "auto",
+                     "tooltip": "Override how threshold varies across steps. 'auto' uses the preset's schedule."},
+                ),
+            },
         }
 
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "apply_teacache_anima"
     CATEGORY = "TeaCache"
 
-    def apply_teacache_anima(self, model, steps, quality):
+    def apply_teacache_anima(self, model, steps, quality,
+                              residual_strategy="auto",
+                              block_mode="auto",
+                              accumulation_type="auto",
+                              step_schedule="auto"):
         cfg, speedup, lpips_est = _quality_to_config(quality, steps=steps)
+
+        overrides = []
+        if residual_strategy != "auto":
+            cfg.residual_strategy = residual_strategy
+            overrides.append(f"res={residual_strategy}")
+        if block_mode != "auto":
+            cfg.block_mode = block_mode
+            overrides.append(f"blk={block_mode}")
+        if accumulation_type != "auto":
+            cfg.accumulation_type = accumulation_type
+            overrides.append(f"acc={accumulation_type}")
+        if step_schedule != "auto":
+            cfg.step_schedule = step_schedule
+            overrides.append(f"sched={step_schedule}")
 
         new_model = _apply_teacache(model, cfg)
 
@@ -304,6 +348,8 @@ class TeaCacheAnima:
             f"LPIPS≈{lpips_est:.3f}  "
             f"src={cfg.source}"
         )
+        if overrides:
+            info += "  {" + ", ".join(overrides) + "}"
 
         if hasattr(new_model, "widget_values"):
             new_model.widget_values = info
