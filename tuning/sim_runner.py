@@ -103,6 +103,8 @@ def simulate_config(
     total_skip = 0
     total_error = 0.0
     total_steps = 0
+    dyn_bf_weighted = 0.0
+    dyn_skip_total = 0
 
     for group in sim_data.groups:
         stats = _get_source_stats(group, cfg.source)
@@ -123,7 +125,7 @@ def simulate_config(
         penalties = np.where(group.out_rel > 0, group.out_rel, group.res_rel)
 
         # ── Sequential: accumulation (Numba or Python, dispatched once) ──
-        skip, err = simulate_group(
+        skip, err, mask = simulate_group(
             predicted, thresholds, penalties,
             cfg.accumulation_type, cfg.accumulation_params,
         )
@@ -132,14 +134,63 @@ def simulate_config(
         total_error += err
         total_steps += group.n_steps
 
+        if cfg.block_mode == "dynamic":
+            dyn_bf = _compute_dynamic_block_fraction(
+                cfg, group.block_cos_sim, mask,
+            )
+            dyn_bf_weighted += dyn_bf * skip
+            dyn_skip_total += skip
+
     if total_steps == 0:
         return 0.0, 0.0, 1.0, 1.0
 
     skip_rate = total_skip / total_steps
     avg_error = total_error / total_steps
     quality_proxy = 1.0 / (1.0 + avg_error)
-    bf = _block_fraction(cfg)
+
+    if cfg.block_mode == "dynamic" and dyn_skip_total > 0:
+        bf = dyn_bf_weighted / dyn_skip_total
+    else:
+        bf = _block_fraction(cfg)
+
     speedup = (1.0 / (1.0 - skip_rate * bf)
                if bf > 0 and skip_rate * bf < 1.0 else 1.0)
 
     return skip_rate, avg_error, speedup, quality_proxy
+
+
+def _compute_dynamic_block_fraction(
+    cfg: TeacacheConfig,
+    block_cos_sim: Optional[np.ndarray],  # (n_blocks, n_steps) or None
+    skip_mask: np.ndarray,                # bool (n_steps,)
+    default: float = 0.85,
+) -> float:
+    """Compute block fraction using per-block cosine similarity at each skip step.
+
+    On steps where the global accumulator says 'skip', blocks whose recorded
+    cosine similarity exceeds cfg.cosim_threshold are considered cache-safe.
+    The returned fraction represents the average compute saved per skip step,
+    scaled by *default* (the fraction of total model compute in the blocks).
+    """
+    if block_cos_sim is None:
+        return default
+
+    n_blocks = block_cos_sim.shape[0]
+    n_steps = min(len(skip_mask), block_cos_sim.shape[1])
+    threshold = cfg.cosim_threshold
+
+    total_cached_blocks = 0.0
+    skip_count = 0
+    for t in range(n_steps):
+        if skip_mask[t]:
+            skip_count += 1
+            cached = 0
+            for bi in range(n_blocks):
+                cs = block_cos_sim[bi, t]
+                if not np.isnan(cs) and cs > threshold:
+                    cached += 1
+            total_cached_blocks += cached / max(n_blocks, 1)
+
+    if skip_count == 0:
+        return 0.0
+    return (total_cached_blocks / skip_count) * default

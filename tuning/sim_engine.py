@@ -24,59 +24,69 @@ except ImportError:
 
 def _py_hard_reset(
     predicted: np.ndarray, thresholds: np.ndarray, penalties: np.ndarray,
-) -> Tuple[int, float]:
+) -> Tuple[int, float, np.ndarray]:
     n = len(predicted)
     skip, err, acc = 0, 0.0, 0.0
+    mask = np.empty(n, dtype=bool)
     for i in range(n):
         acc += predicted[i]
         if acc >= thresholds[i]:
             acc = 0.0
+            mask[i] = False
         else:
             skip += 1
             err += penalties[i]
-    return skip, err
+            mask[i] = True
+    return skip, err, mask
 
 
 def _py_carry_over(
     predicted: np.ndarray, thresholds: np.ndarray, penalties: np.ndarray,
-) -> Tuple[int, float]:
+) -> Tuple[int, float, np.ndarray]:
     n = len(predicted)
     skip, err, acc = 0, 0.0, 0.0
+    mask = np.empty(n, dtype=bool)
     for i in range(n):
         acc += predicted[i]
         if acc >= thresholds[i]:
             acc -= thresholds[i]
+            mask[i] = False
         else:
             skip += 1
             err += penalties[i]
-    return skip, err
+            mask[i] = True
+    return skip, err, mask
 
 
 def _py_leaky(
     predicted: np.ndarray, thresholds: np.ndarray, penalties: np.ndarray,
     leak_factor: float,
-) -> Tuple[int, float]:
+) -> Tuple[int, float, np.ndarray]:
     n = len(predicted)
     skip, err, acc = 0, 0.0, 0.0
+    mask = np.empty(n, dtype=bool)
     for i in range(n):
         acc = acc * leak_factor + predicted[i]
         if acc >= thresholds[i]:
             acc = 0.0
+            mask[i] = False
         else:
             skip += 1
             err += penalties[i]
-    return skip, err
+            mask[i] = True
+    return skip, err, mask
 
 
 def _py_windowed(
     predicted: np.ndarray, thresholds: np.ndarray, penalties: np.ndarray,
     window_size: int,
-) -> Tuple[int, float]:
+) -> Tuple[int, float, np.ndarray]:
     n = len(predicted)
     window = np.zeros(window_size, dtype=np.float64)
     w_idx, w_count, w_sum = 0, 0, 0.0
     min_w = max(2, window_size // 2)
     skip, err = 0, 0.0
+    mask = np.empty(n, dtype=bool)
 
     for i in range(n):
         if w_count == window_size:
@@ -92,10 +102,12 @@ def _py_windowed(
             w_sum = 0.0
             w_count = 0
             window[:] = 0.0
+            mask[i] = False
         else:
             skip += 1
             err += penalties[i]
-    return skip, err
+            mask[i] = True
+    return skip, err, mask
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -108,40 +120,49 @@ if _HAS_NUMBA:
     def _nb_hard_reset(predicted, thresholds, penalties):  # pragma: no cover
         n = len(predicted)
         skip, err, acc = 0, 0.0, 0.0
+        mask = np.empty(n, dtype=np.bool_)
         for i in range(n):
             acc += predicted[i]
             if acc >= thresholds[i]:
                 acc = 0.0
+                mask[i] = False
             else:
                 skip += 1
                 err += penalties[i]
-        return skip, err
+                mask[i] = True
+        return skip, err, mask
 
     @njit(fastmath=False, cache=True)
     def _nb_carry_over(predicted, thresholds, penalties):  # pragma: no cover
         n = len(predicted)
         skip, err, acc = 0, 0.0, 0.0
+        mask = np.empty(n, dtype=np.bool_)
         for i in range(n):
             acc += predicted[i]
             if acc >= thresholds[i]:
                 acc -= thresholds[i]
+                mask[i] = False
             else:
                 skip += 1
                 err += penalties[i]
-        return skip, err
+                mask[i] = True
+        return skip, err, mask
 
     @njit(fastmath=False, cache=True)
     def _nb_leaky(predicted, thresholds, penalties, leak_factor):  # pragma: no cover
         n = len(predicted)
         skip, err, acc = 0, 0.0, 0.0
+        mask = np.empty(n, dtype=np.bool_)
         for i in range(n):
             acc = acc * leak_factor + predicted[i]
             if acc >= thresholds[i]:
                 acc = 0.0
+                mask[i] = False
             else:
                 skip += 1
                 err += penalties[i]
-        return skip, err
+                mask[i] = True
+        return skip, err, mask
 
     @njit(fastmath=False, cache=True)
     def _nb_windowed(predicted, thresholds, penalties, window_size):  # pragma: no cover
@@ -150,6 +171,7 @@ if _HAS_NUMBA:
         w_idx, w_count, w_sum = 0, 0, 0.0
         min_w = max(2, window_size // 2)
         skip, err = 0, 0.0
+        mask = np.empty(n, dtype=np.bool_)
         for i in range(n):
             if w_count == window_size:
                 w_sum -= window[w_idx]
@@ -163,10 +185,12 @@ if _HAS_NUMBA:
                 w_sum = 0.0
                 w_count = 0
                 window[:] = 0.0
+                mask[i] = False
             else:
                 skip += 1
                 err += penalties[i]
-        return skip, err
+                mask[i] = True
+        return skip, err, mask
 
     _DISPATCH = {
         "hard_reset": _nb_hard_reset,
@@ -193,8 +217,8 @@ def simulate_group(
     penalties: np.ndarray,    # (G,) float64 — merged out_rel / res_rel
     accum_type: str,
     accum_params: dict,
-) -> Tuple[int, float]:
-    """Simulate one group's accumulation.  Returns (skip_count, total_error)."""
+) -> Tuple[int, float, np.ndarray]:
+    """Simulate one group's accumulation.  Returns (skip_count, total_error, skip_mask)."""
     fn = _DISPATCH[accum_type]
     if accum_type == "leaky":
         return fn(predicted, thresholds, penalties,
