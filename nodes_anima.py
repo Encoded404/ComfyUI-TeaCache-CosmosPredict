@@ -54,6 +54,36 @@ def _is_new_format(presets: dict) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  Quality curve: maps the 0-100 slider to error space
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _apply_quality_curve(quality: float, lo: float, hi: float, presets: dict) -> float:
+    """Map quality (0-100) to a target accumulated_error using the configured curve.
+
+    Supported curves:
+      "linear":   uniform spacing (legacy default)
+      "power":    polynomial compression toward low error (p > 1 → more
+                  granularity at the high-quality end)
+      "exponential": geometric spacing (proportional steps)
+
+    Configured via _quality_curve and _quality_power in the presets JSON.
+    """
+    curve = presets.get("_quality_curve", "linear")
+    q = quality / 100.0
+
+    if curve == "exponential":
+        ratio = hi / lo if lo > 0 else 1.0
+        return lo * (ratio ** q)
+
+    if curve == "power":
+        p = presets.get("_quality_power", 2.0)
+        return lo + (hi - lo) * (q ** p)
+
+    # linear (default / backward-compatible)
+    return lo + q * (hi - lo)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  New format: error-anchored control point interpolation
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -77,7 +107,7 @@ def _quality_to_config(quality: float, steps: int = 30) -> Tuple[TeacacheConfig,
     points.sort(key=lambda p: p["error"])
     lo_err, hi_err = error_range
 
-    target_error = lo_err + (quality / 100.0) * (hi_err - lo_err)
+    target_error = _apply_quality_curve(quality, lo_err, hi_err, presets)
 
     # Find bracketing control points
     if target_error <= points[0]["error"]:
@@ -300,7 +330,7 @@ def _quality_to_error(quality: float) -> float:
     points = presets["control_points"]
     error_range = presets.get("_error_range", [points[0]["error"], points[-1]["error"]])
     lo_err, hi_err = error_range
-    return lo_err + (quality / 100.0) * (hi_err - lo_err)
+    return _apply_quality_curve(quality, lo_err, hi_err, presets)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

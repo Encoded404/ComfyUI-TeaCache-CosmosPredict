@@ -58,6 +58,27 @@ def _resolve_error_range(pareto, error_min, error_max):
     return lo, hi
 
 
+def _apply_quality_curve(frac: float, lo: float, hi: float,
+                         curve: str = "linear", power: float = 2.0) -> float:
+    """Map a 0-1 fraction to an error value using the configured curve.
+
+    Supported curves:
+      "linear":      uniform spacing (legacy default)
+      "power":       polynomial compression toward low error (p > 1 → finer
+                     granularity at high-quality end)
+      "exponential": geometric spacing (proportional steps)
+    """
+    if curve == "exponential":
+        ratio = hi / lo if lo > 0 else 1.0
+        return lo * (ratio ** frac)
+
+    if curve == "power":
+        return lo + (hi - lo) * (frac ** power)
+
+    # linear (default / backward-compatible)
+    return lo + frac * (hi - lo)
+
+
 def build_presets(
     pareto_path,
     num_points=8,
@@ -65,6 +86,8 @@ def build_presets(
     error_max=None,
     preset_steps=None,
     lpips_scale=6.0,
+    quality_curve="linear",
+    quality_power=2.0,
 ):
     with open(pareto_path) as f:
         pareto = json.load(f)
@@ -78,7 +101,9 @@ def build_presets(
     control_points = []
     for i in range(num_points):
         frac = i / (num_points - 1)
-        target_error = lo + frac * (hi - lo)
+        target_error = _apply_quality_curve(
+            frac, lo, hi, curve=quality_curve, power=quality_power,
+        )
 
         nearest = _find_nearest(pareto, target_error)
 
@@ -129,6 +154,11 @@ def build_presets(
         "control_points": control_points,
     }
 
+    if quality_curve != "linear":
+        presets["_quality_curve"] = quality_curve
+        if quality_curve == "power":
+            presets["_quality_power"] = quality_power
+
     if preset_steps is not None:
         presets["_steps"] = preset_steps
 
@@ -167,6 +197,15 @@ def main():
         "--lpips-scale", type=float, default=6.0,
         help="Multiplier for error→LPIPS display hint (default: 6.0)",
     )
+    parser.add_argument(
+        "--quality-curve", default="linear",
+        choices=["linear", "power", "exponential"],
+        help="Curve for mapping quality slider to error (default: linear)",
+    )
+    parser.add_argument(
+        "--quality-power", type=float, default=2.0,
+        help="Exponent for power quality curve (default: 2.0)",
+    )
     args = parser.parse_args()
 
     presets = build_presets(
@@ -176,6 +215,8 @@ def main():
         error_max=args.error_max,
         preset_steps=args.steps,
         lpips_scale=args.lpips_scale,
+        quality_curve=args.quality_curve,
+        quality_power=args.quality_power,
     )
 
     out_path = (

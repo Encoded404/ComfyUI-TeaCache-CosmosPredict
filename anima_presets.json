@@ -1,10 +1,12 @@
 {
-  "_description": "Auto-generated TeaCache presets for Anima/Cosmos-Predict2. Each control point is a full configuration from the Pareto frontier. The slider interpolates threshold between neighboring points; discrete params snap to the nearer anchor.",
+  "_description": "Auto-generated TeaCache presets for Anima/Cosmos-Predict2. Each control point is a full configuration from the Pareto frontier. The slider uses a power-law curve (p=2.0) for perceptually uniform quality-to-error mapping; discrete params snap to the nearer anchor.",
   "_error_range": [
     0.043846,
     0.099269
   ],
   "_lpips_scale": 6.0,
+  "_quality_curve": "power",
+  "_quality_power": 2.0,
   "control_points": [
     {
       "error": 0.043846,
