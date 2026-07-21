@@ -181,26 +181,20 @@ def make_calibration_forward(source_hint: str = "all"):
         # ── Per-block cosine similarity (deferred outside the block loop) ──
         if track_per_block:
             for bi in range(len(self.blocks)):
-                curr = self._calib_block_currs[bi]
-                prev = self._calib_block_prevs[bi]
-                if prev is not None and curr is not None:
-                    a = prev.flatten()
-                    b = curr.flatten()
-                    cos_sim = float((a @ b) / (a.norm() * b.norm() + 1e-8))
+                curr_out = self._calib_block_currs[bi]
+                prev_out = self._calib_block_prevs[bi]
+                if prev_out is not None and curr_out is not None:
+                    va = prev_out.flatten()
+                    vb = curr_out.flatten()
+                    cos_sim = float((va @ vb) / (va.norm() * vb.norm() + 1e-8))
                     self._calib_block_deltas.append((bi, cos_sim))
-                self._calib_block_prevs[bi] = curr.clone() if curr is not None else None
+                self._calib_block_prevs[bi] = curr_out.clone() if curr_out is not None else None
 
         residual = (x_B_T_H_W_D.to(cache_device) - ori_x).detach()
 
         # ── Record ground truth output/residual changes ──
         for i, k in enumerate(cond_or_uncond):
             state = self._calib_state[k]
-            import sys
-            print(f"  [DEBUG] step={current_step} i={i} k={k} b={b} "
-                  f"type={type(x_B_T_H_W_D).__name__} "
-                  f"shape={x_B_T_H_W_D.shape} "
-                  f"device={x_B_T_H_W_D.device} "
-                  f"len_blocks={len(self.blocks)}", file=sys.stderr, flush=True)
             curr_out = x_B_T_H_W_D[i * b : (i + 1) * b].detach()
             curr_res = residual[i * b : (i + 1) * b]
 
