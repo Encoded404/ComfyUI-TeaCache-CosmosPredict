@@ -271,6 +271,27 @@ def _signal_signature(cfg: TeacacheConfig) -> tuple:
     return sig
 
 
+def _pg_outer_signature(cfg: TeacacheConfig) -> tuple:
+    """Hashable key grouping per_group atomic configs by their shared outer dims.
+
+    Atomic configs with the same outer signature differ only in per-group
+    accumulation config and group index.  They share source, metric, mapping,
+    scale, cosim_threshold, and residual strategy — so their combinations
+    can be analytically scored without re-simulation.
+    """
+    return (
+        cfg.source,
+        cfg.metric_type,
+        tuple(sorted(cfg.metric_weights.items())),
+        cfg.signal_scale,
+        cfg.mapping_type,
+        tuple(sorted(cfg.mapping_params.items())),
+        cfg.cosim_threshold,
+        cfg.residual_strategy,
+        tuple(sorted(cfg.residual_params.items())),
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  Polynomial fit (SimData-backed)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -695,10 +716,9 @@ def _count_candidates(tcfg, entries, auto_scales, has_per_block, block_modes):
                                         res_params_list = opt.get("residual_params_scenarios", [{}])
                                     for res_params in res_params_list:
                                         for cosim_thresh in cosim_thresh_values:
-                                            for g0 in group_combos:
-                                                for g1 in group_combos:
-                                                    for g2 in group_combos:
-                                                        count += 1
+                                            for _combo in group_combos:
+                                                for _gi in range(3):
+                                                    count += 1
     max_cap = opt.get("max_candidates", 0)
     if max_cap > 0 and count > max_cap:
         count = max_cap
@@ -903,38 +923,41 @@ def generate_candidate_configs(tcfg: TuningConfig,
                                         res_params_list = opt.get("residual_params_scenarios", [{}])
                                     for res_params in res_params_list:
                                         for cosim_thresh in cosim_thresh_values:
-                                            for g0 in group_combos:
-                                                for g1 in group_combos:
-                                                    for g2 in group_combos:
-                                                        cfg = TeacacheConfig(
-                                                            source=source,
-                                                            metric_type=metric_type,
-                                                            metric_weights=metric_weights_scenario,
-                                                            signal_scale=scale,
-                                                            mapping_type=mapping_type,
-                                                            coefficients=[],
-                                                            mapping_params=mapping_params,
-                                                            accumulation_type="per_group",
-                                                            accumulation_params={},
-                                                            step_schedule="constant",
-                                                            start_percent=0.05,
-                                                            end_percent=0.95,
-                                                            residual_strategy=residual_strat,
-                                                            residual_params=res_params,
-                                                            block_mode="dynamic",
-                                                            cosim_threshold=cosim_thresh,
-                                                            block_level="per_group",
-                                                            block_params={"per_group": {"groups": [g0, g1, g2]}},
-                                                        )
-                                                        configs.append(cfg)
-                                                        generated += 1
-                                                        if generated == total or generated % _log_interval == 0 or generated == 1:
-                                                            elapsed = time_mod.time() - start_time
-                                                            eta = elapsed / generated * (total - generated) if generated > 0 else 0
-                                                            print(f"\r  [{generated:>5d}/{total}] "
-                                                                  f"{generated/total*100:5.1f}%  "
-                                                                  f"elapsed={elapsed:.0f}s  ETA={eta:.0f}s      ",
-                                                                  end="", flush=True)
+                                            for combo in group_combos:
+                                                for gi in range(3):
+                                                    cfg = TeacacheConfig(
+                                                        source=source,
+                                                        metric_type=metric_type,
+                                                        metric_weights=metric_weights_scenario,
+                                                        signal_scale=scale,
+                                                        mapping_type=mapping_type,
+                                                        coefficients=[],
+                                                        mapping_params=mapping_params,
+                                                        accumulation_type="per_group",
+                                                        accumulation_params={},
+                                                        step_schedule="constant",
+                                                        start_percent=0.05,
+                                                        end_percent=0.95,
+                                                        residual_strategy=residual_strat,
+                                                        residual_params=res_params,
+                                                        block_mode="dynamic",
+                                                        cosim_threshold=cosim_thresh,
+                                                        block_level="per_group",
+                                                        block_params={
+                                                            "per_group": {"groups": [combo]},
+                                                            "_pg_atomic": True,
+                                                            "_pg_group_index": gi,
+                                                        },
+                                                    )
+                                                    configs.append(cfg)
+                                                    generated += 1
+                                                    if generated == total or generated % _log_interval == 0 or generated == 1:
+                                                        elapsed = time_mod.time() - start_time
+                                                        eta = elapsed / generated * (total - generated) if generated > 0 else 0
+                                                        print(f"\r  [{generated:>5d}/{total}] "
+                                                              f"{generated/total*100:5.1f}%  "
+                                                              f"elapsed={elapsed:.0f}s  ETA={eta:.0f}s      ",
+                                                              end="", flush=True)
 
     # ── Cap total candidates if configured ────────────────────────────
     max_cap = opt.get("max_candidates", 0)
@@ -947,6 +970,153 @@ def generate_candidate_configs(tcfg: TuningConfig,
 
     print()
     return configs
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Per-group combination (atomic → composite)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _combine_per_group_results(
+    sim_results: Dict[tuple, OptimizationResult],
+    holdout_sd: SimData,
+    thresholds: List[float],
+    scoring_config: dict,
+    top_k_per_group: int = 20,
+) -> Tuple[Dict[tuple, List[TeacacheConfig]], Dict[tuple, OptimizationResult]]:
+    """Build composite per_group configs from atomic simulation results.
+
+    Returns (new_signal_groups, new_sim_results):
+      - new_signal_groups:  outer_sig → [composite_cfg]  (for replication step)
+      - new_sim_results:    outer_sig → composite_result
+
+    For each outer-dimension tuple, re-simulates the best per-group atomic
+    configs at every candidate threshold, then analytically evaluates the
+    Cartesian product of top-K per group to find the global best combination.
+    """
+    from .sim_runner import simulate_config as sim_cfg
+
+    atomic_by_outer: Dict[tuple, Dict[int, List[tuple]]] = {}
+    for sig, result in sim_results.items():
+        cfg = result.config
+        if not cfg.block_params.get("_pg_atomic"):
+            continue
+        outer = _pg_outer_signature(cfg)
+        gi = cfg.block_params.get("_pg_group_index", 0)
+        grp = atomic_by_outer.setdefault(outer, {})
+        grp.setdefault(gi, []).append((sig, cfg, result))
+
+    if not atomic_by_outer:
+        return {}, {}
+
+    composite_signal_groups: Dict[tuple, List[TeacacheConfig]] = {}
+    composite_sim_results: Dict[tuple, OptimizationResult] = {}
+
+    for outer_sig, groups_by_gi in atomic_by_outer.items():
+        if len(groups_by_gi) < 3:
+            continue
+
+        # ── Select top-K atomic configs per group (by their sim_result score) ──
+        top_k = min(top_k_per_group, min(len(v) for v in groups_by_gi.values()))
+        per_group_top: Dict[int, List[tuple]] = {}
+        for gi in range(3):
+            entries = sorted(groups_by_gi[gi], key=lambda e: e[2].score, reverse=True)
+            per_group_top[gi] = entries[:top_k]
+
+        # ── Re-simulate top-K entries at every candidate threshold ──
+        # per_group_data[gi][combo_idx] → [(t, skip, err), ...]  (additively normalized)
+        per_group_data: Dict[int, list] = {0: [], 1: [], 2: []}
+        per_group_cfgs: Dict[int, list] = {0: [], 1: [], 2: []}
+        for gi in range(3):
+            for _sig, cfg, _result in per_group_top[gi]:
+                per_t = []
+                for t in thresholds:
+                    skip, err, _, _ = sim_cfg(holdout_sd, cfg, t)
+                    per_t.append((t, skip, err))
+                per_group_data[gi].append(per_t)
+                per_group_cfgs[gi].append(cfg)
+
+        n_thresholds = len(thresholds)
+        n_combos = len(per_group_data[0])
+
+        # ── Evaluate all K³ × T combinations analytically ──
+        best_score = -1.0
+        best_composite_cfg = None
+        best_skip = 0.0
+        best_err = 0.0
+        best_sp = 1.0
+        best_thresh = thresholds[0]
+
+        for ti in range(n_thresholds):
+            for c0 in range(n_combos):
+                s0, e0 = per_group_data[0][c0][ti][1], per_group_data[0][c0][ti][2]
+                for c1 in range(n_combos):
+                    s1, e1 = per_group_data[1][c1][ti][1], per_group_data[1][c1][ti][2]
+                    for c2 in range(n_combos):
+                        s2, e2 = per_group_data[2][c2][ti][1], per_group_data[2][c2][ti][2]
+                        skip = s0 + s1 + s2
+                        err = e0 + e1 + e2
+                        bf = 0.85
+                        sp = (1.0 / (1.0 - min(skip, 1.0) * bf)
+                              if bf > 0 and min(skip, 1.0) * bf < 1.0 else 1.0)
+                        quality = compute_quality_score(err, scoring_config)
+                        score = sp * quality
+
+                        if score > best_score:
+                            best_score = score
+                            best_skip = min(skip, 1.0)
+                            best_err = err
+                            best_sp = sp
+                            best_thresh = thresholds[ti]
+
+                            # Build composite config from the source config's shared fields
+                            src_cfg = per_group_cfgs[0][c0]
+                            g0_combo = per_group_cfgs[0][c0].block_params["per_group"]["groups"][0]
+                            g1_combo = per_group_cfgs[1][c1].block_params["per_group"]["groups"][0]
+                            g2_combo = per_group_cfgs[2][c2].block_params["per_group"]["groups"][0]
+
+                            best_composite_cfg = TeacacheConfig(
+                                source=src_cfg.source,
+                                metric_type=src_cfg.metric_type,
+                                metric_weights=dict(src_cfg.metric_weights),
+                                signal_scale=src_cfg.signal_scale,
+                                mapping_type=src_cfg.mapping_type,
+                                coefficients=list(src_cfg.coefficients),
+                                mapping_params=dict(src_cfg.mapping_params),
+                                accumulation_type="per_group",
+                                accumulation_params={},
+                                step_schedule="constant",
+                                rel_l1_thresh=best_thresh,
+                                start_percent=0.05,
+                                end_percent=0.95,
+                                residual_strategy=src_cfg.residual_strategy,
+                                residual_params=dict(src_cfg.residual_params),
+                                block_mode="dynamic",
+                                cosim_threshold=src_cfg.cosim_threshold,
+                                block_level="per_group",
+                                block_params={
+                                    "per_group": {"groups": [g0_combo, g1_combo, g2_combo]},
+                                },
+                            )
+
+        if best_composite_cfg is None:
+            continue
+
+        best_result = OptimizationResult(
+            config=best_composite_cfg,
+            skip_rate=best_skip,
+            estimated_speedup=best_sp,
+            accumulated_error=best_err,
+            score=best_score,
+        )
+        composite_signal_groups[outer_sig] = [best_composite_cfg]
+        composite_sim_results[outer_sig] = best_result
+
+        n_atomic = sum(len(v) for v in groups_by_gi.values())
+        print(f"  [per_group combine] {n_atomic} atomic → 1 composite  "
+              f"sp={best_sp:.2f}x  err={best_err:.4f}  score={best_score:.3f}  "
+              f"thresh={best_thresh:.4f}")
+
+    return composite_signal_groups, composite_sim_results
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1121,6 +1291,30 @@ def optimize(configs: List[TeacacheConfig],
                       f"last: src={cfg.source} {cfg.metric_type} {cfg.mapping_type} "
                       f"skip={best_skip:.1%} sp={best_sp:.2f}x score={score:.3f}      ",
                       end="", flush=True)
+
+    # ── 5.5. Combine per_group atomic results → composite configs ────
+    has_atomic = any(
+        r.config.block_params.get("_pg_atomic")
+        for r in sim_results.values()
+    )
+    if has_atomic:
+        comp_groups, comp_results = _combine_per_group_results(
+            sim_results, holdout_sd, thresholds, scoring_config,
+        )
+        # Replace atomic entries with composite entries
+        filtered_groups: Dict[tuple, List[TeacacheConfig]] = {}
+        for sig, cfgs in signal_groups.items():
+            if cfgs and cfgs[0].block_params.get("_pg_atomic"):
+                continue  # drop atomic entries
+            filtered_groups[sig] = cfgs
+        for outer_sig, cfgs in comp_groups.items():
+            filtered_groups[outer_sig] = cfgs
+        for outer_sig, result in comp_results.items():
+            sim_results[outer_sig] = result
+        signal_groups = filtered_groups
+        composite_count = len(comp_groups)
+        print(f"  [per_group] Combined {composite_count} composite configs "
+              f"from atomic results")
 
     # ── 6. Replicate results to full config space ──────────────────────
     print("  Replicating to full config space...", flush=True)

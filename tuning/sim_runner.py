@@ -308,13 +308,18 @@ def _simulate_config_per_group(
     Each group uses its own accumulation type, params, and schedule from
     block_params.per_group.groups.  Skip rate and error are both weighted
     by group block counts so larger groups contribute proportionally.
+
+    Atomic mode (_pg_atomic=True): simulates only one group position and
+    returns additively-normalized partial (skip_rate, avg_error) so that
+    summing the 3 group contributions recovers the composite result.
     """
     pg = cfg.block_params.get("per_group", {})
     group_configs = pg.get("groups", [])
-    if len(group_configs) < 2:
+    is_atomic = cfg.block_params.get("_pg_atomic", False)
+    if not is_atomic and len(group_configs) < 2:
         return _simulate_config_unified(sim_data, cfg, threshold)
 
-    n_groups = len(group_configs)
+    n_groups = 3 if is_atomic else len(group_configs)
 
     # Estimate n_blocks from first group with per-block data
     n_blocks = None
@@ -328,8 +333,16 @@ def _simulate_config_per_group(
             "(run calibration with record_block_data=true)"
         )
 
-    group_sizes = [n_blocks // n_groups] * n_groups
-    group_sizes[-1] += n_blocks % n_groups
+    # 3-group architecture block boundaries
+    bp_g0 = max(n_blocks // 3, 1)
+    bp_g1 = max(2 * n_blocks // 3, bp_g0 + 1)
+    bp_g2 = n_blocks
+    group_sizes = [bp_g0, bp_g1 - bp_g0, bp_g2 - bp_g1]
+    group_indices = [0, 1, 2]  # all groups participate in atomic/composite
+
+    if is_atomic:
+        gi_target = cfg.block_params.get("_pg_group_index", 0)
+        group_indices = [gi_target]
 
     total_weighted_skip = 0
     total_weighted_error = 0.0
@@ -352,8 +365,11 @@ def _simulate_config_per_group(
         group_skip_counts = []
         group_errors = []
 
-        for gi in range(n_groups):
-            gc = group_configs[gi]
+        for gi in group_indices:
+            if is_atomic:
+                gc = group_configs[0]  # atomic: single combo in groups[0]
+            else:
+                gc = group_configs[gi]
             sched = gc.get("step_schedule", cfg.step_schedule)
             s_mult = group.step_mult.get(sched, group.step_mult["constant"])
             g_thresholds = threshold * s_mult * cfg.signal_scale
@@ -366,9 +382,9 @@ def _simulate_config_per_group(
             group_skip_counts.append(skip)
             group_errors.append(err)
 
-        for gi in range(n_groups):
-            total_weighted_skip += group_skip_counts[gi] * group_sizes[gi]
-            total_weighted_error += group_errors[gi] * group_sizes[gi]
+        for idx, gi in enumerate(group_indices):
+            total_weighted_skip += group_skip_counts[idx] * group_sizes[gi]
+            total_weighted_error += group_errors[idx] * group_sizes[gi]
         total_steps += group.n_steps
 
     if total_steps == 0:
@@ -376,6 +392,13 @@ def _simulate_config_per_group(
 
     skip_rate = total_weighted_skip / (n_blocks * total_steps)
     avg_error = total_weighted_error / (n_blocks * total_steps)
+
+    if is_atomic:
+        # Return partial contributions — caller sums across groups.
+        # Speedup and quality are placeholders (wrong for partial data).
+        # The combination step recomputes them from summed partials.
+        return min(skip_rate, 1.0), avg_error, 1.0, 1.0
+
     bf = 0.85
     speedup = (1.0 / (1.0 - skip_rate * bf)
                if bf > 0 and skip_rate * bf < 1.0 else 1.0)
