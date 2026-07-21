@@ -1,148 +1,300 @@
 {
-    "_description": "Auto-generated TeaCache presets for Anima/Cosmos-Predict2. Each control point is a full configuration from the Pareto frontier. The slider interpolates threshold between neighboring points; discrete params snap to the nearer anchor.",
-    "_steps": 30,
-    "_error_range": [0.0005, 0.0367],
-    "_lpips_scale": 6.0,
-    "control_points": [
-        {
-            "error": 0.0005,
-            "config": {
-                "source": "pooled_latent",
-                "metric_type": "mean_only",
-                "metric_weights": {"mean": 1.0},
-                "signal_scale": 1.0,
-                "mapping_type": "identity",
-                "coefficients": [],
-                "mapping_params": {},
-                "accumulation_type": "carry_over",
-                "accumulation_params": {},
-                "rel_l1_thresh": 0.03,
-                "step_schedule": "bell",
-                "start_percent": 0.05,
-                "end_percent": 0.95,
-                "block_mode": "all_or_nothing",
-                "block_params": {},
-                "residual_strategy": "hard",
-                "residual_params": {},
-                "cross_feed_enabled": false,
-                "cross_feed_strength": 0.5,
-                "cosim_threshold": 0.95,
-                "block_level": "unified",
-                "block_level_config_scope": ["*"]
-            },
-            "speedup": 1.01
+  "_description": "Auto-generated TeaCache presets for Anima/Cosmos-Predict2. Each control point is a full configuration from the Pareto frontier. The slider interpolates threshold between neighboring points; discrete params snap to the nearer anchor.",
+  "_error_range": [
+    0.043846,
+    0.099269
+  ],
+  "_lpips_scale": 6.0,
+  "control_points": [
+    {
+      "error": 0.043846,
+      "config": {
+        "source": "t_emb",
+        "metric_type": "mean_and_max",
+        "metric_weights": {
+          "mean": 0.7,
+          "max": 0.3
         },
-        {
-            "error": 0.0025,
-            "config": {
-                "source": "pooled_latent",
-                "metric_type": "mean_only",
-                "metric_weights": {"mean": 1.0},
-                "signal_scale": 1.0,
-                "mapping_type": "identity",
-                "coefficients": [],
-                "mapping_params": {},
-                "accumulation_type": "carry_over",
-                "accumulation_params": {},
-                "rel_l1_thresh": 0.20,
-                "step_schedule": "bell",
-                "start_percent": 0.05,
-                "end_percent": 0.95,
-                "block_mode": "all_or_nothing",
-                "block_params": {},
-                "residual_strategy": "hard",
-                "residual_params": {},
-                "cross_feed_enabled": false,
-                "cross_feed_strength": 0.5,
-                "cosim_threshold": 0.95,
-                "block_level": "unified",
-                "block_level_config_scope": ["*"]
-            },
-            "speedup": 1.08
+        "signal_scale": 442.0,
+        "mapping_type": "polynomial",
+        "coefficients": [],
+        "mapping_params": {
+          "poly_degree": 3
         },
-        {
-            "error": 0.0117,
-            "config": {
-                "source": "pooled_latent",
-                "metric_type": "mean_only",
-                "metric_weights": {"mean": 1.0},
-                "signal_scale": 1.0,
-                "mapping_type": "identity",
-                "coefficients": [],
-                "mapping_params": {},
-                "accumulation_type": "carry_over",
-                "accumulation_params": {},
-                "rel_l1_thresh": 0.51,
-                "step_schedule": "bell",
-                "start_percent": 0.05,
-                "end_percent": 0.95,
-                "block_mode": "all_or_nothing",
-                "block_params": {},
-                "residual_strategy": "hard",
-                "residual_params": {},
-                "cross_feed_enabled": false,
-                "cross_feed_strength": 0.5,
-                "cosim_threshold": 0.95,
-                "block_level": "unified",
-                "block_level_config_scope": ["*"]
-            },
-            "speedup": 1.34
+        "accumulation_type": "leaky",
+        "accumulation_params": {
+          "leak_factor": 0.5
         },
-        {
-            "error": 0.02,
-            "config": {
-                "source": "pooled_latent",
-                "metric_type": "mean_only",
-                "metric_weights": {"mean": 1.0},
-                "signal_scale": 1.0,
-                "mapping_type": "identity",
-                "coefficients": [],
-                "mapping_params": {},
-                "accumulation_type": "carry_over",
-                "accumulation_params": {},
-                "rel_l1_thresh": 0.70,
-                "step_schedule": "bell",
-                "start_percent": 0.05,
-                "end_percent": 0.95,
-                "block_mode": "all_or_nothing",
-                "block_params": {},
-                "residual_strategy": "hard",
-                "residual_params": {},
-                "cross_feed_enabled": false,
-                "cross_feed_strength": 0.5,
-                "cosim_threshold": 0.95,
-                "block_level": "unified",
-                "block_level_config_scope": ["*"]
-            },
-            "speedup": 1.50
+        "rel_l1_thresh": 0.014762814719093903,
+        "step_schedule": "bell",
+        "start_percent": 0.05,
+        "end_percent": 0.95,
+        "block_mode": "all_or_nothing",
+        "block_params": {},
+        "residual_strategy": "hard",
+        "residual_params": {},
+        "cross_feed_enabled": false,
+        "cross_feed_strength": 0.5,
+        "cosim_threshold": 0.95,
+        "block_level": "unified",
+        "block_level_config_scope": [
+          "*"
+        ]
+      },
+      "speedup": 1.818
+    },
+    {
+      "error": 0.048858,
+      "config": {
+        "source": "pooled_latent",
+        "metric_type": "mean_max_std",
+        "metric_weights": {
+          "mean": 0.5,
+          "max": 0.3,
+          "std": 0.2
         },
-        {
-            "error": 0.0367,
-            "config": {
-                "source": "pooled_latent",
-                "metric_type": "mean_only",
-                "metric_weights": {"mean": 1.0},
-                "signal_scale": 1.0,
-                "mapping_type": "identity",
-                "coefficients": [],
-                "mapping_params": {},
-                "accumulation_type": "carry_over",
-                "accumulation_params": {},
-                "rel_l1_thresh": 1.00,
-                "step_schedule": "bell",
-                "start_percent": 0.05,
-                "end_percent": 0.95,
-                "block_mode": "all_or_nothing",
-                "block_params": {},
-                "residual_strategy": "hard",
-                "residual_params": {},
-                "cross_feed_enabled": false,
-                "cross_feed_strength": 0.5,
-                "cosim_threshold": 0.95,
-                "block_level": "unified",
-                "block_level_config_scope": ["*"]
-            },
-            "speedup": 1.96
-        }
-    ]
+        "signal_scale": 10,
+        "mapping_type": "power_law",
+        "coefficients": [],
+        "mapping_params": {
+          "pooled_latent_mode": "mean"
+        },
+        "accumulation_type": "leaky",
+        "accumulation_params": {
+          "leak_factor": 0.72272727
+        },
+        "rel_l1_thresh": 1.3650078065460138,
+        "step_schedule": "bell",
+        "start_percent": 0.05,
+        "end_percent": 0.95,
+        "block_mode": "all_or_nothing",
+        "block_params": {},
+        "residual_strategy": "hard",
+        "residual_params": {},
+        "cross_feed_enabled": false,
+        "cross_feed_strength": 0.5,
+        "cosim_threshold": 0.95,
+        "block_level": "unified",
+        "block_level_config_scope": [
+          "*"
+        ]
+      },
+      "speedup": 2.231
+    },
+    {
+      "error": 0.059567,
+      "config": {
+        "source": "t_emb",
+        "metric_type": "mean_only",
+        "metric_weights": {
+          "mean": 1.0
+        },
+        "signal_scale": 442.0,
+        "mapping_type": "polynomial",
+        "coefficients": [],
+        "mapping_params": {
+          "poly_degree": 3
+        },
+        "accumulation_type": "windowed",
+        "accumulation_params": {
+          "window_size": 4.36363636
+        },
+        "rel_l1_thresh": 0.001191450698119776,
+        "step_schedule": "bell",
+        "start_percent": 0.05,
+        "end_percent": 0.95,
+        "block_mode": "all_or_nothing",
+        "block_params": {},
+        "residual_strategy": "hard",
+        "residual_params": {},
+        "cross_feed_enabled": false,
+        "cross_feed_strength": 0.5,
+        "cosim_threshold": 0.95,
+        "block_level": "unified",
+        "block_level_config_scope": [
+          "*"
+        ]
+      },
+      "speedup": 1.818
+    },
+    {
+      "error": 0.068065,
+      "config": {
+        "source": "t_emb",
+        "metric_type": "mean_only",
+        "metric_weights": {
+          "mean": 1.0
+        },
+        "signal_scale": 442.0,
+        "mapping_type": "polynomial",
+        "coefficients": [],
+        "mapping_params": {
+          "poly_degree": 3
+        },
+        "accumulation_type": "windowed",
+        "accumulation_params": {
+          "window_size": 2.0
+        },
+        "rel_l1_thresh": 0.001,
+        "step_schedule": "constant",
+        "start_percent": 0.05,
+        "end_percent": 0.95,
+        "block_mode": "all_or_nothing",
+        "block_params": {},
+        "residual_strategy": "hard",
+        "residual_params": {},
+        "cross_feed_enabled": false,
+        "cross_feed_strength": 0.5,
+        "cosim_threshold": 0.95,
+        "block_level": "unified",
+        "block_level_config_scope": [
+          "*"
+        ]
+      },
+      "speedup": 1.978
+    },
+    {
+      "error": 0.075935,
+      "config": {
+        "source": "t_emb",
+        "metric_type": "mean_only",
+        "metric_weights": {
+          "mean": 1.0
+        },
+        "signal_scale": 200,
+        "mapping_type": "polynomial",
+        "coefficients": [],
+        "mapping_params": {
+          "poly_degree": 3
+        },
+        "accumulation_type": "windowed",
+        "accumulation_params": {
+          "window_size": 7.90909091
+        },
+        "rel_l1_thresh": 0.001,
+        "step_schedule": "bell",
+        "start_percent": 0.05,
+        "end_percent": 0.95,
+        "block_mode": "all_or_nothing",
+        "block_params": {},
+        "residual_strategy": "hard",
+        "residual_params": {},
+        "cross_feed_enabled": false,
+        "cross_feed_strength": 0.5,
+        "cosim_threshold": 0.95,
+        "block_level": "unified",
+        "block_level_config_scope": [
+          "*"
+        ]
+      },
+      "speedup": 2.338
+    },
+    {
+      "error": 0.08196,
+      "config": {
+        "source": "t_emb",
+        "metric_type": "mean_only",
+        "metric_weights": {
+          "mean": 1.0
+        },
+        "signal_scale": 100,
+        "mapping_type": "polynomial",
+        "coefficients": [],
+        "mapping_params": {
+          "poly_degree": 3
+        },
+        "accumulation_type": "windowed",
+        "accumulation_params": {
+          "window_size": 6.72727273
+        },
+        "rel_l1_thresh": 0.001076544612842316,
+        "step_schedule": "cosine",
+        "start_percent": 0.05,
+        "end_percent": 0.95,
+        "block_mode": "all_or_nothing",
+        "block_params": {},
+        "residual_strategy": "hard",
+        "residual_params": {},
+        "cross_feed_enabled": false,
+        "cross_feed_strength": 0.5,
+        "cosim_threshold": 0.95,
+        "block_level": "unified",
+        "block_level_config_scope": [
+          "*"
+        ]
+      },
+      "speedup": 2.609
+    },
+    {
+      "error": 0.094447,
+      "config": {
+        "source": "pooled_latent",
+        "metric_type": "mean_only",
+        "metric_weights": {
+          "mean": 1.0
+        },
+        "signal_scale": 50,
+        "mapping_type": "power_law",
+        "coefficients": [],
+        "mapping_params": {
+          "pooled_latent_mode": "mean"
+        },
+        "accumulation_type": "windowed",
+        "accumulation_params": {
+          "window_size": 11.45454545
+        },
+        "rel_l1_thresh": 0.08277856966198477,
+        "step_schedule": "bell",
+        "start_percent": 0.05,
+        "end_percent": 0.95,
+        "block_mode": "all_or_nothing",
+        "block_params": {},
+        "residual_strategy": "hard",
+        "residual_params": {},
+        "cross_feed_enabled": false,
+        "cross_feed_strength": 0.5,
+        "cosim_threshold": 0.95,
+        "block_level": "unified",
+        "block_level_config_scope": [
+          "*"
+        ]
+      },
+      "speedup": 4.015
+    },
+    {
+      "error": 0.099269,
+      "config": {
+        "source": "t_emb",
+        "metric_type": "mean_only",
+        "metric_weights": {
+          "mean": 1.0
+        },
+        "signal_scale": 50,
+        "mapping_type": "softplus",
+        "coefficients": [],
+        "mapping_params": {},
+        "accumulation_type": "windowed",
+        "accumulation_params": {
+          "window_size": 15.0
+        },
+        "rel_l1_thresh": 0.6008675891719687,
+        "step_schedule": "cosine",
+        "start_percent": 0.05,
+        "end_percent": 0.95,
+        "block_mode": "all_or_nothing",
+        "block_params": {},
+        "residual_strategy": "hard",
+        "residual_params": {},
+        "cross_feed_enabled": false,
+        "cross_feed_strength": 0.5,
+        "cosim_threshold": 0.95,
+        "block_level": "unified",
+        "block_level_config_scope": [
+          "*"
+        ]
+      },
+      "speedup": 5.625
+    }
+  ],
+  "_steps": 30
 }
