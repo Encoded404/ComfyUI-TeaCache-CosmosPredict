@@ -34,7 +34,6 @@ import math
 import random
 import sys
 import time as time_mod
-from itertools import product
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -592,14 +591,6 @@ def _generate_per_group_configs(opt: dict, scope: list) -> list:
     return combos
 
 
-def _sample_or_exhaustive(items: list, max_count: int = 0) -> list:
-    """Return items, possibly randomly sampled down to max_count."""
-    if max_count <= 0 or len(items) <= max_count:
-        return items
-    rng = random.Random(42)
-    return rng.sample(items, max_count)
-
-
 def generate_candidate_configs(tcfg: TuningConfig,
                                 entries: Optional[List[CalibrationEntry]] = None,
                                 ) -> List[TeacacheConfig]:
@@ -710,39 +701,30 @@ def generate_candidate_configs(tcfg: TuningConfig,
                                                             block_level_iter = opt.get("block_levels", ["unified"])
 
                                                         for block_level in block_level_iter:
-                                                            # Per-group configuration generation
+                                                            # Per-group: deterministic product of group combos
                                                             if block_mode == "dynamic" and block_level == "per_group":
                                                                 scope = opt.get("block_level_config_scope", ["*"])
                                                                 group_combos = _generate_per_group_configs(opt, scope)
-                                                                max_combos = opt.get("per_group_max_combos", 10000)
-                                                                n_gc = len(group_combos)
-                                                                total_space = n_gc ** 3
-                                                                if max_combos > 0 and total_space > max_combos:
-                                                                    indices = random.sample(range(total_space), min(max_combos, total_space))
-                                                                else:
-                                                                    indices = range(min(total_space, max_combos if max_combos > 0 else total_space))
-                                                                for idx in indices:
-                                                                    i0 = idx % n_gc
-                                                                    i1 = (idx // n_gc) % n_gc
-                                                                    i2 = idx // (n_gc * n_gc)
-                                                                    g0, g1, g2 = group_combos[i0], group_combos[i1], group_combos[i2]
-                                                                    cfg = TeacacheConfig(
-                                                                        source=source, metric_type=metric_type,
-                                                                        metric_weights=metric_weights_scenario,
-                                                                        signal_scale=scale, mapping_type=mapping_type,
-                                                                        coefficients=[], mapping_params=mapping_params,
-                                                                        accumulation_type=accum_type,
-                                                                        accumulation_params=accum_params_dict,
-                                                                        step_schedule=schedule,
-                                                                        start_percent=0.05, end_percent=0.95,
-                                                                        residual_strategy=residual_strat,
-                                                                        residual_params=res_params,
-                                                                        block_mode=block_mode,
-                                                                        cosim_threshold=cosim_thresh,
-                                                                        block_level=block_level,
-                                                                        block_params={"per_group": {"groups": [g0, g1, g2]}},
-                                                                    )
-                                                                    configs.append(cfg)
+                                                                for g0 in group_combos:
+                                                                    for g1 in group_combos:
+                                                                        for g2 in group_combos:
+                                                                            cfg = TeacacheConfig(
+                                                                                source=source, metric_type=metric_type,
+                                                                                metric_weights=metric_weights_scenario,
+                                                                                signal_scale=scale, mapping_type=mapping_type,
+                                                                                coefficients=[], mapping_params=mapping_params,
+                                                                                accumulation_type=accum_type,
+                                                                                accumulation_params=accum_params_dict,
+                                                                                step_schedule=schedule,
+                                                                                start_percent=0.05, end_percent=0.95,
+                                                                                residual_strategy=residual_strat,
+                                                                                residual_params=res_params,
+                                                                                block_mode=block_mode,
+                                                                                cosim_threshold=0.95,  # unused by per_group sim
+                                                                                block_level=block_level,
+                                                                                block_params={"per_group": {"groups": [g0, g1, g2]}},
+                                                                            )
+                                                                            configs.append(cfg)
                                                             else:
                                                                 # Non-per-group modes: sweep block_params scenarios
                                                                 block_params_list = [{}]

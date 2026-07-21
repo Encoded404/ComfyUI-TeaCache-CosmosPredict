@@ -159,6 +159,16 @@ def simulate_config(
 
     Returns (skip_rate, avg_error, estimated_speedup, quality_proxy).
     """
+    if cfg.block_mode == "dynamic" and cfg.block_level == "per_group":
+        return _simulate_config_per_group(sim_data, cfg, threshold)
+    return _simulate_config_unified(sim_data, cfg, threshold)
+
+
+def _simulate_config_unified(
+    sim_data: SimData,
+    cfg: TeacacheConfig,
+    threshold: float,
+) -> Tuple[float, float, float, float]:
     total_skip = 0
     total_error = 0.0
     total_steps = 0
@@ -253,3 +263,84 @@ def _compute_dynamic_block_fraction(
     if skip_count == 0:
         return 0.0
     return (total_cached_blocks / skip_count) * default
+
+
+def _simulate_config_per_group(
+    sim_data: SimData,
+    cfg: TeacacheConfig,
+    threshold: float,
+) -> Tuple[float, float, float, float]:
+    """Simulate per_group config: 3 independent accumulators.
+
+    Each group uses its own accumulation type, params, and schedule from
+    block_params.per_group.groups.  Skip rate is weighted by group block
+    counts; error is averaged across groups.
+    """
+    pg = cfg.block_params.get("per_group", {})
+    group_configs = pg.get("groups", [])
+    if len(group_configs) < 2:
+        return _simulate_config_unified(sim_data, cfg, threshold)
+
+    n_groups = len(group_configs)
+
+    # Estimate n_blocks from first group with per-block data
+    n_blocks = 28
+    for g in sim_data.groups:
+        if g.block_cos_sim is not None:
+            n_blocks = g.block_cos_sim.shape[0]
+            break
+
+    group_sizes = [n_blocks // n_groups] * n_groups
+    group_sizes[-1] += n_blocks % n_groups
+
+    total_weighted_skip = 0
+    total_error = 0.0
+    total_steps = 0
+
+    for group in sim_data.groups:
+        stats = _get_source_stats(group, cfg.source)
+        if stats is None:
+            continue
+
+        dist = _compute_distance(stats, cfg)
+        if cfg.signal_scale != 1.0:
+            dist *= cfg.signal_scale
+        predicted = _apply_mapping(dist, cfg)
+
+        step_mult = group.step_mult.get(cfg.step_schedule, group.step_mult["constant"])
+        thresholds = threshold * step_mult * cfg.signal_scale
+        penalties = np.where(group.out_rel > 0, group.out_rel, group.res_rel)
+
+        group_skip_counts = []
+        group_errors = []
+
+        for gi in range(n_groups):
+            gc = group_configs[gi]
+            sched = gc.get("step_schedule", cfg.step_schedule)
+            s_mult = group.step_mult.get(sched, group.step_mult["constant"])
+            g_thresholds = threshold * s_mult * cfg.signal_scale
+
+            skip, err, _mask = simulate_group(
+                predicted, g_thresholds, penalties,
+                gc["accumulation_type"],
+                gc.get("accumulation_params", {}),
+            )
+            group_skip_counts.append(skip)
+            group_errors.append(err)
+
+        for gi in range(n_groups):
+            total_weighted_skip += group_skip_counts[gi] * group_sizes[gi]
+            total_error += group_errors[gi]
+        total_steps += group.n_steps
+
+    if total_steps == 0:
+        return 0.0, 0.0, 1.0, 1.0
+
+    skip_rate = total_weighted_skip / (n_blocks * total_steps)
+    avg_error = total_error / (n_groups * total_steps)
+    bf = 0.85
+    speedup = (1.0 / (1.0 - skip_rate * bf)
+               if bf > 0 and skip_rate * bf < 1.0 else 1.0)
+    quality_proxy = 1.0 / (1.0 + avg_error)
+
+    return min(skip_rate, 1.0), avg_error, speedup, quality_proxy
