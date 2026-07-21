@@ -18,6 +18,7 @@ python -m tuning.smoke_test --comfy-dir .
 2. **Calibration** (`calibrate.py`) — records per-step delta stats (all 3 sources simultaneously) plus ground-truth output changes. Optionally records per-block cosine similarity for dead-block detection. Shows run schedule with time/disk estimates before starting. 30 min–4 hours.
 3. **Optimization** (`optimize.py`) — offline config search. Pre-computes mapping fits (polynomial, power_law, softplus), sweeps candidate thresholds, builds Pareto frontier, fine-tunes winner thresholds. Supports Numba acceleration, cross-validation, signal-space deduplication, and data-driven block param injection. Multi-core CPU, 3–30 min.
 4. **Validation** (`validate.py`) — end-to-end quality metrics (PSNR, SSIM, LPIPS, DISTS, MS-SSIM, FSIM, VIF, GMSD, NLPD, PieAPP, VSI) across multiple resolutions (512², 1024², 1024×512) and step counts (20, 30, 40). Configs are selected by uniform error sampling (not just the knee) so the full speedup-vs-quality curve is validated. Baselines are cached per resolution/steps/prompt/seed — ~45% fewer total generations. Results grouped by resolution and step count, with a recommended config per group.
+5. **Build presets** (`build_presets.py`) — generates the shipped `anima_presets.json` from the Pareto frontier. Samples evenly-spaced accumulated error levels, each with a full `TeacacheConfig` (source, metric, accumulation, schedule, etc. can differ between control points). The TeaCacheAnima quality slider interpolates threshold between bracketing points and snaps discrete params to the nearest anchor at runtime. Run once after optimization, ship the output with the plugin.
 
 ```bash
 # Phase 1 — calibration (run on GPU)
@@ -34,6 +35,16 @@ python -m tuning.validate --comfy-dir . \
 # Quick validation (3 min)
 python -m tuning.validate --comfy-dir . \
     --pareto outputs/optimization/pareto_frontier.json --quick
+
+# Phase 4 — build presets (run on CPU after Phase 2 or Phase 3)
+python -m tuning.build_presets \
+    --pareto outputs/optimization/pareto_frontier.json \
+    --error-min 0.01 --error-max 0.10 --steps 30
+
+# Restrict the error range to conservative→balanced
+python -m tuning.build_presets \
+    --pareto outputs/optimization/pareto_frontier.json \
+    --error-min 0.001 --error-max 0.04 --points 10
 ```
 
 ## Architecture
@@ -44,12 +55,117 @@ calibrate.py  ──→  calibration_data.jsonl  ──→  optimize.py  ──�
             │    sim_data.py · sim_engine.py · sim_runner.py          │
             │              ↑                                          │
 validate.py  ←────────────────────────────────────────────────────────┘
-    │
-    └── validation_results.json   (grouped by resolution × steps)
-        └── speedup, PSNR, SSIM, LPIPS, DISTS, MS-SSIM, FSIM, VIF, ...
+    │                                    │
+    └── validation_results.json          └── build_presets.py
+                                            │
+                                            └── anima_presets.json
+                                                    │
+                                            TeaCacheAnima node
+                                           (auto-loaded at startup)
 ```
 
-The smoke test runs all three phases on a tiny dataset to verify everything works.
+The smoke test runs all four phases on a tiny dataset to verify everything works.
+
+---
+
+## Phase 4: Build Presets
+
+`build_presets.py` converts the Pareto frontier into a file the TeaCacheAnima node can read at ComfyUI startup.
+
+### What it does
+
+1. Loads `pareto_frontier.json` from Phase 2 (or Phase 3 if available).
+2. Samples `N` evenly-spaced accumulated error levels across the frontier.
+3. For each level, picks the nearest Pareto-optimal config and stores its full `TeacacheConfig` (source, metric, accumulation, schedule, block mode, etc.).
+4. Writes `anima_presets.json` — the file the TeaCacheAnima quality slider reads.
+
+### How the slider maps to error
+
+The slider (quality 0–100) maps linearly to the accumulated error range defined by `--error-min` and `--error-max`:
+
+```
+quality=0   → error=error_min  → near-lossless (LPIPS display: ~error×lpips_scale)
+quality=50  → error=midpoint   → balanced (~1.3× speedup)
+quality=100 → error=error_max  → max speed (~2× speedup)
+```
+
+Between control points, **threshold** is linearly interpolated. **Discrete params** (source, accumulation type, step schedule, etc.) snap to the nearest control point halfway through each bracket. This means the config can switch from `pooled_latent` + `carry_over` at low error to `t_emb` + `leaky` at high error — whatever the Pareto frontier found optimal at each speedup level.
+
+### Usage
+
+```bash
+python -m tuning.build_presets \
+    --pareto outputs/optimization/pareto_frontier.json \
+    --error-min 0.01 --error-max 0.10 \
+    --steps 30 --points 8
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--pareto` | *(required)* | Path to `pareto_frontier.json` (Phase 2 output) |
+| `--error-min` | from data | Minimum accumulated error (quality=0). Leftmost slider position. |
+| `--error-max` | from data | Maximum accumulated error (quality=100). Rightmost slider position. |
+| `--steps` | *(none)* | Step count the presets were calibrated for (stored as `_steps` metadata). Threshold auto-scales by `preset_steps / user_steps` at runtime. |
+| `--points` | 8 | Number of control points to sample. More = smoother threshold curve. |
+| `--lpips-scale` | 6.0 | Multiplier for `error → LPIPS` display hint in the node. Adjust based on validation results. |
+| `--output` | `<project>/anima_presets.json` | Where to write the preset file. |
+
+### Where the output goes
+
+The default output path is `anima_presets.json` in the project root — the same directory as `nodes_anima.py`. This is where the node expects to find it at startup:
+
+```
+ComfyUI-TeaCache-CosmosPredict/
+├── anima_presets.json   ← build_presets.py writes here by default
+├── nodes_anima.py        ← TeaCacheAnima node reads it from here
+├── tuning/
+│   ├── build_presets.py  ← generates it
+│   └── ...
+```
+
+After running `build_presets.py`, copy or symlink the output to the project root if you used `--output` elsewhere. The node auto-detects whether the file uses the new error-anchored format (`control_points` at top level) or the old hand-crafted format (`quality_zones`) and handles both.
+
+### Preset file format (auto-generated)
+
+```json
+{
+    "_description": "Auto-generated TeaCache presets...",
+    "_steps": 30,
+    "_error_range": [0.01, 0.10],
+    "_lpips_scale": 6.0,
+    "control_points": [
+        {
+            "error": 0.01,
+            "config": {
+                "source": "pooled_latent",
+                "metric_type": "mean_only",
+                "signal_scale": 1.0,
+                "mapping_type": "identity",
+                "accumulation_type": "carry_over",
+                "rel_l1_thresh": 0.035,
+                "step_schedule": "bell",
+                "block_mode": "all_or_nothing",
+                "residual_strategy": "hard"
+            },
+            "speedup": 1.02
+        },
+        {
+            "error": 0.04,
+            "config": {
+                "source": "t_emb",
+                "accumulation_type": "leaky",
+                "rel_l1_thresh": 8.5,
+                "step_schedule": "linear_ramp"
+            },
+            "speedup": 1.52
+        }
+    ]
+}
+```
+
+Control points can have entirely different architectures — the Pareto frontier naturally surfaces the best config for each error regime. The slider interpolates threshold smoothly; the architecture switches at bracket midpoints.
+
+---
 
 ## Configuration Reference
 
