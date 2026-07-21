@@ -170,9 +170,10 @@ def _quality_to_config_legacy(quality: float) -> Tuple[TeacacheConfig, float, fl
 def _apply_teacache(model, cfg: TeacacheConfig):
     """Apply a TeaCache config as the model's _forward.
 
-    Patches MiniTrainDIT._forward directly (no unittest.mock needed).
-    Same pattern used by the tuning pipeline (calibrate.py, validate.py).
+    Patches MiniTrainDIT._forward within a context manager, so the
+    original forward is restored when TeaCache is not active.
     """
+    from unittest.mock import patch
     from .tuning.forward import teacache_anima_forward
 
     new_model = model.clone()
@@ -182,9 +183,11 @@ def _apply_teacache(model, cfg: TeacacheConfig):
     to = new_model.model_options.setdefault("transformer_options", {})
     cfg.inject_into_transformer_options(to)
 
-    # Patch the _forward method directly on the instance
-    diffusion_model._forward = teacache_anima_forward.__get__(
-        diffusion_model, diffusion_model.__class__
+    # Context manager for _forward patching (restores original on exit)
+    context = patch.object(
+        diffusion_model,
+        '_forward',
+        teacache_anima_forward.__get__(diffusion_model, diffusion_model.__class__),
     )
 
     # Wrapper to track step index and enable/disable TeaCache
@@ -195,6 +198,7 @@ def _apply_teacache(model, cfg: TeacacheConfig):
         c_to = c.setdefault("transformer_options", {})
         sigmas = c_to.get("sample_sigmas")
 
+        teacache_enabled = False
         if sigmas is not None:
             matched = (sigmas == timestep[0]).nonzero()
             if len(matched) > 0:
@@ -206,11 +210,20 @@ def _apply_teacache(model, cfg: TeacacheConfig):
                         step_idx = i
                         break
             c_to["current_percent"] = step_idx / max(len(sigmas) - 1, 1)
-            c_to["enable_teacache"] = (
+            teacache_enabled = (
                 cfg.start_percent <= c_to["current_percent"] <= cfg.end_percent
             )
+            c_to["enable_teacache"] = teacache_enabled
 
-        return model_function(input_x, timestep, **c)
+            # Reset state at start of each generation
+            if step_idx == 0 and hasattr(diffusion_model, 'teacache_state'):
+                delattr(diffusion_model, 'teacache_state')
+
+        if teacache_enabled:
+            with context:
+                return model_function(input_x, timestep, **c)
+        else:
+            return model_function(input_x, timestep, **c)
 
     new_model.set_model_unet_function_wrapper(unet_wrapper)
     return new_model

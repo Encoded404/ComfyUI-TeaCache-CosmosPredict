@@ -278,15 +278,25 @@ class TeaCacheForCogVideoX:
     TITLE = "TeaCache For CogVideoX"
     
     def apply_teacache(self, model, enable_teacache: bool, rel_l1_thresh: float):
+        transformer = model["pipe"].transformer
         if enable_teacache:
-            transformer = model["pipe"].transformer
-            transformer.rel_l1_thresh = rel_l1_thresh # Set as instance attribute
+            transformer.rel_l1_thresh = rel_l1_thresh
+            # Clean up stale state from previous runs
+            for attr in ('accumulated_rel_l1_distance', 'previous_modulated_input',
+                         'previous_residual', 'previous_residual_encoder'):
+                if hasattr(transformer, attr):
+                    delattr(transformer, attr)
             transformer.forward = teacache_cogvideox_forward.__get__(
                                 transformer,
                                 transformer.__class__
                             )
         else:
-            transformer = model["pipe"].transformer
+            # Clean up stale state and restore original forward
+            for attr in ('accumulated_rel_l1_distance', 'previous_modulated_input',
+                         'previous_residual', 'previous_residual_encoder',
+                         'rel_l1_thresh', 'fastercache_counter'):
+                if hasattr(transformer, attr):
+                    delattr(transformer, attr)
             transformer.forward = CogVideoXTransformer3DModel.forward.__get__(
                                 transformer,
                                 transformer.__class__

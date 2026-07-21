@@ -463,7 +463,7 @@ def teacache_anima_forward(
         # For explicit fixed-grid pooling, set pooled_latent_mode: "fixed_grid"
         # in mapping_params.
         pooled_mode = cfg.mapping_params.get("pooled_latent_mode", "mean")
-        if transformer_options.get("enable_teacache", True) and pooled_mode == "fixed_grid":
+        if transformer_options.get("enable_teacache", False) and pooled_mode == "fixed_grid":
             try:
                 import torch.nn.functional as F
                 N, T, H, W, D = x_B_T_H_W_D.shape
@@ -482,106 +482,109 @@ def teacache_anima_forward(
     # ── 3. Per-slot state initialization ──
     cond_or_uncond = transformer_options.get("cond_or_uncond", [0, 1])
     b = int(x_B_T_H_W_D.shape[0] / len(cond_or_uncond))
+    enable_teacache = transformer_options.get("enable_teacache", False)
 
     if not hasattr(self, "teacache_state"):
         self.teacache_state = {}
-    for k in cond_or_uncond:
-        if k not in self.teacache_state:
-            self.teacache_state[k] = {
-                "accumulated": 0.0,
-                "should_calc": True,
-                "prev_mod": None,
-                "prev_residual": None,
-                "prev_residual_late": None,   # for block splitting
-                "accum_state": {},             # for windowed accumulation
-                "per_group": None,             # per-group accum state for dynamic+per_group
-            }
-        if cfg.block_mode == "dynamic" and cfg.block_level == "per_group":
-            groups = detect_block_groups(self.blocks)
-            if self.teacache_state[k].get("per_group") is None:
-                self.teacache_state[k]["per_group"] = {
-                    "accumulated": [0.0] * len(groups),
-                    "should_calc": [True] * len(groups),
-                    "accum_state": [{} for _ in groups],
-                    "prev_residuals": [None] * len(groups),
+
+    if enable_teacache:
+        for k in cond_or_uncond:
+            if k not in self.teacache_state:
+                self.teacache_state[k] = {
+                    "accumulated": 0.0,
+                    "should_calc": True,
+                    "prev_mod": None,
+                    "prev_residual": None,
+                    "prev_residual_late": None,
+                    "accum_state": {},
+                    "per_group": None,
                 }
+            if cfg.block_mode == "dynamic" and cfg.block_level == "per_group":
+                groups = detect_block_groups(self.blocks)
+                if self.teacache_state[k].get("per_group") is None:
+                    self.teacache_state[k]["per_group"] = {
+                        "accumulated": [0.0] * len(groups),
+                        "should_calc": [True] * len(groups),
+                        "accum_state": [{} for _ in groups],
+                        "prev_residuals": [None] * len(groups),
+                    }
 
     # ── 3b. Determine current step index ──
     sigmas = transformer_options.get("sample_sigmas", None)
     current_percent = transformer_options.get("current_percent", 0.0)
 
     # ── 4. Per-slot distance → mapping → accumulation (Knobs 2–7) ──
-    for i, k in enumerate(cond_or_uncond):
-        state = self.teacache_state[k]
-        curr_mod = modulated_inp[i * b : (i + 1) * b]
-
-        if state["prev_mod"] is not None:
-            delta = (curr_mod - state["prev_mod"]).abs()
-            denom = state["prev_mod"].abs().mean()
-
-            # Knob 2: Compute statistics
-            stats = compute_delta_stats(delta, denom)
-
-            # Knob 2+3: Distance metric + scaling
-            distance = compute_distance(stats, cfg.metric_type, cfg.metric_weights)
-            if cfg.signal_scale != 1.0:
-                distance *= cfg.signal_scale
-
-            # Knob 4: Mapping
-            predicted = apply_mapping(
-                distance,
-                cfg.mapping_type,
-                cfg.coefficients,
-                cfg.mapping_params,
-            )
-            state["last_predicted"] = float(predicted) if isinstance(predicted, (int, float)) else float(predicted.item())
-
-            # Knob 7: Step schedule
-            mult = step_schedule_multiplier(current_percent, cfg.step_schedule)
-            effective_thresh = cfg.rel_l1_thresh * mult * cfg.signal_scale
-
-            # Knob 5+6: Accumulation + threshold
-            new_acc, should_calc = accumulate_distance(
-                state["accumulated"],
-                predicted,
-                effective_thresh,
-                cfg.accumulation_type,
-                cfg.accumulation_params,
-                accum_state=state.get("accum_state"),
-            )
-            state["accumulated"] = new_acc
-            state["should_calc"] = should_calc
-
-        state["prev_mod"] = curr_mod
-
-    # ── 4b. Per-group accumulation (dynamic + per_group only) ──
-    if cfg.block_mode == "dynamic" and cfg.block_level == "per_group":
-        groups = detect_block_groups(self.blocks)
-        pg_cfgs = cfg.block_params.get("per_group", {}).get("groups", [])
+    if enable_teacache:
         for i, k in enumerate(cond_or_uncond):
-            pg_state = self.teacache_state[k].get("per_group")
-            if pg_state is None:
-                continue
-            for gi in range(len(groups)):
-                if gi >= len(pg_cfgs):
-                    continue
-                gc = pg_cfgs[gi]
-                sched = gc.get("step_schedule", cfg.step_schedule)
-                mult = step_schedule_multiplier(current_percent, sched)
-                eff = cfg.rel_l1_thresh * mult * cfg.signal_scale
-                new_acc, should = accumulate_distance(
-                    pg_state["accumulated"][gi],
-                    self.teacache_state[k].get("last_predicted", 0.0),
-                    eff,
-                    gc["accumulation_type"],
-                    gc.get("accumulation_params", {}),
-                    accum_state=pg_state["accum_state"][gi],
+            state = self.teacache_state[k]
+            curr_mod = modulated_inp[i * b : (i + 1) * b]
+
+            if state["prev_mod"] is not None:
+                delta = (curr_mod - state["prev_mod"]).abs()
+                denom = state["prev_mod"].abs().mean()
+
+                # Knob 2: Compute statistics
+                stats = compute_delta_stats(delta, denom)
+
+                # Knob 2+3: Distance metric + scaling
+                distance = compute_distance(stats, cfg.metric_type, cfg.metric_weights)
+                if cfg.signal_scale != 1.0:
+                    distance *= cfg.signal_scale
+
+                # Knob 4: Mapping
+                predicted = apply_mapping(
+                    distance,
+                    cfg.mapping_type,
+                    cfg.coefficients,
+                    cfg.mapping_params,
                 )
-                pg_state["accumulated"][gi] = new_acc
-                pg_state["should_calc"][gi] = should
+                state["last_predicted"] = float(predicted) if isinstance(predicted, (int, float)) else float(predicted.item())
+
+                # Knob 7: Step schedule
+                mult = step_schedule_multiplier(current_percent, cfg.step_schedule)
+                effective_thresh = cfg.rel_l1_thresh * mult * cfg.signal_scale
+
+                # Knob 5+6: Accumulation + threshold
+                new_acc, should_calc = accumulate_distance(
+                    state["accumulated"],
+                    predicted,
+                    effective_thresh,
+                    cfg.accumulation_type,
+                    cfg.accumulation_params,
+                    accum_state=state.get("accum_state"),
+                )
+                state["accumulated"] = new_acc
+                state["should_calc"] = should_calc
+
+            state["prev_mod"] = curr_mod
+
+        # ── 4b. Per-group accumulation (dynamic + per_group only) ──
+        if cfg.block_mode == "dynamic" and cfg.block_level == "per_group":
+            groups = detect_block_groups(self.blocks)
+            pg_cfgs = cfg.block_params.get("per_group", {}).get("groups", [])
+            for i, k in enumerate(cond_or_uncond):
+                pg_state = self.teacache_state[k].get("per_group")
+                if pg_state is None:
+                    continue
+                for gi in range(len(groups)):
+                    if gi >= len(pg_cfgs):
+                        continue
+                    gc = pg_cfgs[gi]
+                    sched = gc.get("step_schedule", cfg.step_schedule)
+                    mult = step_schedule_multiplier(current_percent, sched)
+                    eff = cfg.rel_l1_thresh * mult * cfg.signal_scale
+                    new_acc, should = accumulate_distance(
+                        pg_state["accumulated"][gi],
+                        self.teacache_state[k].get("last_predicted", 0.0),
+                        eff,
+                        gc["accumulation_type"],
+                        gc.get("accumulation_params", {}),
+                        accum_state=pg_state["accum_state"][gi],
+                    )
+                    pg_state["accumulated"][gi] = new_acc
+                    pg_state["should_calc"][gi] = should
 
     # ── 5. Global decision ──
-    enable_teacache = transformer_options.get("enable_teacache", True)
     if enable_teacache:
         should_calc_global = any(
             self.teacache_state[k].get("should_calc", True)
