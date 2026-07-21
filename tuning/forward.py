@@ -509,9 +509,15 @@ def teacache_anima_forward(
                         "prev_residuals": [None] * len(groups),
                     }
 
-    # ── 3b. Determine current step index ──
+    # ── 3b. Determine current step index and runtime step-count scaling ──
     sigmas = transformer_options.get("sample_sigmas", None)
     current_percent = transformer_options.get("current_percent", 0.0)
+    if sigmas is not None:
+        n_steps = max(len(sigmas) - 1, 1)
+        preset_steps = transformer_options.get("preset_steps", n_steps)
+        step_scale = preset_steps / n_steps
+    else:
+        step_scale = 1.0
 
     # ── 4. Per-slot distance → mapping → accumulation (Knobs 2–7) ──
     if enable_teacache:
@@ -542,7 +548,7 @@ def teacache_anima_forward(
 
                 # Knob 7: Step schedule
                 mult = step_schedule_multiplier(current_percent, cfg.step_schedule)
-                effective_thresh = cfg.rel_l1_thresh * mult * cfg.signal_scale
+                effective_thresh = cfg.rel_l1_thresh * mult * cfg.signal_scale * step_scale
 
                 # Knob 5+6: Accumulation + threshold
                 new_acc, should_calc = accumulate_distance(
@@ -572,7 +578,7 @@ def teacache_anima_forward(
                     gc = pg_cfgs[gi]
                     sched = gc.get("step_schedule", cfg.step_schedule)
                     mult = step_schedule_multiplier(current_percent, sched)
-                    eff = cfg.rel_l1_thresh * mult * cfg.signal_scale
+                    eff = cfg.rel_l1_thresh * mult * cfg.signal_scale * step_scale
                     new_acc, should = accumulate_distance(
                         pg_state["accumulated"][gi],
                         self.teacache_state[k].get("last_predicted", 0.0),
@@ -625,7 +631,7 @@ def teacache_anima_forward(
     if not should_calc_global:
         # ── Knob 9: Apply cached residual(s) ──
         mult = step_schedule_multiplier(current_percent, cfg.step_schedule)
-        effective_thresh = cfg.rel_l1_thresh * mult * cfg.signal_scale
+        effective_thresh = cfg.rel_l1_thresh * mult * cfg.signal_scale * step_scale
 
         for i, k in enumerate(cond_or_uncond):
             state = self.teacache_state[k]
@@ -668,7 +674,7 @@ def teacache_anima_forward(
                             resid = pg.get("prev_residuals", [None] * len(groups))[gi]
                             if resid is not None:
                                 acc = pg["accumulated"][gi]
-                                eff = cfg.rel_l1_thresh * step_schedule_multiplier(current_percent, cfg.step_schedule) * cfg.signal_scale
+                                eff = cfg.rel_l1_thresh * step_schedule_multiplier(current_percent, cfg.step_schedule) * cfg.signal_scale * step_scale
                                 conf = min(acc / max(eff, 1e-8), 1.0)
                                 x_B_T_H_W_D[i * b : (i + 1) * b] = apply_residual(
                                     x_B_T_H_W_D[i * b : (i + 1) * b], resid,

@@ -87,20 +87,20 @@ def _apply_quality_curve(quality: float, lo: float, hi: float, presets: dict) ->
 #  New format: error-anchored control point interpolation
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _quality_to_config(quality: float, steps: int = 30) -> Tuple[TeacacheConfig, float, float]:
+def _quality_to_config(quality: float) -> Tuple[TeacacheConfig, float, float, int]:
     """Map quality 0-100 to a full TeacacheConfig via error-anchored control points.
 
     quality=0  → lowest error tolerance → best quality (near-lossless)
     quality=100 → highest error tolerance → most speed (aggressive)
 
-    Returns (config, estimated_speedup, lpips_estimate).
+    Returns (config, estimated_speedup, lpips_estimate, preset_steps).
     """
     presets = _load_presets()
     if not _is_new_format(presets):
         return _quality_to_config_legacy(quality)
 
     points = presets["control_points"]
-    preset_steps = presets.get("_steps", steps)
+    preset_steps = presets.get("_steps", 30)
     lpips_scale = presets.get("_lpips_scale", _DEFAULT_LPIPS_SCALE)
     error_range = presets.get("_error_range", [points[0]["error"], points[-1]["error"]])
 
@@ -132,29 +132,26 @@ def _quality_to_config(quality: float, steps: int = 30) -> Tuple[TeacacheConfig,
     hi_thresh = hi["config"]["rel_l1_thresh"]
     thresh = lo_thresh + t * (hi_thresh - lo_thresh)
 
-    # Step-count scaling: fewer steps → larger per-step deltas → higher threshold
-    if preset_steps > 0 and steps > 0 and steps != preset_steps:
-        thresh *= preset_steps / steps
-
     # Discrete params: snap to nearest control point
     base_config = hi["config"] if t > 0.5 else lo["config"]
     cfg = TeacacheConfig.from_dict(base_config)
     cfg.rel_l1_thresh = round(max(thresh, 0.001), 4)
 
-    # Display hints
+    # Display hints (at preset step count)
     speedup = lo["speedup"] + t * (hi["speedup"] - lo["speedup"])
     lpips_est = target_error * lpips_scale
 
-    return cfg, speedup, lpips_est
+    return cfg, speedup, lpips_est, preset_steps
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Legacy format: quality_zones with hand-crafted control points
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _quality_to_config_legacy(quality: float) -> Tuple[TeacacheConfig, float, float]:
+def _quality_to_config_legacy(quality: float) -> Tuple[TeacacheConfig, float, float, int]:
     """Fallback for old anima_presets.json format (quality_zones)."""
     presets = _load_presets()
+    preset_steps = presets.get("_steps", 30)
     zone = None
     for z in presets.get("quality_zones", []):
         lo, hi = z["quality_range"]
@@ -164,7 +161,7 @@ def _quality_to_config_legacy(quality: float) -> Tuple[TeacacheConfig, float, fl
 
     if zone is None:
         cfg = TeacacheConfig()
-        return cfg, 1.0, 0.05
+        return cfg, 1.0, 0.05, preset_steps
 
     points = sorted(zone["control_points"], key=lambda p: p["quality"])
 
@@ -190,14 +187,14 @@ def _quality_to_config_legacy(quality: float) -> Tuple[TeacacheConfig, float, fl
     cfg_dict.update(zone.get("config_overrides", {}))
     cfg_dict["rel_l1_thresh"] = round(p["thresh"], 4)
 
-    return TeacacheConfig.from_dict(cfg_dict), p["speedup"], p["lpips"]
+    return TeacacheConfig.from_dict(cfg_dict), p["speedup"], p["lpips"], preset_steps
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Apply helper (shared by both nodes)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _apply_teacache(model, cfg: TeacacheConfig):
+def _apply_teacache(model, cfg: TeacacheConfig, preset_steps: int = 30):
     """Apply a TeaCache config as the model's _forward.
 
     Patches MiniTrainDIT._forward within a context manager, so the
@@ -209,9 +206,10 @@ def _apply_teacache(model, cfg: TeacacheConfig):
     new_model = model.clone()
     diffusion_model = new_model.get_model_object("diffusion_model")
 
-    # Inject config into transformer_options
+    # Inject config + step baseline into transformer_options
     to = new_model.model_options.setdefault("transformer_options", {})
     cfg.inject_into_transformer_options(to)
+    to["preset_steps"] = preset_steps
 
     # Context manager for _forward patching (restores original on exit)
     context = patch.object(
@@ -284,8 +282,6 @@ class TeaCacheAnima:
         return {
             "required": {
                 "model": ("MODEL", {"tooltip": "The Anima diffusion model from Load Diffusion Model."}),
-                "steps": ("INT", {"default": 30, "min": 10, "max": 100, "step": 1,
-                                    "tooltip": "Number of sampling steps in your KSampler. Threshold auto-scales."}),
                 "quality": ("FLOAT", {"default": 50.0, "min": 0.0, "max": 100.0, "step": 1.0,
                                         "display": "slider",
                                         "tooltip": "0 = max quality (lossless), 50 = balanced, 100 = max speed"}),
@@ -318,12 +314,12 @@ class TeaCacheAnima:
     FUNCTION = "apply_teacache_anima"
     CATEGORY = "TeaCache"
 
-    def apply_teacache_anima(self, model, steps, quality,
+    def apply_teacache_anima(self, model, quality,
                               residual_strategy="auto",
                               block_mode="auto",
                               accumulation_type="auto",
                               step_schedule="auto"):
-        cfg, speedup, lpips_est = _quality_to_config(quality, steps=steps)
+        cfg, speedup, lpips_est, preset_steps = _quality_to_config(quality)
 
         overrides = []
         if residual_strategy != "auto":
@@ -339,7 +335,7 @@ class TeaCacheAnima:
             cfg.step_schedule = step_schedule
             overrides.append(f"sched={step_schedule}")
 
-        new_model = _apply_teacache(model, cfg)
+        new_model = _apply_teacache(model, cfg, preset_steps=preset_steps)
 
         info = (
             f"err≈{_quality_to_error(quality):.3f}  "
@@ -354,7 +350,7 @@ class TeaCacheAnima:
         if hasattr(new_model, "widget_values"):
             new_model.widget_values = info
 
-        print(f"  TeaCacheAnima: quality={quality:.0f} steps={steps} → {info}")
+        print(f"  TeaCacheAnima: quality={quality:.0f} → {info}")
         return (new_model,)
 
 
@@ -395,7 +391,6 @@ class TeaCacheAnimaAdvanced:
         return {
             "required": {
                 "model": ("MODEL", {"tooltip": "The Anima diffusion model."}),
-                "steps": ("INT", {"default": 30, "min": 10, "max": 100, "step": 1}),
                 "source": (
                     ["t_emb", "first_block_shift", "pooled_latent"],
                     {"default": "pooled_latent",
@@ -447,7 +442,7 @@ class TeaCacheAnimaAdvanced:
     CATEGORY = "TeaCache"
 
     def apply_teacache_anima_advanced(
-        self, model, steps, source, metric_type, signal_scale,
+        self, model, source, metric_type, signal_scale,
         mapping_type, rel_l1_thresh, accumulation, step_schedule,
         residual, start_percent, end_percent, block_mode,
     ):
