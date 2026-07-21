@@ -175,6 +175,8 @@ def _simulate_config_unified(
     dyn_bf_weighted = 0.0
     dyn_skip_total = 0
 
+    ss = cfg.signal_scale if isinstance(cfg.signal_scale, (int, float)) else 1.0
+
     for group in sim_data.groups:
         stats = _get_source_stats(group, cfg.source)
         if stats is None:
@@ -182,13 +184,13 @@ def _simulate_config_unified(
 
         # ── Vectorized: distance → signal scale → mapping ──
         dist = _compute_distance(stats, cfg)
-        if cfg.signal_scale != 1.0:
-            dist *= cfg.signal_scale
+        if ss != 1.0:
+            dist *= ss
         predicted = _apply_mapping(dist, cfg)
 
         # ── Vectorized: effective thresholds ──
         step_mult = group.step_mult.get(cfg.step_schedule, group.step_mult["constant"])
-        thresholds = threshold * step_mult * cfg.signal_scale
+        thresholds = threshold * step_mult * ss
 
         # ── Precompute merged penalty array (out_rel > 0 ? out_rel : res_rel) ──
         penalties = np.where(group.out_rel > 0, group.out_rel, group.res_rel)
@@ -348,18 +350,20 @@ def _simulate_config_per_group(
     total_weighted_error = 0.0
     total_steps = 0
 
+    ss = cfg.signal_scale if isinstance(cfg.signal_scale, (int, float)) else 1.0
+
     for group in sim_data.groups:
         stats = _get_source_stats(group, cfg.source)
         if stats is None:
             continue
 
         dist = _compute_distance(stats, cfg)
-        if cfg.signal_scale != 1.0:
-            dist *= cfg.signal_scale
+        if ss != 1.0:
+            dist *= ss
         predicted = _apply_mapping(dist, cfg)
 
         step_mult = group.step_mult.get(cfg.step_schedule, group.step_mult["constant"])
-        thresholds = threshold * step_mult * cfg.signal_scale
+        thresholds = threshold * step_mult * ss
         penalties = np.where(group.out_rel > 0, group.out_rel, group.res_rel)
 
         group_skip_counts = []
@@ -372,7 +376,7 @@ def _simulate_config_per_group(
                 gc = group_configs[gi]
             sched = gc.get("step_schedule", cfg.step_schedule)
             s_mult = group.step_mult.get(sched, group.step_mult["constant"])
-            g_thresholds = threshold * s_mult * cfg.signal_scale
+            g_thresholds = threshold * s_mult * ss
 
             skip, err, _mask = simulate_group(
                 predicted, g_thresholds, penalties,

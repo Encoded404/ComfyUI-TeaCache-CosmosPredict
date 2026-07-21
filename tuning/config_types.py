@@ -59,6 +59,18 @@ class TeacacheConfig:
     cross_feed_enabled: bool = False
     cross_feed_strength: float = 0.5
 
+    def __post_init__(self):
+        if isinstance(self.signal_scale, dict):
+            raise TypeError(
+                f"signal_scale received a dict {self.signal_scale}; "
+                f"it must be a per-source key but should be looked up "
+                f"for source={self.source!r} before constructing TeacacheConfig"
+            )
+        if not isinstance(self.signal_scale, (int, float)):
+            raise TypeError(
+                f"signal_scale must be int or float, got {type(self.signal_scale).__name__}"
+            )
+
     def to_dict(self) -> dict:
         return {
             "source": self.source,
