@@ -1,34 +1,32 @@
 {
   "_description": "Auto-generated TeaCache presets for Anima/Cosmos-Predict2. Each control point is a full configuration from the Pareto frontier. The slider uses a power-law curve (p=2.0) for perceptually uniform quality-to-error mapping; discrete params snap to the nearer anchor.",
   "_error_range": [
-    0.043846,
-    0.099269
+    0.04393,
+    0.1
   ],
   "_lpips_scale": 6.0,
   "_quality_curve": "power",
   "_quality_power": 2.0,
   "control_points": [
     {
-      "error": 0.043846,
+      "error": 0.04393,
       "config": {
-        "source": "t_emb",
+        "source": "pooled_latent",
         "metric_type": "mean_and_max",
         "metric_weights": {
           "mean": 0.7,
           "max": 0.3
         },
-        "signal_scale": 442.0,
-        "mapping_type": "polynomial",
+        "signal_scale": 1.0,
+        "mapping_type": "power_law",
         "coefficients": [],
         "mapping_params": {
-          "poly_degree": 3
+          "pooled_latent_mode": "mean"
         },
-        "accumulation_type": "leaky",
-        "accumulation_params": {
-          "leak_factor": 0.5
-        },
-        "rel_l1_thresh": 0.014762814719093903,
-        "step_schedule": "bell",
+        "accumulation_type": "hard_reset",
+        "accumulation_params": {},
+        "rel_l1_thresh": 1.0940547072057425,
+        "step_schedule": "linear_decay",
         "start_percent": 0.05,
         "end_percent": 0.95,
         "block_mode": "all_or_nothing",
@@ -43,7 +41,7 @@
           "*"
         ]
       },
-      "speedup": 1.818
+      "speedup": 1.624
     },
     {
       "error": 0.048858,
@@ -84,24 +82,31 @@
       "speedup": 2.231
     },
     {
-      "error": 0.059567,
+      "error": 0.059775,
       "config": {
         "source": "t_emb",
-        "metric_type": "mean_only",
+        "metric_type": "mean_and_max",
         "metric_weights": {
-          "mean": 1.0
+          "mean": 0.7,
+          "max": 0.3
         },
         "signal_scale": 442.0,
         "mapping_type": "polynomial",
-        "coefficients": [],
+        "coefficients": [
+          -5.504010691187495e-06,
+          0.00019461952871609794,
+          0.0010892929653452063,
+          -0.02418060131499682,
+          0.12042421506207725
+        ],
         "mapping_params": {
           "poly_degree": 3
         },
-        "accumulation_type": "windowed",
+        "accumulation_type": "leaky",
         "accumulation_params": {
-          "window_size": 4.36363636
+          "leak_factor": 0.85636364
         },
-        "rel_l1_thresh": 0.001191450698119776,
+        "rel_l1_thresh": 0.0010092621909870473,
         "step_schedule": "bell",
         "start_percent": 0.05,
         "end_percent": 0.95,
@@ -117,10 +122,139 @@
           "*"
         ]
       },
-      "speedup": 1.818
+      "speedup": 2.571
     },
     {
-      "error": 0.068065,
+      "error": 0.06832,
+      "config": {
+        "source": "t_emb",
+        "metric_type": "mean_and_max",
+        "metric_weights": {
+          "mean": 0.7,
+          "max": 0.3
+        },
+        "signal_scale": 442.0,
+        "mapping_type": "polynomial",
+        "coefficients": [
+          -5.504010691187495e-06,
+          0.00019461952871609794,
+          0.0010892929653452063,
+          -0.02418060131499682,
+          0.12042421506207725
+        ],
+        "mapping_params": {
+          "poly_degree": 3
+        },
+        "accumulation_type": "leaky",
+        "accumulation_params": {
+          "leak_factor": 0.54454545
+        },
+        "rel_l1_thresh": 0.001,
+        "step_schedule": "bell",
+        "start_percent": 0.05,
+        "end_percent": 0.95,
+        "block_mode": "all_or_nothing",
+        "block_params": {},
+        "residual_strategy": "hard",
+        "residual_params": {},
+        "cross_feed_enabled": false,
+        "cross_feed_strength": 0.5,
+        "cosim_threshold": 0.95,
+        "block_level": "unified",
+        "block_level_config_scope": [
+          "*"
+        ]
+      },
+      "speedup": 3.158
+    },
+    {
+      "error": 0.076535,
+      "config": {
+        "source": "t_emb",
+        "metric_type": "mean_and_max",
+        "metric_weights": {
+          "mean": 0.7,
+          "max": 0.3
+        },
+        "signal_scale": 100,
+        "mapping_type": "polynomial",
+        "coefficients": [
+          -0.0021007208514952046,
+          0.016805569126775985,
+          0.021280863088171894,
+          -0.10687825781228809,
+          0.12042421506207791
+        ],
+        "mapping_params": {
+          "poly_degree": 3
+        },
+        "accumulation_type": "leaky",
+        "accumulation_params": {
+          "leak_factor": 0.5
+        },
+        "rel_l1_thresh": 0.001,
+        "step_schedule": "linear_decay",
+        "start_percent": 0.05,
+        "end_percent": 0.95,
+        "block_mode": "all_or_nothing",
+        "block_params": {},
+        "residual_strategy": "hard",
+        "residual_params": {},
+        "cross_feed_enabled": false,
+        "cross_feed_strength": 0.5,
+        "cosim_threshold": 0.95,
+        "block_level": "unified",
+        "block_level_config_scope": [
+          "*"
+        ]
+      },
+      "speedup": 3.273
+    },
+    {
+      "error": 0.083952,
+      "config": {
+        "source": "t_emb",
+        "metric_type": "mean_and_max",
+        "metric_weights": {
+          "mean": 0.7,
+          "max": 0.3
+        },
+        "signal_scale": 200,
+        "mapping_type": "polynomial",
+        "coefficients": [
+          -0.00013129505321845029,
+          0.002100696140846998,
+          0.0053202157720429735,
+          -0.053439128906144044,
+          0.12042421506207791
+        ],
+        "mapping_params": {
+          "poly_degree": 3
+        },
+        "accumulation_type": "leaky",
+        "accumulation_params": {
+          "leak_factor": 0.63363636
+        },
+        "rel_l1_thresh": 0.001,
+        "step_schedule": "linear_decay",
+        "start_percent": 0.05,
+        "end_percent": 0.95,
+        "block_mode": "all_or_nothing",
+        "block_params": {},
+        "residual_strategy": "hard",
+        "residual_params": {},
+        "cross_feed_enabled": false,
+        "cross_feed_strength": 0.5,
+        "cosim_threshold": 0.95,
+        "block_level": "unified",
+        "block_level_config_scope": [
+          "*"
+        ]
+      },
+      "speedup": 4.0
+    },
+    {
+      "error": 0.091036,
       "config": {
         "source": "t_emb",
         "metric_type": "mean_only",
@@ -129,7 +263,13 @@
         },
         "signal_scale": 442.0,
         "mapping_type": "polynomial",
-        "coefficients": [],
+        "coefficients": [
+          -0.002531918728845369,
+          0.019517114163366607,
+          0.09266105534877665,
+          -0.2221730785738032,
+          0.1626902391369772
+        ],
         "mapping_params": {
           "poly_degree": 3
         },
@@ -137,43 +277,7 @@
         "accumulation_params": {
           "window_size": 2.0
         },
-        "rel_l1_thresh": 0.001,
-        "step_schedule": "constant",
-        "start_percent": 0.05,
-        "end_percent": 0.95,
-        "block_mode": "all_or_nothing",
-        "block_params": {},
-        "residual_strategy": "hard",
-        "residual_params": {},
-        "cross_feed_enabled": false,
-        "cross_feed_strength": 0.5,
-        "cosim_threshold": 0.95,
-        "block_level": "unified",
-        "block_level_config_scope": [
-          "*"
-        ]
-      },
-      "speedup": 1.978
-    },
-    {
-      "error": 0.075935,
-      "config": {
-        "source": "t_emb",
-        "metric_type": "mean_only",
-        "metric_weights": {
-          "mean": 1.0
-        },
-        "signal_scale": 200,
-        "mapping_type": "polynomial",
-        "coefficients": [],
-        "mapping_params": {
-          "poly_degree": 3
-        },
-        "accumulation_type": "windowed",
-        "accumulation_params": {
-          "window_size": 7.90909091
-        },
-        "rel_l1_thresh": 0.001,
+        "rel_l1_thresh": 0.0011696827039703846,
         "step_schedule": "bell",
         "start_percent": 0.05,
         "end_percent": 0.95,
@@ -189,79 +293,7 @@
           "*"
         ]
       },
-      "speedup": 2.338
-    },
-    {
-      "error": 0.08196,
-      "config": {
-        "source": "t_emb",
-        "metric_type": "mean_only",
-        "metric_weights": {
-          "mean": 1.0
-        },
-        "signal_scale": 100,
-        "mapping_type": "polynomial",
-        "coefficients": [],
-        "mapping_params": {
-          "poly_degree": 3
-        },
-        "accumulation_type": "windowed",
-        "accumulation_params": {
-          "window_size": 6.72727273
-        },
-        "rel_l1_thresh": 0.001076544612842316,
-        "step_schedule": "cosine",
-        "start_percent": 0.05,
-        "end_percent": 0.95,
-        "block_mode": "all_or_nothing",
-        "block_params": {},
-        "residual_strategy": "hard",
-        "residual_params": {},
-        "cross_feed_enabled": false,
-        "cross_feed_strength": 0.5,
-        "cosim_threshold": 0.95,
-        "block_level": "unified",
-        "block_level_config_scope": [
-          "*"
-        ]
-      },
-      "speedup": 2.609
-    },
-    {
-      "error": 0.094447,
-      "config": {
-        "source": "pooled_latent",
-        "metric_type": "mean_only",
-        "metric_weights": {
-          "mean": 1.0
-        },
-        "signal_scale": 50,
-        "mapping_type": "power_law",
-        "coefficients": [],
-        "mapping_params": {
-          "pooled_latent_mode": "mean"
-        },
-        "accumulation_type": "windowed",
-        "accumulation_params": {
-          "window_size": 11.45454545
-        },
-        "rel_l1_thresh": 0.08277856966198477,
-        "step_schedule": "bell",
-        "start_percent": 0.05,
-        "end_percent": 0.95,
-        "block_mode": "all_or_nothing",
-        "block_params": {},
-        "residual_strategy": "hard",
-        "residual_params": {},
-        "cross_feed_enabled": false,
-        "cross_feed_strength": 0.5,
-        "cosim_threshold": 0.95,
-        "block_level": "unified",
-        "block_level_config_scope": [
-          "*"
-        ]
-      },
-      "speedup": 4.015
+      "speedup": 4.615
     },
     {
       "error": 0.099269,
