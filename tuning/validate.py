@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """Phase 3: End-to-end validation of top configurations.
 
-Loads the top-K configurations from Phase 2, runs them through the actual
-TeaCache forward function, and measures real wall-clock speedup + quality
-metrics (PSNR/SSIM/LPIPS) against a baseline.
+Loads Pareto-optimal configurations from Phase 2, selects them by uniform
+sampling across the error range (not just the knee), and measures real
+wall-clock speedup + quality metrics against precomputed baselines.
 
-This is the only phase that requires the GPU and is run last.
+Baselines are cached per (resolution, steps, prompt, seed) so every config
+reuses the same baseline — ~45% reduction in total generations.
+
+Supports multiple resolutions and step counts to verify generalization.
 
 Usage:
     python -m tuning.validate --comfy-dir /path/to/ComfyUI \
         --pareto outputs/optimization/pareto_frontier.json \
-        [--top-k 10] [--extra-sweep]
+        [--num-error-samples 8] [--quick] [--thorough] [--extra-sweep]
 """
 
 import argparse
@@ -18,8 +21,9 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import List
+from typing import Dict, List, Tuple
 
+import numpy as np
 import torch
 
 from .config_types import (
@@ -31,21 +35,147 @@ from .utils import (
     print_metrics_legend,
 )
 from .forward import teacache_anima_forward
-
-
 from .prompt_loader import load_prompt_config, select_prompts, resolve_prompt
 
 
-def load_validation_prompts(tcfg: TuningConfig):
-    """Load and resolve prompts for validation based on config settings."""
+# ═══════════════════════════════════════════════════════════════════════════
+#  Config selection from Pareto frontier
+# ═══════════════════════════════════════════════════════════════════════════
+
+def select_validation_configs(
+    pareto_results: List[OptimizationResult],
+    num_error_samples: int,
+    closest_per_sample: int,
+    include_score_top: int,
+) -> List[TeacacheConfig]:
+    """Select configs uniformly across the Pareto frontier error range.
+
+    Samples N points uniformly in accumulated_error space, takes the K
+    closest Pareto configs per sample point, and includes the top M by
+    score (knee configs).  Deduplicates by signal signature.
+    """
+    if not pareto_results:
+        return []
+
+    selected_cfgs: List[TeacacheConfig] = []
+    seen: set = set()
+
+    def _sig(r: OptimizationResult) -> tuple:
+        c = r.config
+        return (
+            c.source, c.metric_type, c.mapping_type,
+            round(c.rel_l1_thresh, 8), c.accumulation_type,
+            c.step_schedule, c.block_mode,
+            tuple(sorted(c.accumulation_params.items())),
+            tuple(sorted(c.mapping_params.items())),
+        )
+
+    def _add(r: OptimizationResult) -> None:
+        s = _sig(r)
+        if s not in seen:
+            seen.add(s)
+            selected_cfgs.append(r.config)
+
+    # ── Error-uniform samples ──────────────────────────────────────────
+    pareto_by_error = sorted(pareto_results, key=lambda r: r.accumulated_error)
+    min_err = pareto_by_error[0].accumulated_error
+    max_err = pareto_by_error[-1].accumulated_error
+
+    if max_err - min_err < 1e-12:
+        by_score = sorted(pareto_results, key=lambda r: r.score, reverse=True)
+        for r in by_score[:max(num_error_samples, include_score_top)]:
+            _add(r)
+        return selected_cfgs
+
+    target_errors = np.linspace(min_err, max_err, num=num_error_samples)
+
+    for target in target_errors:
+        distances = sorted(
+            [(abs(r.accumulated_error - target), r) for r in pareto_results],
+            key=lambda x: x[0],
+        )
+        for _, r in distances[:closest_per_sample]:
+            _add(r)
+
+    # ── Top M by score (knee) ──────────────────────────────────────────
+    by_score = sorted(pareto_results, key=lambda r: r.score, reverse=True)
+    for r in by_score[:include_score_top]:
+        _add(r)
+
+    return selected_cfgs
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Baseline precomputation
+# ═══════════════════════════════════════════════════════════════════════════
+
+def precompute_baselines(
+    unet, clip, vae,
+    prompts: List[dict],
+    seeds: List[int],
+    resolutions: List[Tuple[int, int]],
+    step_counts: List[int],
+    tcfg: TuningConfig,
+) -> Dict[tuple, dict]:
+    """Generate baselines once per (resolution, steps, prompt, seed) combo.
+
+    Returns dict keyed by (width, height, steps, prompt_idx, seed), each
+    value being {"image": PIL.Image, "time": float}.
+    """
+    baselines: Dict[tuple, dict] = {}
+    total = len(resolutions) * len(step_counts) * len(prompts) * len(seeds)
+    done = 0
+
+    print(f"\n  Precomputing {total} baselines...")
+
+    for w, h in resolutions:
+        for steps in step_counts:
+            for pi, pdata in enumerate(prompts):
+                for seed in seeds:
+                    key = (w, h, steps, pi, seed)
+                    torch.cuda.empty_cache()
+                    t0 = time.time()
+                    img = sample(
+                        unet, clip, vae, pdata["prompt"],
+                        seed=seed, steps=steps,
+                        cfg=tcfg.sampling["cfg"],
+                        sampler_name=tcfg.sampling["sampler"],
+                        scheduler=tcfg.sampling["scheduler"],
+                        width=w, height=h,
+                        negative=pdata["negative"],
+                    )
+                    dt = time.time() - t0
+                    baselines[key] = {"image": img, "time": dt}
+                    done += 1
+                    print(f"  [{done:>3d}/{total}] {w}x{h} s={steps:>2d} "
+                          f"p={pi} seed={seed}  {dt:.1f}s")
+
+    return baselines
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Prompt loading
+# ═══════════════════════════════════════════════════════════════════════════
+
+def load_validation_prompts(
+    tcfg: TuningConfig,
+    num_prompts: int = None,
+    num_seeds: int = None,
+) -> Tuple[list, list]:
+    """Load and resolve prompts for validation.
+
+    Returns (prompts_list, seeds_list) where prompts_list contains dicts
+    with 'prompt', 'negative', and 'entry' keys.
+    """
     cfg = tcfg.validation
     prompt_config = load_prompt_config(
         str(Path(__file__).parent / cfg["prompts_file"])
     )
+    count = num_prompts if num_prompts is not None else cfg.get("num_prompts", 2)
     entries = select_prompts(
         prompt_config,
         method=cfg.get("prompt_selection", "from_top"),
-        count=cfg["num_prompts"],
+        count=count,
         tag_filter=cfg.get("prompt_tag_filter"),
     )
     resolved = []
@@ -56,30 +186,20 @@ def load_validation_prompts(tcfg: TuningConfig):
             negative_variant_idx=i % max(len(prompt_config.negative_variants), 1),
         )
         resolved.append({"prompt": full, "negative": neg, "entry": entry})
-    return resolved
+
+    seeds = list(cfg.get("seeds", [34635345]))
+    if num_seeds is not None:
+        seeds = seeds[:num_seeds]
+
+    return resolved, seeds
 
 
-def patch_with_config(unet, cfg: TeacacheConfig):
-    """Apply a TeaCache config as the model's _forward."""
-    dm = get_diffusion_model(unet)
+# ═══════════════════════════════════════════════════════════════════════════
+#  TeaCache helpers
+# ═══════════════════════════════════════════════════════════════════════════
 
-    # Reset cache state
-    if hasattr(dm, "teacache_state"):
-        delattr(dm, "teacache_state")
-
-    # Replace _forward
-    dm._forward = teacache_anima_forward.__get__(dm, dm.__class__)
-
-    # Inject config into transformer_options
-    to = unet.model_options.setdefault("transformer_options", {})
-    cfg.inject_into_transformer_options(to)
-    to["enable_teacache"] = True
-
-    return dm
-
-
-def cleanup_patch(dm, unet):
-    """Remove TeaCache patch and config."""
+def _cleanup_patch(dm, unet):
+    """Remove TeaCache patch and config from model."""
     to = unet.model_options.get("transformer_options", {})
     for k in list(to.keys()):
         if k.startswith("tc_"):
@@ -153,10 +273,13 @@ def run_single_teacache(
         dt = time.time() - t0
     finally:
         dm._forward = original
-        cleanup_patch(dm, unet)
+        _cleanup_patch(dm, unet)
 
     return img, dt
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  Validation core
+# ═══════════════════════════════════════════════════════════════════════════
 
 def validate_config(
     cfg: TeacacheConfig,
@@ -165,66 +288,71 @@ def validate_config(
     seeds: List[int],
     tcfg: TuningConfig,
     qm: QualityMetrics,
+    baselines: Dict[tuple, dict],
+    width: int,
+    height: int,
+    steps: int,
+    quiet: bool = False,
 ) -> ValidationResult:
-    """End-to-end validation of one configuration.
+    """End-to-end validation of one configuration at a specific
+    resolution and step count.
 
-    prompts: list of dicts with 'prompt' and 'negative' keys
+    Uses precomputed baselines keyed by
+    (width, height, steps, prompt_idx, seed).
     """
     metric_names = qm.metric_names()
-    all_scores: dict[str, list[float]] = {k: [] for k in metric_names}
-    all_speedups: list[float] = []
-    all_times: list[float] = []
+    all_scores: Dict[str, List[float]] = {k: [] for k in metric_names}
+    all_speedups: List[float] = []
+    all_times: List[float] = []
+    sampler = tcfg.sampling["sampler"]
+    scheduler = tcfg.sampling["scheduler"]
+    cfg_val = tcfg.sampling["cfg"]
 
     for pi, pdata in enumerate(prompts):
         for seed in seeds:
-            sp = f"p={pi} s={seed} thresh={cfg.rel_l1_thresh}"
+            key = (width, height, steps, pi, seed)
+            bl = baselines.get(key)
+            if bl is None:
+                print(f"  WARNING missing baseline for key={key}, skipping")
+                continue
 
-            # Baseline (no patching)
-            torch.cuda.empty_cache()
-            torch.cuda.reset_peak_memory_stats()
+            img_base = bl["image"]
+            t_base = bl["time"]
 
-            t0 = time.time()
-            img_base = sample(
-                unet, clip, vae, pdata["prompt"],
-                seed=seed, steps=tcfg.sampling.get("default_steps", 30),
-                cfg=tcfg.sampling["cfg"],
-                sampler_name=tcfg.sampling["sampler"],
-                scheduler=tcfg.sampling["scheduler"],
-                width=tcfg.sampling["width"],
-                height=tcfg.sampling["height"],
-                negative=pdata["negative"],
-            )
-            t_base = time.time() - t0
-
-            # TeaCache run (shared function — same code path as smoke test)
             img_tc, t_tc = run_single_teacache(
                 unet, clip, vae,
                 pdata["prompt"], pdata["negative"],
                 cfg,
-                seed=seed, steps=tcfg.sampling.get("default_steps", 30),
-                sampler=tcfg.sampling["sampler"], scheduler=tcfg.sampling["scheduler"],
-                width=tcfg.sampling["width"], height=tcfg.sampling["height"],
-                cfg_val=tcfg.sampling["cfg"],
+                seed=seed, steps=steps,
+                sampler=sampler, scheduler=scheduler,
+                width=width, height=height,
+                cfg_val=cfg_val,
             )
 
             speedup = t_base / max(t_tc, 0.001)
             all_speedups.append(speedup)
             all_times.append(t_tc)
 
-            # Compute all quality metrics
             scores = qm.measure(img_tc, img_base)
             for k in metric_names:
                 all_scores[k].append(scores.get(k, float("nan")))
 
-            lpips = scores.get("lpips_alex", float("inf"))
-            print(f"  p={pi} s={seed} thresh={cfg.rel_l1_thresh} "
-                  f"speedup={speedup:.2f}x  LPIPS={lpips:.4f}")
+            if not quiet:
+                lpips = scores.get("lpips_alex", float("inf"))
+                print(f"  p={pi} s={seed} thresh={cfg.rel_l1_thresh} "
+                      f"speedup={speedup:.2f}x  LPIPS={lpips:.4f}")
 
-    # Aggregate
     n = len(all_speedups)
+    if n == 0:
+        return ValidationResult(
+            config=cfg, mean_speedup=1.0,
+            mean_psnr=float("inf"), mean_ssim=1.0, mean_lpips=0.0,
+            mean_time_sec=0.0, n_samples=0, mean_metrics={},
+        )
+
     mean_metrics = {}
     for k in metric_names:
-        vals = [v for v in all_scores[k] if v != float("inf") and v == v]
+        vals = [v for v in all_scores[k] if v == v and v != float("inf")]
         mean_metrics[k] = round(sum(vals) / max(len(vals), 1), 4) if vals else float("nan")
 
     return ValidationResult(
@@ -247,17 +375,97 @@ def sweep_thresholds(
     tcfg: TuningConfig,
     qm: QualityMetrics,
     thresh_values: List[float],
+    baselines: Dict[tuple, dict],
+    width: int,
+    height: int,
+    steps: int,
 ) -> List[ValidationResult]:
-    """Sweep threshold values for a given base config."""
+    """Sweep threshold values for one base config at one resolution/steps."""
     results = []
     for thresh in thresh_values:
         cfg = TeacacheConfig.from_dict(base_cfg.to_dict())
         cfg.rel_l1_thresh = thresh
-        print(f"\n  Threshold sweep: thresh={thresh}")
-        result = validate_config(cfg, unet, clip, vae, prompts, seeds, tcfg, qm)
+        print(f"\n  Threshold sweep: thresh={thresh}  ({width}x{height} @ {steps}s)")
+        result = validate_config(
+            cfg, unet, clip, vae, prompts, seeds, tcfg, qm,
+            baselines, width, height, steps,
+        )
         results.append(result)
     return results
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  CLI argument parsing helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _parse_resolutions(raw: str) -> List[Tuple[int, int]]:
+    """Parse '512x512,1024x1024,1024x512' into [(512,512), ...]."""
+    if not raw:
+        return []
+    out = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            w, h = part.split("x")
+            out.append((int(w), int(h)))
+        except ValueError:
+            print(f"  WARNING invalid resolution '{part}', expected WxH; skipping")
+    return out
+
+
+def _parse_int_list(raw: str) -> List[int]:
+    """Parse '20,30,40' into [20, 30, 40]."""
+    if not raw:
+        return []
+    out = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(int(part))
+        except ValueError:
+            print(f"  WARNING invalid int '{part}', skipping")
+    return out
+
+
+def _parse_float_list(raw: str) -> List[float]:
+    """Parse '0.01,0.05,0.10' into [0.01, 0.05, 0.10]."""
+    if not raw:
+        return []
+    out = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(float(part))
+        except ValueError:
+            print(f"  WARNING invalid float '{part}', skipping")
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Result formatting helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _build_flat_results(
+    all_results: List[tuple],
+) -> List[dict]:
+    """Convert (result, width, height, steps) tuples to JSON-serializable dicts."""
+    out = []
+    for result, w, h, steps in all_results:
+        d = result.to_dict()
+        d["resolution"] = [w, h]
+        d["steps"] = steps
+        out.append(d)
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Main
+# ═══════════════════════════════════════════════════════════════════════════
 
 def main():
     parser = argparse.ArgumentParser(description="TeaCache Validator")
@@ -267,14 +475,36 @@ def main():
                         help="Path to pareto_frontier.json from Phase 2")
     parser.add_argument("--config", default=None,
                         help="Path to config.json")
-    parser.add_argument("--top-k", type=int, default=10,
-                        help="Validate top K configurations (default: 10)")
-    parser.add_argument("--extra-sweep", action="store_true",
-                        help="Also run threshold sweeps for top configs")
     parser.add_argument("--tier", type=int, default=1, choices=[1, 2, 3],
                         help="Metric tier (1=fastest, 3=most comprehensive)")
+
+    # ── Presets ────────────────────────────────────────────────────────
+    parser.add_argument("--quick", action="store_true",
+                        help="1 prompt, 1 seed, 512^2+1024^2, 30 steps, N=6")
+    parser.add_argument("--thorough", action="store_true",
+                        help="2 prompts, 2 seeds, all resolutions/steps, N=12")
+
+    # ── Config overrides ───────────────────────────────────────────────
+    parser.add_argument("--num-error-samples", type=int, default=None,
+                        help="Uniform error sample count across Pareto (default: 8)")
+    parser.add_argument("--error-samples-span", type=int, default=None,
+                        help="K-closest configs per error sample (default: 1)")
+    parser.add_argument("--include-score-top", type=int, default=None,
+                        help="Also top-M by score (knee, default: 2)")
+    parser.add_argument("--num-prompts", type=int, default=None)
+    parser.add_argument("--num-seeds", type=int, default=None)
+    parser.add_argument("--resolutions", type=str, default=None,
+                        help="Comma-separated WxH pairs, e.g. '512x512,1024x1024'")
+    parser.add_argument("--step-counts", type=str, default=None,
+                        help="Comma-separated step counts, e.g. '20,30,40'")
+    parser.add_argument("--extra-sweep", action="store_true",
+                        help="Run threshold sweeps at key error points")
+    parser.add_argument("--extra-sweep-errors", type=str, default=None,
+                        help="Comma-separated error targets, e.g. '0.01,0.05,0.10'")
+
     args = parser.parse_args()
 
+    # ── Load config ────────────────────────────────────────────────────
     if args.config is None:
         args.config = str(Path(__file__).parent / "config.json")
     tcfg = TuningConfig.load(args.config)
@@ -282,77 +512,164 @@ def main():
     out_dir = Path(tcfg.output_dir) / "validation"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print("=" * 60)
-    print("  TeaCache Validator — Phase 3")
-    print("=" * 60)
-    print(f"  Pareto:  {args.pareto}")
-    print(f"  Top-K:   {args.top_k}")
-    print(f"  Tiers:   {args.tier}")
-    print(f"  Output:  {out_dir}")
+    # ── Resolve parameters (config defaults → preset overrides → CLI overrides) ──
+    vcfg = tcfg.validation
 
-    # Create shared metrics instance before validation runs
+    num_error_samples = vcfg.get("num_error_samples", 8)
+    error_samples_span = vcfg.get("error_samples_span", 1)
+    include_score_top = vcfg.get("include_score_top", 2)
+    num_prompts = vcfg.get("num_prompts", 2)
+    num_seeds = 1  # default 1 seed
+    resolutions = [tuple(r) for r in vcfg.get("resolutions", [[512, 512], [1024, 1024], [1024, 512]])]
+    step_counts = list(vcfg.get("step_counts", [20, 30, 40]))
+    do_extra_sweep = args.extra_sweep
+    extra_sweep_errors = list(vcfg.get("extra_threshold_sweep_errors", [0.01, 0.03, 0.05, 0.10]))
+
+    # ── Presets ────────────────────────────────────────────────────────
+    if args.quick:
+        num_error_samples = 6
+        num_prompts = 1
+        num_seeds = 1
+        resolutions = [(512, 512), (1024, 1024)]
+        step_counts = [30]
+    elif args.thorough:
+        num_error_samples = 12
+        num_prompts = 2
+        num_seeds = 2
+        # keep full resolutions and step_counts from config
+
+    # ── CLI overrides ──────────────────────────────────────────────────
+    if args.num_error_samples is not None:
+        num_error_samples = args.num_error_samples
+    if args.error_samples_span is not None:
+        error_samples_span = args.error_samples_span
+    if args.include_score_top is not None:
+        include_score_top = args.include_score_top
+    if args.num_prompts is not None:
+        num_prompts = args.num_prompts
+    if args.num_seeds is not None:
+        num_seeds = args.num_seeds
+    if args.resolutions is not None:
+        resolutions = _parse_resolutions(args.resolutions) or resolutions
+    if args.step_counts is not None:
+        step_counts = _parse_int_list(args.step_counts) or step_counts
+    if args.extra_sweep_errors is not None:
+        extra_sweep_errors = _parse_float_list(args.extra_sweep_errors) or extra_sweep_errors
+
+    # ── Header ─────────────────────────────────────────────────────────
+    print("=" * 60)
+    print("  TeaCache Validator - Phase 3")
+    print("=" * 60)
+    print(f"  Pareto:          {args.pareto}")
+    print(f"  Tier:            {args.tier}")
+    print(f"  Error samples:   {num_error_samples}  (span={error_samples_span})")
+    print(f"  Score top incl:  {include_score_top}")
+    print(f"  Prompts:         {num_prompts}  Seeds: {num_seeds}")
+    print(f"  Resolutions:     {resolutions}")
+    print(f"  Step counts:     {step_counts}")
+    if do_extra_sweep:
+        print(f"  Extra sweep at:  {extra_sweep_errors}")
+    print(f"  Output:          {out_dir}")
+    total_combo = (len(resolutions) * len(step_counts) * num_prompts * num_seeds)
+    print(f"  Baseline images: {total_combo}")
+    print("=" * 60)
+
+    # ── Metrics ────────────────────────────────────────────────────────
     qm = QualityMetrics(tier=args.tier)
     if not qm.available:
-        print("  ⚠ pyiqa not found. Install: pip install -r tuning/requirements.txt")
+        print("\n  ERROR: pyiqa not found. Install: pip install -r tuning/requirements.txt")
         sys.exit(1)
     metric_names = qm.metric_names()
     print(f"  Metrics:  {', '.join(metric_names)}")
-    print("=" * 60)
 
-    # Load Pareto frontier
+    # ── Load Pareto frontier ───────────────────────────────────────────
     pareto_data = json.loads(Path(args.pareto).read_text())
-    pareto_configs = [OptimizationResult.from_dict(d) for d in pareto_data]
-    print(f"[load] {len(pareto_configs)} Pareto-optimal configs")
+    pareto_results = [OptimizationResult.from_dict(d) for d in pareto_data]
+    print(f"\n[load] {len(pareto_results)} Pareto-optimal configs")
 
-    # Load models
+    # ── Select configs ─────────────────────────────────────────────────
+    selected_cfgs = select_validation_configs(
+        pareto_results, num_error_samples, error_samples_span, include_score_top,
+    )
+    print(f"[select] {len(selected_cfgs)} configs to validate\n")
+
+    if not selected_cfgs:
+        print("  No configs selected — exiting.")
+        return
+
+    # ── Load models ────────────────────────────────────────────────────
     unet, clip, vae = load_models(
         tcfg.comfy_dir, tcfg.model_name,
         tcfg.clip_name, tcfg.clip_type, tcfg.vae_name,
     )
 
-    # Load prompts
-    prompts = load_validation_prompts(tcfg)
-    seeds = tcfg.validation["seeds"]
+    # ── Load prompts ───────────────────────────────────────────────────
+    prompts, seeds = load_validation_prompts(tcfg, num_prompts, num_seeds)
+    print(f"[prompts] {len(prompts)} prompts x {len(seeds)} seeds\n")
 
-    # Select top-K configs by score (best quality-speedup tradeoff first)
-    sorted_by_score = sorted(pareto_configs, key=lambda r: r.score, reverse=True)
-    n = min(args.top_k, len(sorted_by_score))
-    selected = sorted_by_score[:n]
-
-    print(f"\nValidating {len(selected)} configurations (top-{n} by score)...")
-
-    all_results = []
-    for idx, opt_result in enumerate(selected):
-        cfg = opt_result.config
-        print(f"\n  [{idx+1}/{len(selected)}] {cfg.source} {cfg.metric_type} "
-              f"{cfg.mapping_type} (sim speedup={opt_result.estimated_speedup:.2f}x)")
-
-        result = validate_config(cfg, unet, clip, vae, prompts, seeds, tcfg, qm)
-        all_results.append(result)
-
-        # Extra threshold sweep for top-3
-        if args.extra_sweep and idx < 3:
-            extra_threshes = tcfg.validation.get("extra_threshold_sweep", [
-                0.03, 0.05, 0.07, 0.10, 0.15, 0.20, 0.30, 0.50, 0.70, 1.0])
-            sweep_results = sweep_thresholds(
-                cfg, unet, clip, vae, prompts[:4], seeds[:2],
-                tcfg, qm, extra_threshes,
-            )
-            all_results.extend(sweep_results)
-
-    # Save and print
-    (out_dir / "validation_results.json").write_text(
-        json.dumps([r.to_dict() for r in all_results], indent=2)
+    # ── Precompute baselines ───────────────────────────────────────────
+    baselines = precompute_baselines(
+        unet, clip, vae, prompts, seeds, resolutions, step_counts, tcfg,
     )
 
+    # ── Validate each (config × resolution × steps) ────────────────────
+    all_results: List[tuple] = []  # (ValidationResult, width, height, steps)
+    total_validations = len(selected_cfgs) * len(resolutions) * len(step_counts)
+    done = 0
+
+    for cfg in selected_cfgs:
+        for w, h in resolutions:
+            for steps in step_counts:
+                done += 1
+                print(f"\n[{done}/{total_validations}] "
+                      f"{cfg.source} {cfg.metric_type} {cfg.mapping_type} "
+                      f"{w}x{h} @ {steps}s  thresh={cfg.rel_l1_thresh}")
+
+                result = validate_config(
+                    cfg, unet, clip, vae, prompts, seeds, tcfg, qm,
+                    baselines, w, h, steps,
+                )
+                all_results.append((result, w, h, steps))
+
+    # ── Extra threshold sweeps (at default resolution) ─────────────────
+    if do_extra_sweep and extra_sweep_errors:
+        sweep_threshes = vcfg.get("extra_threshold_sweep", [
+            0.02, 0.04, 0.06, 0.07, 0.08, 0.10, 0.15,
+            0.20, 0.30, 0.50, 0.70, 1.0, 2.0, 5.0,
+        ])
+        # Sweep at first resolution x first step count
+        sw, sh = resolutions[0]
+        ssteps = step_counts[0]
+        pareto_by_error = sorted(pareto_results,
+                                 key=lambda r: r.accumulated_error)
+
+        for target_err in extra_sweep_errors:
+            nearest = min(pareto_by_error,
+                          key=lambda r: abs(r.accumulated_error - target_err))
+            print(f"\n  Extra sweep at error~{target_err:.4f} "
+                  f"(closest err={nearest.accumulated_error:.4f}, "
+                  f"speedup~{nearest.estimated_speedup:.2f}x)")
+            sweep_results = sweep_thresholds(
+                nearest.config, unet, clip, vae,
+                prompts, seeds, tcfg, qm,
+                sweep_threshes,
+                baselines, sw, sh, ssteps,
+            )
+            for r in sweep_results:
+                all_results.append((r, sw, sh, ssteps))
+
+    # ── Save results ───────────────────────────────────────────────────
+    flat = _build_flat_results(all_results)
+    (out_dir / "validation_results.json").write_text(
+        json.dumps(flat, indent=2)
+    )
+
+    # ── Print summary tables grouped by (resolution, steps) ────────────
     print(f"\n{'=' * 60}")
     print(f"  Validation Results")
     print(f"{'=' * 60}")
-
-    # Print the metric legend for context
     print_metrics_legend()
 
-    # Build dynamic header from actual metric names
     short_metrics = {
         "psnr": "PSNR", "ssim": "SSIM", "lpips_alex": "LPIPSa",
         "lpips_vgg": "LPIPSv", "dists": "DISTS", "ms_ssim": "MSSIM",
@@ -361,40 +678,47 @@ def main():
     }
     display_names = [short_metrics.get(n, n[:6]) for n in metric_names]
 
-    header = (f"  {'#':>3} | {'source':<20} | {'speed':>6} | "
-              + " | ".join(f"{d:>7}" for d in display_names))
-    print(header)
-    print(f"  {'─' * len(header)}")
+    # Group by (resolution, steps)
+    from collections import defaultdict
+    groups: Dict[tuple, List[ValidationResult]] = defaultdict(list)
+    for result, w, h, steps in all_results:
+        groups[(w, h, steps)].append(result)
 
-    primary = [r for r in all_results if not hasattr(r.config, '_is_sweep')]
-    for i, r in enumerate(primary):
-        c = r.config
-        vals = " | ".join(
-            f"{r.mean_metrics.get(n, float('nan')):>7.4f}"
-            for n in metric_names
-        )
-        print(f"  {i+1:>3} | {c.source:<20} | {r.mean_speedup:>5.2f}x | {vals}")
+    for (w, h, steps), group_results in sorted(groups.items()):
+        n_configs = len(group_results)
+        primary = [r for r in group_results
+                   if not hasattr(r.config, '_is_sweep')]
+        print(f"\n  {w}x{h} @ {steps} steps  ({n_configs} results)")
+        header = (f"  {'#':>3} | {'source':<20} | {'speed':>6} | "
+                  + " | ".join(f"{d:>7}" for d in display_names))
+        print(header)
+        print(f"  {'-' * len(header)}")
 
-    # Find best by LPIPS < 0.05 and max speedup
-    good = [r for r in all_results if r.mean_lpips < 0.05]
-    if good:
-        best = max(good, key=lambda r: r.mean_speedup)
-        extra = ""
-        if best.mean_metrics:
-            extra = "  " + "  ".join(
-                f"{short_metrics.get(n, n)}={best.mean_metrics.get(n, '?'):.4f}"
-                for n in ["dists", "ms_ssim", "fsim", "vif", "gmsd"]
-                if n in best.mean_metrics
+        for i, r in enumerate(primary):
+            c = r.config
+            vals = " | ".join(
+                f"{r.mean_metrics.get(n, float('nan')):>7.4f}"
+                for n in metric_names
             )
-        print(f"\n  ★ Recommended (LPIPS<0.05): thresh={best.config.rel_l1_thresh} "
-              f"speedup={best.mean_speedup}x LPIPS={best.mean_lpips}"
-              f"{extra}")
-    else:
-        best = min(all_results, key=lambda r: r.mean_lpips)
-        print(f"\n  ★ Best quality (no LPIPS<0.05): thresh={best.config.rel_l1_thresh} "
-              f"speedup={best.mean_speedup}x LPIPS={best.mean_lpips}")
+            print(f"  {i+1:>3} | {c.source:<20} | {r.mean_speedup:>5.2f}x | {vals}")
 
-    print(f"\n  Results saved to: {out_dir}")
+        # Best by LPIPS < 0.05
+        good = [r for r in group_results if not (r.mean_lpips >= 0.05)]
+        if good:
+            best = max(good, key=lambda r: r.mean_speedup)
+            print(f"  * Recommended (LPIPS<0.05): "
+                  f"thresh={best.config.rel_l1_thresh} "
+                  f"speedup={best.mean_speedup}x "
+                  f"LPIPS={best.mean_lpips}")
+        else:
+            best = min(group_results,
+                       key=lambda r: r.mean_lpips if r.mean_lpips != 0 else float('inf'))
+            print(f"  * Best quality (no LPIPS<0.05): "
+                  f"thresh={best.config.rel_l1_thresh} "
+                  f"speedup={best.mean_speedup}x "
+                  f"LPIPS={best.mean_lpips}")
+
+    print(f"\n  Results saved to: {out_dir}/validation_results.json")
 
 
 if __name__ == "__main__":

@@ -17,7 +17,7 @@ python -m tuning.smoke_test --comfy-dir .
 1. **Smoke test** (`smoke_test.py`) — 8 checks: model loading, prompt diversity test, baseline generation, calibration collection, mini-optimizer, TeaCache comparison vs daraskme reference, and 12-metric quality assessment. ~6 min on V100 at 512².
 2. **Calibration** (`calibrate.py`) — records per-step delta stats (all 3 sources simultaneously) plus ground-truth output changes. Optionally records per-block cosine similarity for dead-block detection. Shows run schedule with time/disk estimates before starting. 30 min–4 hours.
 3. **Optimization** (`optimize.py`) — offline config search. Pre-computes mapping fits (polynomial, power_law, softplus), sweeps candidate thresholds, builds Pareto frontier, fine-tunes winner thresholds. Supports Numba acceleration, cross-validation, signal-space deduplication, and data-driven block param injection. Multi-core CPU, 3–30 min.
-4. **Validation** (`validate.py`) — end-to-end quality metrics (PSNR, SSIM, LPIPS, DISTS, MS-SSIM, FSIM, VIF, GMSD, NLPD, PieAPP, VSI). Shows comparison table and recommendation.
+4. **Validation** (`validate.py`) — end-to-end quality metrics (PSNR, SSIM, LPIPS, DISTS, MS-SSIM, FSIM, VIF, GMSD, NLPD, PieAPP, VSI) across multiple resolutions (512², 1024², 1024×512) and step counts (20, 30, 40). Configs are selected by uniform error sampling (not just the knee) so the full speedup-vs-quality curve is validated. Baselines are cached per resolution/steps/prompt/seed — ~45% fewer total generations. Results grouped by resolution and step count, with a recommended config per group.
 
 ```bash
 # Phase 1 — calibration (run on GPU)
@@ -29,7 +29,11 @@ python -m tuning.optimize --data outputs/<timestamp>/calibration_data.jsonl
 # Phase 3 — validation (run on GPU after Phase 2)
 python -m tuning.validate --comfy-dir . \
     --pareto outputs/optimization/pareto_frontier.json \
-    --top-k 10 --tier 2 --extra-sweep
+    --tier 2 --extra-sweep
+
+# Quick validation (3 min)
+python -m tuning.validate --comfy-dir . \
+    --pareto outputs/optimization/pareto_frontier.json --quick
 ```
 
 ## Architecture
@@ -41,7 +45,8 @@ calibrate.py  ──→  calibration_data.jsonl  ──→  optimize.py  ──�
             │              ↑                                          │
 validate.py  ←────────────────────────────────────────────────────────┘
     │
-    └── validation_results.json
+    └── validation_results.json   (grouped by resolution × steps)
+        └── speedup, PSNR, SSIM, LPIPS, DISTS, MS-SSIM, FSIM, VIF, ...
 ```
 
 The smoke test runs all three phases on a tiny dataset to verify everything works.
@@ -335,15 +340,24 @@ Cap on total configs. `0` = unlimited. When exceeded, configs are randomly sampl
 
 ### Validation (`validation`)
 
+Configurations are selected by **uniform error sampling** across the Pareto frontier — not just the knee. This validates the full speedup-vs-quality curve from conservative (near-lossless) to aggressive (fastest, some quality loss). Baselines are precomputed once per `(resolution, steps, prompt, seed)` and reused across all configs (~45% fewer generations).
+
+Validation tests multiple resolutions and step counts to verify generalization beyond calibration settings (which are typically 512² at mixed step counts).
+
 ```json
 "validation": {
     "prompts_file": "prompts/benchmark.json",
     "prompt_selection": "semantic_diversity",
     "prompt_tag_filter": [],
-    "num_prompts": 8,
+    "num_prompts": 2,
     "seeds": [34635345, 53453634, 267454, 123],
-    "top_k": 20,
-    "extra_threshold_sweep": [0.02, 0.04, 0.06, 0.07, 0.08, 0.10, 0.15, 0.20, 0.30, 0.50, 0.70, 1.0, 2.0, 5.0]
+    "num_error_samples": 8,
+    "error_samples_span": 1,
+    "include_score_top": 2,
+    "resolutions": [[512, 512], [1024, 1024], [1024, 512]],
+    "step_counts": [20, 30, 40],
+    "extra_threshold_sweep": [0.02, 0.04, 0.06, 0.07, 0.08, 0.10, 0.15, 0.20, 0.30, 0.50, 0.70, 1.0, 2.0, 5.0],
+    "extra_threshold_sweep_errors": [0.01, 0.03, 0.05, 0.10]
 }
 ```
 
@@ -352,10 +366,32 @@ Cap on total configs. `0` = unlimited. When exceeded, configs are randomly sampl
 | `prompts_file` | Path to benchmark prompt JSON |
 | `prompt_selection` | Selection strategy (same methods as calibration) |
 | `prompt_tag_filter` | Tag-based filter (same format as calibration) |
-| `num_prompts` | Number of benchmark prompts |
-| `seeds` | Seeds for validation runs |
-| `top_k` | Number of top configurations from Pareto frontier to validate |
-| `extra_threshold_sweep` | Additional threshold values swept on top-3 configs (when `--extra-sweep` is passed). Tests the full quality-speedup curve |
+| `num_prompts` | Number of benchmark prompts (default: 2) |
+| `seeds` | Seed pool for validation runs (first N used based on config/CLI) |
+| `num_error_samples` | N uniform points sampled across the Pareto accumulated_error range. Default: 8 |
+| `error_samples_span` | K closest configs to each sample point. Default: 1 |
+| `include_score_top` | Also validate top-M configs by score (knee). Default: 2 |
+| `resolutions` | `[width, height]` pairs tested per config. Default: `[[512,512],[1024,1024],[1024,512]]` |
+| `step_counts` | Step budgets tested per config. Default: `[20,30,40]` |
+| `extra_threshold_sweep` | Threshold values swept when `--extra-sweep` is passed. Default: 14 values from 0.02 to 5.0 |
+| `extra_threshold_sweep_errors` | Sweep the config nearest each error target. Default: `[0.01,0.03,0.05,0.10]` |
+
+#### CLI presets
+
+| Flag | Effect |
+|------|--------|
+| `--quick` | 1 prompt, 1 seed, 512²+1024², 30 steps, N=6. ~3 min |
+| `--thorough` | 2 prompts, 2 seeds, all resolutions/steps, N=12. ~78 min |
+
+#### Generation budget examples
+
+| Mode | Configs | Prompts | Seeds | Resolutions | Steps | Teacache | Baselines | Total | ~Time |
+|------|---------|---------|-------|-------------|-------|----------|-----------|-------|-------|
+| Quick | 6+2 | 1 | 1 | 2 | 1 | 16 | 4 | **20** | 3 min |
+| Default | 8+2 | 2 | 1 | 3 | 3 | 90 | 18 | **108** | 13 min |
+| Thorough | 12+2 | 2 | 2 | 3 | 3 | 252 | 36 | **288** | 34 min |
+
+(Teacache = (num_error_samples * error_samples_span + include_score_top) × prompts × seeds × resolutions × steps)
 
 ---
 

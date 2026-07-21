@@ -86,10 +86,15 @@
         "prompts_file": "prompts/benchmark.json",
         "prompt_selection": "semantic_diversity",
         "prompt_tag_filter": [],
-        "num_prompts": 8,
+        "num_prompts": 2,
         "seeds": [34635345, 53453634, 267454, 123],
-        "top_k": 20,
-        "extra_threshold_sweep": [0.02, 0.04, 0.06, 0.07, 0.08, 0.10, 0.15, 0.20, 0.30, 0.50, 0.70, 1.0, 2.0, 5.0]
+        "num_error_samples": 8,
+        "error_samples_span": 1,
+        "include_score_top": 2,
+        "resolutions": [[512, 512], [1024, 1024], [1024, 512]],
+        "step_counts": [20, 30, 40],
+        "extra_threshold_sweep": [0.02, 0.04, 0.06, 0.07, 0.08, 0.10, 0.15, 0.20, 0.30, 0.50, 0.70, 1.0, 2.0, 5.0],
+        "extra_threshold_sweep_errors": [0.01, 0.03, 0.05, 0.10]
     },
 
     "output_dir": "outputs"
