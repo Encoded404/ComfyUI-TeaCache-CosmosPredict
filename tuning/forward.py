@@ -538,7 +538,7 @@ def teacache_anima_forward(
 
             # Knob 7: Step schedule
             mult = step_schedule_multiplier(current_percent, cfg.step_schedule)
-            effective_thresh = cfg.rel_l1_thresh * mult * cfg.signal_scale * cfg.signal_scale
+            effective_thresh = cfg.rel_l1_thresh * mult * cfg.signal_scale
 
             # Knob 5+6: Accumulation + threshold
             new_acc, should_calc = accumulate_distance(
@@ -568,7 +568,7 @@ def teacache_anima_forward(
                 gc = pg_cfgs[gi]
                 sched = gc.get("step_schedule", cfg.step_schedule)
                 mult = step_schedule_multiplier(current_percent, sched)
-                eff = cfg.rel_l1_thresh * mult * cfg.signal_scale * cfg.signal_scale
+                eff = cfg.rel_l1_thresh * mult * cfg.signal_scale
                 new_acc, should = accumulate_distance(
                     pg_state["accumulated"][gi],
                     self.teacache_state[k].get("last_predicted", 0.0),

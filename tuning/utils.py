@@ -406,7 +406,7 @@ def detect_gpu() -> tuple[str, float]:
     name = torch.cuda.get_device_name(0) or "Unknown"
     name_lower = name.lower()
 
-    for pattern, factor in _GPU_SPEED_FACTORS:
+    for pattern, factor in sorted(_GPU_SPEED_FACTORS, key=lambda x: len(x[0]), reverse=True):
         if pattern in name_lower:
             return (name, factor)
 

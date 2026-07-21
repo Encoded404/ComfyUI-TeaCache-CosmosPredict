@@ -57,7 +57,7 @@
         "auto_scale_target": 1.0,
         "block_modes": ["all_or_nothing", "split_fraction", "split_groups", "dynamic"],
         "block_levels": ["unified", "per_group"],
-        "block_level_config_scope": ["*"],
+        "block_level_config_scope": ["accumulation_type", "step_schedule"],
         "cosim_thresholds": [
             {"param": "cosim_threshold", "start": 0.85, "end": 0.99, "steps": 5, "spacing": "linear"}
         ],

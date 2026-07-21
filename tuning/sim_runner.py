@@ -203,11 +203,11 @@ def _simulate_config_unified(
         total_error += err
         total_steps += group.n_steps
 
-        if cfg.block_mode == "dynamic":
-            dyn_bf = _compute_dynamic_block_fraction(
+        if cfg.block_mode in ("split_fraction", "split_groups", "dynamic"):
+            dbf = _compute_data_driven_block_fraction(
                 cfg, group.block_cos_sim, mask,
             )
-            dyn_bf_weighted += dyn_bf * skip
+            dyn_bf_weighted += dbf * skip
             dyn_skip_total += skip
 
     if total_steps == 0:
@@ -217,7 +217,7 @@ def _simulate_config_unified(
     avg_error = total_error / total_steps
     quality_proxy = 1.0 / (1.0 + avg_error)
 
-    if cfg.block_mode == "dynamic" and dyn_skip_total > 0:
+    if cfg.block_mode in ("split_fraction", "split_groups", "dynamic") and dyn_skip_total > 0:
         bf = dyn_bf_weighted / dyn_skip_total
     else:
         bf = _block_fraction(cfg)
@@ -228,25 +228,29 @@ def _simulate_config_unified(
     return skip_rate, avg_error, speedup, quality_proxy
 
 
-def _compute_dynamic_block_fraction(
+def _compute_data_driven_block_fraction(
     cfg: TeacacheConfig,
     block_cos_sim: Optional[np.ndarray],  # (n_blocks, n_steps) or None
     skip_mask: np.ndarray,                # bool (n_steps,)
-    default: float = 0.85,
+    block_fraction_default: float = 0.85,
 ) -> float:
     """Compute block fraction using per-block cosine similarity at each skip step.
 
-    On steps where the global accumulator says 'skip', blocks whose recorded
-    cosine similarity exceeds cfg.cosim_threshold are considered cache-safe.
-    The returned fraction represents the average compute saved per skip step,
-    scaled by *default* (the fraction of total model compute in the blocks).
+    For each skip step, counts how many blocks in the *cacheable set* actually
+    meet the cosim_threshold on that step.  Returns the fraction of compute
+    saved, scaled by *block_fraction_default* (the fraction of total model
+    compute that lives in the DiT blocks).
+
+    Falls back to _block_fraction when per-block data is unavailable.
     """
     if block_cos_sim is None:
-        return default
+        return _block_fraction(cfg)
 
     n_blocks = block_cos_sim.shape[0]
     n_steps = min(len(skip_mask), block_cos_sim.shape[1])
     threshold = cfg.cosim_threshold
+
+    cacheable = _build_cacheable_mask(cfg, n_blocks)
 
     total_cached_blocks = 0.0
     skip_count = 0
@@ -255,14 +259,43 @@ def _compute_dynamic_block_fraction(
             skip_count += 1
             cached = 0
             for bi in range(n_blocks):
-                cs = block_cos_sim[bi, t]
-                if not np.isnan(cs) and cs > threshold:
-                    cached += 1
+                if cacheable[bi]:
+                    cs = block_cos_sim[bi, t]
+                    if not np.isnan(cs) and cs > threshold:
+                        cached += 1
             total_cached_blocks += cached / max(n_blocks, 1)
 
     if skip_count == 0:
         return 0.0
-    return (total_cached_blocks / skip_count) * default
+    return (total_cached_blocks / skip_count) * block_fraction_default
+
+
+def _build_cacheable_mask(cfg: TeacacheConfig, n_blocks: int) -> np.ndarray:
+    """Return boolean mask (n_blocks,) — True for blocks in the cacheable set."""
+    cacheable = np.ones(n_blocks, dtype=bool)
+
+    if cfg.block_mode == "split_fraction":
+        always_n = int(cfg.block_params.get("always_fraction", 0.33) * n_blocks)
+        cacheable[:always_n] = False
+
+    elif cfg.block_mode in ("split_groups", "dynamic"):
+        g1 = max(n_blocks // 3, 1)
+        g2 = max(2 * n_blocks // 3, g1 + 1)
+        boundaries = [(0, g1), (g1, g2), (g2, n_blocks)]
+
+        if cfg.block_mode == "split_groups":
+            cache_groups = set(cfg.block_params.get("cache_groups", []))
+            if not cache_groups:
+                return cacheable
+            cacheable[:] = False
+            for gi in cache_groups:
+                if gi < len(boundaries):
+                    s, e = boundaries[gi]
+                    cacheable[s:e] = True
+        else:
+            cacheable[:g2] = False
+
+    return cacheable
 
 
 def _simulate_config_per_group(
@@ -273,8 +306,8 @@ def _simulate_config_per_group(
     """Simulate per_group config: 3 independent accumulators.
 
     Each group uses its own accumulation type, params, and schedule from
-    block_params.per_group.groups.  Skip rate is weighted by group block
-    counts; error is averaged across groups.
+    block_params.per_group.groups.  Skip rate and error are both weighted
+    by group block counts so larger groups contribute proportionally.
     """
     pg = cfg.block_params.get("per_group", {})
     group_configs = pg.get("groups", [])
@@ -284,17 +317,22 @@ def _simulate_config_per_group(
     n_groups = len(group_configs)
 
     # Estimate n_blocks from first group with per-block data
-    n_blocks = 28
+    n_blocks = None
     for g in sim_data.groups:
         if g.block_cos_sim is not None:
             n_blocks = g.block_cos_sim.shape[0]
             break
+    if n_blocks is None:
+        raise RuntimeError(
+            "per_group simulation requires per-block cosine similarity data "
+            "(run calibration with record_block_data=true)"
+        )
 
     group_sizes = [n_blocks // n_groups] * n_groups
     group_sizes[-1] += n_blocks % n_groups
 
     total_weighted_skip = 0
-    total_error = 0.0
+    total_weighted_error = 0.0
     total_steps = 0
 
     for group in sim_data.groups:
@@ -330,14 +368,14 @@ def _simulate_config_per_group(
 
         for gi in range(n_groups):
             total_weighted_skip += group_skip_counts[gi] * group_sizes[gi]
-            total_error += group_errors[gi]
+            total_weighted_error += group_errors[gi] * group_sizes[gi]
         total_steps += group.n_steps
 
     if total_steps == 0:
         return 0.0, 0.0, 1.0, 1.0
 
     skip_rate = total_weighted_skip / (n_blocks * total_steps)
-    avg_error = total_error / (n_groups * total_steps)
+    avg_error = total_weighted_error / (n_blocks * total_steps)
     bf = 0.85
     speedup = (1.0 / (1.0 - skip_rate * bf)
                if bf > 0 and skip_rate * bf < 1.0 else 1.0)
