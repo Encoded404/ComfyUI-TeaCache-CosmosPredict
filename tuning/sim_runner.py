@@ -87,6 +87,65 @@ def _block_fraction(cfg: TeacacheConfig, default: float = 0.85) -> float:
     return default
 
 
+def _compute_block_cosim_means(
+    groups: tuple,
+) -> Optional[np.ndarray]:
+    """Compute per-block mean cosine similarity across all groups.
+
+    Returns (n_blocks,) float64 array of averages, or None if no per-block data.
+    """
+    all_means = []
+    n_blocks = None
+    for g in groups:
+        if g.block_cos_sim is not None:
+            means = np.nanmean(g.block_cos_sim, axis=1)  # (n_blocks,)
+            all_means.append(means)
+            if n_blocks is None:
+                n_blocks = g.block_cos_sim.shape[0]
+    if not all_means:
+        return None
+    stacked = np.stack(all_means, axis=-1)  # (n_blocks, n_groups)
+    return np.nanmean(stacked, axis=-1)  # (n_blocks,)
+
+
+def _inject_data_driven_block_params(
+    cfg: TeacacheConfig,
+    block_cosim_means: np.ndarray,  # (n_blocks,) precomputed mean cos_sim per block
+) -> None:
+    """Inject learned block_params from per-block cosine similarity means.
+
+    For split_groups: partitions blocks into 3 groups and classifies each as
+    always-run or cacheable based on cosim_threshold. Stores always_groups
+    and cache_groups (group indices) in cfg.block_params.
+
+    For dynamic (unified): computes per-block sensitivity multipliers
+    normalized so 1.0 = average sensitivity.
+    """
+    n_blocks = len(block_cosim_means)
+
+    if cfg.block_mode == "split_groups":
+        split1 = max(n_blocks // 3, 1)
+        split2 = max(2 * n_blocks // 3, split1 + 1)
+        boundaries = [(0, split1), (split1, split2), (split2, n_blocks)]
+        boundaries = [(s, e) for s, e in boundaries if e > s]
+
+        always_groups, cache_groups = [], []
+        for gi, (s, e) in enumerate(boundaries):
+            group_mean = float(np.nanmean(block_cosim_means[s:e]))
+            if group_mean > cfg.cosim_threshold:
+                cache_groups.append(gi)
+            else:
+                always_groups.append(gi)
+
+        cfg.block_params["always_groups"] = always_groups
+        cfg.block_params["cache_groups"] = cache_groups
+
+    elif cfg.block_mode == "dynamic":
+        avg_sensitivity = float(np.nanmean(1.0 - block_cosim_means))
+        if avg_sensitivity > 1e-8:
+            cfg.block_params["sensitivity"] = ((1.0 - block_cosim_means) / avg_sensitivity).tolist()
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  Public API
 # ═══════════════════════════════════════════════════════════════════════════
