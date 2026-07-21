@@ -671,6 +671,7 @@ def teacache_anima_forward(
                                     x_B_T_H_W_D[i * b : (i + 1) * b], resid,
                                     cfg.residual_strategy, confidence=conf, params=cfg.residual_params,
                                 )
+    else:
         # ── Knob 8: Run blocks (with optional splitting for residuals) ──
         ori_x = x_B_T_H_W_D.to(cache_device)
 
