@@ -1253,6 +1253,18 @@ def optimize(configs: List[TeacacheConfig],
                           f"sp={sp:.2f}x  score={score:.3f}      ",
                           end="", flush=True)
 
+        for cfg in unique_signal_configs:
+            key = _poly_fit_key(cfg)
+            params = mapping_cache.get(key, {})
+            if cfg.mapping_type == "polynomial":
+                cfg.coefficients = params.get("coefficients", [])
+            elif cfg.mapping_type == "power_law":
+                if "k" in params:
+                    cfg.mapping_params = {"k": params["k"], "alpha": params["alpha"]}
+            elif cfg.mapping_type == "softplus":
+                if "k" in params:
+                    cfg.mapping_params = {"k": params["k"], "offset": params["offset"]}
+
         for i, r in enumerate(results_list):
             cfg = unique_signal_configs[i]
             sig = _signal_signature(cfg)
