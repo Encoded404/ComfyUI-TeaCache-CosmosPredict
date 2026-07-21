@@ -255,11 +255,14 @@ def _signal_signature(cfg: TeacacheConfig) -> tuple:
         cfg.mapping_type,
         tuple(sorted(cfg.mapping_params.items())),
         # Note: coefficients are intentionally left out (fitted per key)
-        cfg.accumulation_type,
-        tuple(sorted(cfg.accumulation_params.items())),
-        cfg.step_schedule,
-        cfg.block_level,
     )
+    if cfg.block_level != "per_group":
+        sig += (
+            cfg.accumulation_type,
+            tuple(sorted(cfg.accumulation_params.items())),
+            cfg.step_schedule,
+        )
+    sig += (cfg.block_level,)
     if cfg.block_level == "per_group" and isinstance(cfg.block_params.get("per_group"), dict):
         # Hash the per-group configs to differentiate group combos
         pg = cfg.block_params["per_group"]
@@ -591,6 +594,117 @@ def _generate_per_group_configs(opt: dict, scope: list) -> list:
     return combos
 
 
+def _count_candidates(tcfg, entries, auto_scales, has_per_block, block_modes):
+    """Count total candidate configs without constructing them."""
+    opt = tcfg.optimization
+    count = 0
+    for source in opt["sources"]:
+        for metric_type in opt["metric_types"]:
+            for metric_weights_scenario in opt["metric_weights_scenarios"]:
+                if metric_type == "mean_only" and metric_weights_scenario != {"mean": 1.0}:
+                    continue
+                if metric_type == "mean_and_max" and set(metric_weights_scenario.keys()) != {"mean", "max"}:
+                    continue
+                for mapping_type in opt["mapping_types"]:
+                    mapping_params_list = [{}]
+                    if mapping_type == "polynomial":
+                        mapping_params_list = [{"poly_degree": d} for d in opt.get("poly_degrees", [4])]
+                    else:
+                        mapping_type_key = opt.get("mapping_params_scenarios", {}).get(mapping_type, [])
+                        if mapping_type_key:
+                            mapping_params_list = mapping_type_key
+                    for mapping_params in mapping_params_list:
+                        if source == "pooled_latent":
+                            pl_mode = opt.get("pooled_latent_mode", "mean")
+                            if "pooled_latent_mode" not in mapping_params:
+                                mapping_params = dict(mapping_params, pooled_latent_mode=pl_mode)
+                        for accum_type in opt["accumulation_types"]:
+                            accum_params_list = expand_sweeps(opt["accumulation_params"])
+                            for accum_params_dict in accum_params_list:
+                                if accum_type == "hard_reset" and accum_params_dict != {}:
+                                    continue
+                                if accum_type == "carry_over" and accum_params_dict != {}:
+                                    continue
+                                if accum_type == "leaky" and "leak_factor" not in accum_params_dict:
+                                    continue
+                                if accum_type == "windowed" and "window_size" not in accum_params_dict:
+                                    continue
+                                for schedule in opt["step_schedules"]:
+                                    scales = opt["signal_scales"].get(source, [1.0])
+                                    if source in auto_scales and auto_scales[source]:
+                                        extra = [s for s in auto_scales[source] if s not in scales]
+                                        scales = list(scales) + extra
+                                    for scale in scales:
+                                        for residual_strat in opt["residual_strategies"]:
+                                            res_params_list = [{}]
+                                            if residual_strat in ("blended", "scaled"):
+                                                res_params_list = opt.get("residual_params_scenarios", [{}])
+                                            for res_params in res_params_list:
+                                                for block_mode in block_modes:
+                                                    cosim_thresh_iter = [0.95]
+                                                    if block_mode in ("split_groups", "dynamic"):
+                                                        cosim_thresh_iter = [v["cosim_threshold"] for v in expand_sweeps(opt.get("cosim_thresholds", [{"param": "cosim_threshold", "start": 0.95, "end": 0.95, "steps": 1}]))]
+                                                    for cosim_thresh in cosim_thresh_iter:
+                                                        block_level_iter = ["unified"]
+                                                        if block_mode == "dynamic":
+                                                            block_level_iter = opt.get("block_levels", ["unified"])
+                                                        for block_level in block_level_iter:
+                                                            if block_mode == "dynamic" and block_level == "per_group":
+                                                                continue
+                                                            block_params_list = [{}]
+                                                            block_scenarios = opt.get("block_params_scenarios", {})
+                                                            if block_mode in block_scenarios:
+                                                                block_params_list = expand_sweeps(block_scenarios[block_mode])
+                                                            for _block_params in block_params_list:
+                                                                count += 1
+    if "dynamic" in block_modes and "per_group" in opt.get("block_levels", []):
+        scope = opt.get("block_level_config_scope", ["*"])
+        group_combos = _generate_per_group_configs(opt, scope)
+        cosim_thresh_list = expand_sweeps(opt.get("cosim_thresholds", [{"param": "cosim_threshold", "start": 0.95, "end": 0.95, "steps": 1}]))
+        cosim_thresh_values = [v.get("cosim_threshold", 0.95) for v in cosim_thresh_list if "cosim_threshold" in v]
+        if not cosim_thresh_values:
+            cosim_thresh_values = [0.95]
+        for source in opt["sources"]:
+            for metric_type in opt["metric_types"]:
+                for metric_weights_scenario in opt["metric_weights_scenarios"]:
+                    if metric_type == "mean_only" and metric_weights_scenario != {"mean": 1.0}:
+                        continue
+                    if metric_type == "mean_and_max" and set(metric_weights_scenario.keys()) != {"mean", "max"}:
+                        continue
+                    for mapping_type in opt["mapping_types"]:
+                        mapping_params_list = [{}]
+                        if mapping_type == "polynomial":
+                            mapping_params_list = [{"poly_degree": d} for d in opt.get("poly_degrees", [4])]
+                        else:
+                            mps = opt.get("mapping_params_scenarios", {}).get(mapping_type, [])
+                            if mps:
+                                mapping_params_list = mps
+                        for mapping_params in mapping_params_list:
+                            if source == "pooled_latent":
+                                pl_mode = opt.get("pooled_latent_mode", "mean")
+                                if "pooled_latent_mode" not in mapping_params:
+                                    mapping_params = dict(mapping_params, pooled_latent_mode=pl_mode)
+                            scales = opt["signal_scales"].get(source, [1.0])
+                            if source in auto_scales and auto_scales[source]:
+                                extra = [s for s in auto_scales[source] if s not in scales]
+                                scales = list(scales) + extra
+                            for scale in scales:
+                                for residual_strat in opt["residual_strategies"]:
+                                    res_params_list = [{}]
+                                    if residual_strat in ("blended", "scaled"):
+                                        res_params_list = opt.get("residual_params_scenarios", [{}])
+                                    for res_params in res_params_list:
+                                        for cosim_thresh in cosim_thresh_values:
+                                            for g0 in group_combos:
+                                                for g1 in group_combos:
+                                                    for g2 in group_combos:
+                                                        count += 1
+    max_cap = opt.get("max_candidates", 0)
+    if max_cap > 0 and count > max_cap:
+        count = max_cap
+    return count
+
+
 def generate_candidate_configs(tcfg: TuningConfig,
                                 entries: Optional[List[CalibrationEntry]] = None,
                                 ) -> List[TeacacheConfig]:
@@ -637,6 +751,12 @@ def generate_candidate_configs(tcfg: TuningConfig,
     block_modes = list(opt.get("block_modes", ["all_or_nothing"]))
     if not has_per_block:
         block_modes = [m for m in block_modes if m != "dynamic"]
+
+    total = _count_candidates(tcfg, entries, auto_scales, has_per_block, block_modes)
+    print(f"  [candidates] Total to generate: {total}")
+    start_time = time_mod.time()
+    generated = 0
+    _log_interval = max(1, total // 100)
 
     for source in opt["sources"]:
         for metric_type in opt["metric_types"]:
@@ -701,30 +821,8 @@ def generate_candidate_configs(tcfg: TuningConfig,
                                                             block_level_iter = opt.get("block_levels", ["unified"])
 
                                                         for block_level in block_level_iter:
-                                                            # Per-group: deterministic product of group combos
                                                             if block_mode == "dynamic" and block_level == "per_group":
-                                                                scope = opt.get("block_level_config_scope", ["*"])
-                                                                group_combos = _generate_per_group_configs(opt, scope)
-                                                                for g0 in group_combos:
-                                                                    for g1 in group_combos:
-                                                                        for g2 in group_combos:
-                                                                            cfg = TeacacheConfig(
-                                                                                source=source, metric_type=metric_type,
-                                                                                metric_weights=metric_weights_scenario,
-                                                                                signal_scale=scale, mapping_type=mapping_type,
-                                                                                coefficients=[], mapping_params=mapping_params,
-                                                                                accumulation_type=accum_type,
-                                                                                accumulation_params=accum_params_dict,
-                                                                                step_schedule=schedule,
-                                                                                start_percent=0.05, end_percent=0.95,
-                                                                                residual_strategy=residual_strat,
-                                                                                residual_params=res_params,
-                                                                                block_mode=block_mode,
-                                                                                cosim_threshold=0.95,  # unused by per_group sim
-                                                                                block_level=block_level,
-                                                                                block_params={"per_group": {"groups": [g0, g1, g2]}},
-                                                                            )
-                                                                            configs.append(cfg)
+                                                                continue  # handled in separate per_group pass
                                                             else:
                                                                 # Non-per-group modes: sweep block_params scenarios
                                                                 block_params_list = [{}]
@@ -750,6 +848,92 @@ def generate_candidate_configs(tcfg: TuningConfig,
                                                                         block_params=dict(block_params),
                                                                     )
                                                                     configs.append(cfg)
+                                                                    generated += 1
+                                                                    if generated == total or generated % _log_interval == 0 or generated == 1:
+                                                                        elapsed = time_mod.time() - start_time
+                                                                        eta = elapsed / generated * (total - generated) if generated > 0 else 0
+                                                                        print(f"\r  [{generated:>5d}/{total}] "
+                                                                              f"{generated/total*100:5.1f}%  "
+                                                                              f"elapsed={elapsed:.0f}s  ETA={eta:.0f}s      ",
+                                                                              end="", flush=True)
+
+    # ── Per-group accumulator configs (separate pass — outside global accum loops) ──
+    if "dynamic" in block_modes and "per_group" in opt.get("block_levels", []):
+        scope = opt.get("block_level_config_scope", ["*"])
+        group_combos = _generate_per_group_configs(opt, scope)
+        cosim_thresh_list = expand_sweeps(opt.get("cosim_thresholds", [
+            {"param": "cosim_threshold", "start": 0.95, "end": 0.95, "steps": 1}
+        ]))
+        cosim_thresh_values = [v.get("cosim_threshold", 0.95) for v in cosim_thresh_list if "cosim_threshold" in v]
+        if not cosim_thresh_values:
+            cosim_thresh_values = [0.95]
+
+        for source in opt["sources"]:
+            for metric_type in opt["metric_types"]:
+                for metric_weights_scenario in opt["metric_weights_scenarios"]:
+                    if metric_type == "mean_only" and metric_weights_scenario != {"mean": 1.0}:
+                        continue
+                    if metric_type == "mean_and_max" and set(metric_weights_scenario.keys()) != {"mean", "max"}:
+                        continue
+                    for mapping_type in opt["mapping_types"]:
+                        mapping_params_list = [{}]
+                        if mapping_type == "polynomial":
+                            mapping_params_list = [
+                                {"poly_degree": d}
+                                for d in opt.get("poly_degrees", [4])
+                            ]
+                        else:
+                            mps = opt.get("mapping_params_scenarios", {}).get(mapping_type, [])
+                            if mps:
+                                mapping_params_list = mps
+                        for mapping_params in mapping_params_list:
+                            if source == "pooled_latent":
+                                pl_mode = opt.get("pooled_latent_mode", "mean")
+                                if "pooled_latent_mode" not in mapping_params:
+                                    mapping_params = dict(mapping_params, pooled_latent_mode=pl_mode)
+                            scales = opt["signal_scales"].get(source, [1.0])
+                            if source in auto_scales and auto_scales[source]:
+                                extra = [s for s in auto_scales[source] if s not in scales]
+                                scales = list(scales) + extra
+                            for scale in scales:
+                                for residual_strat in opt["residual_strategies"]:
+                                    res_params_list = [{}]
+                                    if residual_strat in ("blended", "scaled"):
+                                        res_params_list = opt.get("residual_params_scenarios", [{}])
+                                    for res_params in res_params_list:
+                                        for cosim_thresh in cosim_thresh_values:
+                                            for g0 in group_combos:
+                                                for g1 in group_combos:
+                                                    for g2 in group_combos:
+                                                        cfg = TeacacheConfig(
+                                                            source=source,
+                                                            metric_type=metric_type,
+                                                            metric_weights=metric_weights_scenario,
+                                                            signal_scale=scale,
+                                                            mapping_type=mapping_type,
+                                                            coefficients=[],
+                                                            mapping_params=mapping_params,
+                                                            accumulation_type="per_group",
+                                                            accumulation_params={},
+                                                            step_schedule="constant",
+                                                            start_percent=0.05,
+                                                            end_percent=0.95,
+                                                            residual_strategy=residual_strat,
+                                                            residual_params=res_params,
+                                                            block_mode="dynamic",
+                                                            cosim_threshold=cosim_thresh,
+                                                            block_level="per_group",
+                                                            block_params={"per_group": {"groups": [g0, g1, g2]}},
+                                                        )
+                                                        configs.append(cfg)
+                                                        generated += 1
+                                                        if generated == total or generated % _log_interval == 0 or generated == 1:
+                                                            elapsed = time_mod.time() - start_time
+                                                            eta = elapsed / generated * (total - generated) if generated > 0 else 0
+                                                            print(f"\r  [{generated:>5d}/{total}] "
+                                                                  f"{generated/total*100:5.1f}%  "
+                                                                  f"elapsed={elapsed:.0f}s  ETA={eta:.0f}s      ",
+                                                                  end="", flush=True)
 
     # ── Cap total candidates if configured ────────────────────────────
     max_cap = opt.get("max_candidates", 0)
@@ -760,7 +944,7 @@ def generate_candidate_configs(tcfg: TuningConfig,
         print(f"  [cap] Sampled {len(configs)}/{max_cap} candidates "
               f"(full pool had {len(configs)})")
 
-    print(f"[candidates] Generated {len(configs)} candidate configurations")
+    print()
     return configs
 
 
@@ -960,9 +1144,9 @@ def optimize(configs: List[TeacacheConfig],
                 start_percent=bc.start_percent,
                 end_percent=bc.end_percent,
                 block_mode=full_cfg.block_mode,
-                block_params=full_cfg.block_params,
+                block_params=dict(full_cfg.block_params),
                 residual_strategy=full_cfg.residual_strategy,
-                residual_params=full_cfg.residual_params,
+                residual_params=dict(full_cfg.residual_params),
                 cross_feed_enabled=full_cfg.cross_feed_enabled,
                 cross_feed_strength=full_cfg.cross_feed_strength,
                 cosim_threshold=full_cfg.cosim_threshold,
