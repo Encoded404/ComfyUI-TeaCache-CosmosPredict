@@ -164,9 +164,11 @@ def make_calibration_forward(source_hint: str = "all"):
         # ── Per-block output tracking (if enabled) ──
         track_per_block = getattr(self, "_calib_track_per_block", False)
         if track_per_block:
-            if not hasattr(self, "_calib_block_prev"):
-                self._calib_block_prev = [None] * len(self.blocks)
-                self._calib_block_deltas = [[] for _ in range(len(self.blocks))]
+            if not hasattr(self, "_calib_block_prevs"):
+                self._calib_block_prevs = [None] * len(self.blocks)
+                self._calib_block_currs = [None] * len(self.blocks)
+                self._calib_block_deltas = []  # flat list of (bi, cos_sim) for this step
+            self._calib_block_currs = [None] * len(self.blocks)
 
         for bi, block in enumerate(self.blocks):
             x_B_T_H_W_D = block(
@@ -174,12 +176,19 @@ def make_calibration_forward(source_hint: str = "all"):
             )
             if track_per_block:
                 block_out = x_B_T_H_W_D.detach().to(cache_device)
-                if self._calib_block_prev[bi] is not None:
-                    a = self._calib_block_prev[bi].flatten()
-                    b = block_out.flatten()
+                self._calib_block_currs[bi] = block_out
+
+        # ── Per-block cosine similarity (deferred outside the block loop) ──
+        if track_per_block:
+            for bi in range(len(self.blocks)):
+                curr = self._calib_block_currs[bi]
+                prev = self._calib_block_prevs[bi]
+                if prev is not None and curr is not None:
+                    a = prev.flatten()
+                    b = curr.flatten()
                     cos_sim = float((a @ b) / (a.norm() * b.norm() + 1e-8))
-                    self._calib_block_deltas[bi].append(cos_sim)
-                self._calib_block_prev[bi] = block_out
+                    self._calib_block_deltas.append((bi, cos_sim))
+                self._calib_block_prevs[bi] = curr.clone() if curr is not None else None
 
         residual = (x_B_T_H_W_D.to(cache_device) - ori_x).detach()
 
@@ -217,17 +226,14 @@ def make_calibration_forward(source_hint: str = "all"):
             state["prev_residual"] = curr_res
 
         # ── Per-block cos_sim attachment ──
-        if track_per_block:
-            cos_sim_map = {}
-            for bi in range(len(self.blocks)):
-                if bi < len(self._calib_block_deltas) and self._calib_block_deltas[bi]:
-                    cos_sim_map[bi] = self._calib_block_deltas[bi][-1]
-            if cos_sim_map:
-                for entry in reversed(self.calibration_log):
-                    if entry.step == current_step:
-                        entry.block_cos_sims = dict(cos_sim_map)
-                    if entry.step < current_step:
-                        break
+        if track_per_block and self._calib_block_deltas:
+            cos_sim_map = dict(self._calib_block_deltas)
+            for entry in reversed(self.calibration_log):
+                if entry.step == current_step:
+                    entry.block_cos_sims = dict(cos_sim_map)
+                if entry.step < current_step:
+                    break
+            self._calib_block_deltas = []  # clear for next step
 
         # ── Final layer + unpatchify ──
         x_out = self.final_layer(

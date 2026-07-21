@@ -75,7 +75,7 @@ def patch_for_calibration(unet, steps: int, prompt_id: int, seed: int,
     # Reset calibration state
     if hasattr(diffusion_model, "_calib_state"):
         # Also reset per-block tracking state if switching modes
-        for attr in ("_calib_state", "_calib_block_prev", "_calib_block_deltas"):
+        for attr in ("_calib_state", "_calib_block_prevs", "_calib_block_currs", "_calib_block_deltas"):
             if hasattr(diffusion_model, attr):
                 delattr(diffusion_model, attr)
     diffusion_model.calibration_log = []
