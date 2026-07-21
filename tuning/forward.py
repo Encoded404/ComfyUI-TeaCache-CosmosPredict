@@ -342,6 +342,23 @@ def _get_block_split(blocks, cfg) -> tuple:
         cache_blocks = [b for i, b in enumerate(blocks) if i in cache_indices]
         return always_blocks, cache_blocks
 
+    if cfg.block_mode == "dynamic":
+        groups = detect_block_groups(blocks)
+        always_groups = [0, 1]
+        cache_groups = [2]
+        always_indices = set()
+        for g in always_groups:
+            if g < len(groups):
+                s, e = groups[g]
+                always_indices.update(range(s, e))
+        cache_indices = set()
+        for g in cache_groups:
+            if g < len(groups):
+                s, e = groups[g]
+                cache_indices.update(range(s, e))
+        return ([b for i, b in enumerate(blocks) if i in always_indices],
+                [b for i, b in enumerate(blocks) if i in cache_indices])
+
     return list(blocks), []
 
 
@@ -581,7 +598,7 @@ def teacache_anima_forward(
                         x_B_T_H_W_D[i * b : (i + 1) * b], resid,
                         cfg.residual_strategy, confidence=confidence, params=cfg.residual_params,
                     )
-            elif cfg.block_mode in ("split_fraction", "split_groups"):
+            elif cfg.block_mode in ("split_fraction", "split_groups", "dynamic"):
                 # Run always-run blocks, then apply cached late residual
                 always_blocks, cache_blocks = _get_block_split(self.blocks, cfg)
                 for blk in always_blocks:
@@ -604,7 +621,7 @@ def teacache_anima_forward(
             for i, k in enumerate(cond_or_uncond):
                 self.teacache_state[k]["prev_residual"] = residual[i * b : (i + 1) * b]
 
-        elif cfg.block_mode in ("split_fraction", "split_groups"):
+        elif cfg.block_mode in ("split_fraction", "split_groups", "dynamic"):
             always_blocks, cache_blocks = _get_block_split(self.blocks, cfg)
             for blk in always_blocks:
                 x_B_T_H_W_D = blk(x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, **block_kwargs)
@@ -614,7 +631,6 @@ def teacache_anima_forward(
                 x_B_T_H_W_D = blk(x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, **block_kwargs)
             x_final = x_B_T_H_W_D.to(cache_device)
             residual_late = x_final - x_mid
-            # Track per-block output for dead-block detection
             _record_per_block_outputs(self, transformer_options, cache_blocks)
             for i, k in enumerate(cond_or_uncond):
                 self.teacache_state[k]["prev_residual"] = residual_early[i * b : (i + 1) * b]
