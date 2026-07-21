@@ -195,6 +195,12 @@ def make_calibration_forward(source_hint: str = "all"):
         # ── Record ground truth output/residual changes ──
         for i, k in enumerate(cond_or_uncond):
             state = self._calib_state[k]
+            import sys
+            print(f"  [DEBUG] step={current_step} i={i} k={k} b={b} "
+                  f"type={type(x_B_T_H_W_D).__name__} "
+                  f"shape={x_B_T_H_W_D.shape} "
+                  f"device={x_B_T_H_W_D.device} "
+                  f"len_blocks={len(self.blocks)}", file=sys.stderr, flush=True)
             curr_out = x_B_T_H_W_D[i * b : (i + 1) * b].detach()
             curr_res = residual[i * b : (i + 1) * b]
 
