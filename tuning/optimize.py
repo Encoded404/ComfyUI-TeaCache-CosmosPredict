@@ -752,8 +752,9 @@ def generate_candidate_configs(tcfg: TuningConfig,
     if not has_per_block:
         block_modes = [m for m in block_modes if m != "dynamic"]
 
+    print("\r  [candidates] Counting candidate configurations...      ", end="", flush=True)
     total = _count_candidates(tcfg, entries, auto_scales, has_per_block, block_modes)
-    print(f"  [candidates] Total to generate: {total}")
+    print(f"\r  [candidates] Total to generate: {total}")
     start_time = time_mod.time()
     generated = 0
     _log_interval = max(1, total // 100)
