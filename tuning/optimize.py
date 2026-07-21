@@ -261,12 +261,13 @@ def _signal_signature(cfg: TeacacheConfig) -> tuple:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _poly_fit_key(cfg: TeacacheConfig) -> tuple:
-    """Return a hashable key for the polynomial fit that this config needs."""
+    """Return a hashable key for the mapping param fit that this config needs."""
     return (
         cfg.source,
         cfg.metric_type,
         tuple(sorted(cfg.metric_weights.items())),
         cfg.signal_scale,
+        tuple(sorted(cfg.mapping_params.items())),
     )
 
 
@@ -277,6 +278,8 @@ def fit_polynomial_coefficients(
     quiet: bool = False,
 ) -> List[float]:
     """Fit polynomial coefficients using precomputed SimData arrays."""
+    if degree is None or degree <= 0:
+        degree = int(cfg.mapping_params.get("poly_degree", 4))
     xs_list, ys_list = [], []
 
     for group in sim_data.groups:
@@ -338,6 +341,7 @@ def precompute_mapping_params(
             metric_type=key[1],
             metric_weights=dict(key[2]),
             signal_scale=key[3],
+            mapping_params=dict(key[4]) if len(key) > 4 else {},
         )
         mapping_type = None
         for cfg in configs:
@@ -347,7 +351,7 @@ def precompute_mapping_params(
 
         if mapping_type == "polynomial":
             dummy.mapping_type = "polynomial"
-            coeffs = fit_polynomial_coefficients(sim_data, dummy, degree=poly_degree, quiet=True)
+            coeffs = fit_polynomial_coefficients(sim_data, dummy, quiet=True)
             cache[key] = {"coefficients": coeffs}
         elif mapping_type == "power_law":
             params = fit_power_law_params(sim_data, dummy)
@@ -602,11 +606,16 @@ def generate_candidate_configs(tcfg: TuningConfig,
 
                 for mapping_type in opt["mapping_types"]:
                     mapping_params_list = [{}]
-                    mapping_type_key = opt.get("mapping_params_scenarios", {}).get(mapping_type, [])
-                    if mapping_type_key:
-                        mapping_params_list = mapping_type_key
-                    elif mapping_type in ("polynomial", "power_law", "softplus"):
-                        mapping_params_list = [{}]  # fitted from data, single config each
+                    if mapping_type == "polynomial":
+                        mapping_params_list = [
+                            {"poly_degree": d}
+                            for d in opt.get("poly_degrees", [4])
+                        ]
+                    else:
+                        mapping_type_key = opt.get("mapping_params_scenarios", {}).get(mapping_type, [])
+                        if mapping_type_key:
+                            mapping_params_list = mapping_type_key
+                    # power_law, softplus, identity: single [{}]
 
                     for mapping_params in mapping_params_list:
                         if source == "pooled_latent":
@@ -641,7 +650,7 @@ def generate_candidate_configs(tcfg: TuningConfig,
                                                     block_params_list = [{}]
                                                     block_scenarios = opt.get("block_params_scenarios", {})
                                                     if block_mode in block_scenarios:
-                                                        block_params_list = block_scenarios[block_mode]
+                                                        block_params_list = expand_sweeps(block_scenarios[block_mode])
 
                                                     for block_params in block_params_list:
                                                         cfg = TeacacheConfig(
@@ -732,7 +741,6 @@ def optimize(configs: List[TeacacheConfig],
     t_pre = time_mod.time()
     mapping_cache = precompute_mapping_params(
         unique_signal_configs, train_sd,
-        poly_degree=opt.get("poly_degree", 4),
     )
     n_fits = len(mapping_cache)
     t_pre_elapsed = time_mod.time() - t_pre

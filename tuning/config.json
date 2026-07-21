@@ -39,18 +39,7 @@
             {"mean": 0.5, "max": 0.3, "std": 0.2}
         ],
         "mapping_types": ["identity", "polynomial", "power_law", "softplus"],
-        "mapping_params_scenarios": {
-            "power_law": [
-                {"k": 0.5, "alpha": 0.3},
-                {"k": 1.0, "alpha": 0.5},
-                {"k": 0.3, "alpha": 0.7}
-            ],
-            "softplus": [
-                {"k": 10.0, "offset": 0.03},
-                {"k": 10.0, "offset": 0.05},
-                {"k": 5.0,  "offset": 0.10}
-            ]
-        },
+        "poly_degrees": [3, 4, 5],
         "accumulation_types": ["hard_reset", "carry_over", "leaky", "windowed"],
         "accumulation_params": [
             {},
@@ -58,12 +47,7 @@
             {"param": "leak_factor", "start": 0.991, "end": 0.999, "steps": 3, "spacing": "linear"},
             {"param": "window_size", "start": 2, "end": 15, "steps": 12, "spacing": "linear"}
         ],
-        "residual_strategies": ["hard", "blended", "scaled"],
-        "residual_params_scenarios": [
-            {},
-            {"scale": 0.8},
-            {"scale": 0.5}
-        ],
+        "residual_strategies": ["hard"],
         "step_schedules": ["constant", "cosine", "linear_ramp", "linear_decay", "bell"],
         "signal_scales": {
             "t_emb": [10, 50, 100, 200],
@@ -74,14 +58,11 @@
         "block_modes": ["all_or_nothing", "split_fraction", "split_groups", "dynamic"],
         "block_params_scenarios": {
             "split_fraction": [
-                {"always_fraction": 0.25},
-                {"always_fraction": 0.36},
-                {"always_fraction": 0.50}
+                {"param": "always_fraction", "start": 0.05, "end": 0.70, "steps": 10, "spacing": "linear"}
             ],
             "split_groups": [
                 {"always_groups": [0], "cache_groups": [1, 2]},
-                {"always_groups": [0, 1], "cache_groups": [2]},
-                {"always_groups": [0, 1, 2], "cache_groups": []}
+                {"always_groups": [0, 1], "cache_groups": [2]}
             ]
         },
         "candidate_thresholds": [
@@ -89,7 +70,6 @@
         ],
         "pareto_threshold_range": [0.001, 10.0],
         "pareto_threshold_count": 500,
-        "poly_degree": 4,
         "quality_scoring": {
             "type": "thresholded_power",
             "target": 0.05,
