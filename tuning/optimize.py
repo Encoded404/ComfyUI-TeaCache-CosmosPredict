@@ -458,7 +458,7 @@ def _process_config(idx_and_cfg: tuple) -> tuple:
         if "k" in params:
             cfg.mapping_params = {"k": params["k"], "offset": params["offset"]}
 
-    thresholds = _worker_opt.get("candidate_thresholds", [0.07])
+    thresholds = expand_thresholds(_worker_opt.get("candidate_thresholds", [0.07]))
     scoring_config = _worker_opt.get("quality_scoring",
                                       {"type": "thresholded_power", "target": 0.05, "power": 3.0})
 
