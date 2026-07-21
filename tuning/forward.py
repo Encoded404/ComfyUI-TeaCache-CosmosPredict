@@ -635,6 +635,18 @@ def teacache_anima_forward(
                         x_B_T_H_W_D[i * b : (i + 1) * b], resid,
                         cfg.residual_strategy, confidence=confidence, params=cfg.residual_params,
                     )
+            elif cfg.block_mode in ("split_fraction", "split_groups", "dynamic") and cfg.block_level != "per_group":
+                # Run always-run blocks, then apply cached late residual
+                always_blocks, cache_blocks = _get_block_split(self.blocks, cfg)
+                for blk in always_blocks:
+                    x_B_T_H_W_D = blk(x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, **block_kwargs)
+                resid_late = state.get("prev_residual_late")
+                if resid_late is not None:
+                    confidence = min(state["accumulated"] / max(effective_thresh, 1e-8), 1.0)
+                    x_B_T_H_W_D[i * b : (i + 1) * b] = apply_residual(
+                        x_B_T_H_W_D[i * b : (i + 1) * b], resid_late,
+                        cfg.residual_strategy, confidence=confidence, params=cfg.residual_params,
+                    )
             elif cfg.block_mode == "dynamic" and cfg.block_level == "per_group":
                 groups = detect_block_groups(self.blocks)
                 for gi, (s, e) in enumerate(groups):
@@ -669,7 +681,7 @@ def teacache_anima_forward(
             for i, k in enumerate(cond_or_uncond):
                 self.teacache_state[k]["prev_residual"] = residual[i * b : (i + 1) * b]
 
-        elif cfg.block_mode in ("split_fraction", "split_groups", "dynamic"):
+        elif cfg.block_mode in ("split_fraction", "split_groups", "dynamic") and cfg.block_level != "per_group":
             always_blocks, cache_blocks = _get_block_split(self.blocks, cfg)
             for blk in always_blocks:
                 x_B_T_H_W_D = blk(x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, **block_kwargs)
