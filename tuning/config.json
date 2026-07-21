@@ -56,15 +56,14 @@
         },
         "auto_scale_target": 1.0,
         "block_modes": ["all_or_nothing", "split_fraction", "split_groups", "dynamic"],
+        "block_levels": ["unified", "per_group"],
+        "cosim_thresholds": [
+            {"param": "cosim_threshold", "start": 0.85, "end": 0.99, "steps": 5, "spacing": "linear"}
+        ],
         "block_params_scenarios": {
             "split_fraction": [
                 {"param": "always_fraction", "start": 0.05, "end": 0.70, "steps": 10, "spacing": "linear"}
-            ],
-            "split_groups": [
-                {"always_groups": [0], "cache_groups": [1, 2]},
-                {"always_groups": [0, 1], "cache_groups": [2]}
             ]
-        },
         "candidate_thresholds": [
             {"param": "thresh", "start": 0.005, "end": 0.50, "steps": 12, "spacing": "geom"}
         ],
