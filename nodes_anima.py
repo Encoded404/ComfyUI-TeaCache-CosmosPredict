@@ -2,9 +2,13 @@
 
 Two nodes:
   TeaCacheAnima — simple quality slider (0-100), auto-maps to threshold
+                   via error-anchored control points from Pareto frontier
   TeaCacheAnimaAdvanced — all 10 knobs exposed, defaults from presets
 
-The presets are loaded from anima_presets.json in the same directory.
+Presets are loaded from anima_presets.json.  The new format (auto-generated
+by build_presets.py) stores error-anchored control points with full configs.
+The old format (quality_zones with hand-crafted control_points) is still
+supported as a fallback.
 """
 
 from __future__ import annotations
@@ -16,6 +20,13 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 from .tuning.config_types import TeacacheConfig
+
+
+# ── Rough heuristic: LPIPS ≈ accumulated_error × scale ────────────────
+# Calibrated empirically from a few validation runs.  The exact LPIPS
+# value shown in the node is a display hint — users calibrate to their
+# own eyes.  Override in the preset file via _lpips_scale.
+_DEFAULT_LPIPS_SCALE = 6.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -37,61 +48,119 @@ def _load_presets() -> dict:
     return _PRESETS
 
 
-def _get_quality_zone(quality: float) -> dict:
-    presets = _load_presets()
-    for zone in presets.get("quality_zones", []):
-        lo, hi = zone["quality_range"]
-        if lo <= quality <= hi:
-            return zone
-    return None
+def _is_new_format(presets: dict) -> bool:
+    """Return True if presets use the new error-anchored control_points format."""
+    return "control_points" in presets and "quality_zones" not in presets
 
 
-def _quality_to_thresh(quality: float) -> Tuple[float, float, float, dict]:
-    """Map quality 0-100 to (threshold, speedup, lpips, zone).
+# ═══════════════════════════════════════════════════════════════════════════
+#  New format: error-anchored control point interpolation
+# ═══════════════════════════════════════════════════════════════════════════
 
-    Uses nearest-control-point interpolation from the quality zone.
+def _quality_to_config(quality: float, steps: int = 30) -> Tuple[TeacacheConfig, float, float]:
+    """Map quality 0-100 to a full TeacacheConfig via error-anchored control points.
+
+    quality=0  → lowest error tolerance → best quality (near-lossless)
+    quality=100 → highest error tolerance → most speed (aggressive)
+
+    Returns (config, estimated_speedup, lpips_estimate).
     """
-    zone = _get_quality_zone(quality)
-    if zone is None:
-        return 0.07, 1.14, 0.05, {}
+    presets = _load_presets()
+    if not _is_new_format(presets):
+        return _quality_to_config_legacy(quality)
 
-    points = zone["control_points"]
-    points.sort(key=lambda p: p["quality"])
+    points = presets["control_points"]
+    preset_steps = presets.get("_steps", steps)
+    lpips_scale = presets.get("_lpips_scale", _DEFAULT_LPIPS_SCALE)
+    error_range = presets.get("_error_range", [points[0]["error"], points[-1]["error"]])
+
+    points.sort(key=lambda p: p["error"])
+    lo_err, hi_err = error_range
+
+    target_error = lo_err + (quality / 100.0) * (hi_err - lo_err)
+
+    # Find bracketing control points
+    if target_error <= points[0]["error"]:
+        lo = hi = points[0]
+        t = 0.0
+    elif target_error >= points[-1]["error"]:
+        lo = hi = points[-1]
+        t = 1.0
+    else:
+        for i in range(len(points) - 1):
+            if points[i]["error"] <= target_error <= points[i + 1]["error"]:
+                lo, hi = points[i], points[i + 1]
+                span = hi["error"] - lo["error"]
+                t = (target_error - lo["error"]) / span if span > 0 else 0.0
+                break
+        else:
+            lo = hi = points[-1]
+            t = 1.0
+
+    # Threshold: linear interpolation between bracketing points
+    lo_thresh = lo["config"]["rel_l1_thresh"]
+    hi_thresh = hi["config"]["rel_l1_thresh"]
+    thresh = lo_thresh + t * (hi_thresh - lo_thresh)
+
+    # Step-count scaling: fewer steps → larger per-step deltas → higher threshold
+    if preset_steps > 0 and steps > 0 and steps != preset_steps:
+        thresh *= preset_steps / steps
+
+    # Discrete params: snap to nearest control point
+    base_config = hi["config"] if t > 0.5 else lo["config"]
+    cfg = TeacacheConfig.from_dict(base_config)
+    cfg.rel_l1_thresh = round(max(thresh, 0.001), 4)
+
+    # Display hints
+    speedup = lo["speedup"] + t * (hi["speedup"] - lo["speedup"])
+    lpips_est = target_error * lpips_scale
+
+    return cfg, speedup, lpips_est
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Legacy format: quality_zones with hand-crafted control points
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _quality_to_config_legacy(quality: float) -> Tuple[TeacacheConfig, float, float]:
+    """Fallback for old anima_presets.json format (quality_zones)."""
+    presets = _load_presets()
+    zone = None
+    for z in presets.get("quality_zones", []):
+        lo, hi = z["quality_range"]
+        if lo <= quality <= hi:
+            zone = z
+            break
+
+    if zone is None:
+        cfg = TeacacheConfig()
+        return cfg, 1.0, 0.05
+
+    points = sorted(zone["control_points"], key=lambda p: p["quality"])
 
     if quality <= points[0]["quality"]:
         p = points[0]
-        return p["thresh"], p["speedup"], p["lpips"], zone
-    if quality >= points[-1]["quality"]:
+    elif quality >= points[-1]["quality"]:
         p = points[-1]
-        return p["thresh"], p["speedup"], p["lpips"], zone
+    else:
+        for i in range(len(points) - 1):
+            a, b = points[i], points[i + 1]
+            if a["quality"] <= quality <= b["quality"]:
+                t = (quality - a["quality"]) / (b["quality"] - a["quality"])
+                thresh = a["thresh"] + t * (b["thresh"] - a["thresh"])
+                speedup = a["speedup"] + t * (b["speedup"] - a["speedup"])
+                lpips = a["lpips"] + t * (b["lpips"] - a["lpips"])
+                p = {"thresh": thresh, "speedup": speedup, "lpips": lpips}
+                break
+        else:
+            p = points[-1]
 
-    # Linear interpolation between nearest control points
-    for i in range(len(points) - 1):
-        lo, hi = points[i], points[i + 1]
-        if lo["quality"] <= quality <= hi["quality"]:
-            t = (quality - lo["quality"]) / (hi["quality"] - lo["quality"])
-            thresh = lo["thresh"] + t * (hi["thresh"] - lo["thresh"])
-            speedup = lo["speedup"] + t * (hi["speedup"] - lo["speedup"])
-            lpips = lo["lpips"] + t * (hi["lpips"] - lo["lpips"])
-            return thresh, speedup, lpips, zone
-
-    # Fallback
-    p = points[-1]
-    return p["thresh"], p["speedup"], p["lpips"], zone
-
-
-def _build_config(quality: float) -> TeacacheConfig:
-    """Build a TeacacheConfig from presets at the given quality level."""
-    presets = _load_presets()
     defaults = presets.get("defaults", {})
-    thresh, speedup, lpips, zone = _quality_to_thresh(quality)
-
-    # Start with defaults, then apply zone overrides
     cfg_dict = dict(defaults)
     cfg_dict.update(zone.get("config_overrides", {}))
-    cfg_dict["rel_l1_thresh"] = round(thresh, 4)
+    cfg_dict["rel_l1_thresh"] = round(p["thresh"], 4)
 
-    return TeacacheConfig.from_dict(cfg_dict)
+    return TeacacheConfig.from_dict(cfg_dict), p["speedup"], p["lpips"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -155,10 +224,12 @@ class TeaCacheAnima:
     """Simple TeaCache node with a quality slider for Anima/Cosmos.
 
     Connects after Load Diffusion Model / Load LoRA, before KSampler.
-    The Quality slider controls the speed/quality tradeoff:
-      0 = lossless (no visible change)
-      50 = balanced (recommended, ~1.3x speedup)
-      100 = maximum speed (~2x speedup, noticeable quality drop)
+    The Quality slider maps to accumulated error tolerance via
+    auto-generated control points from the Pareto frontier:
+
+      quality=0 → min error tolerance → near-lossless (LPIPS≈0.01)
+      quality=50 → balanced (~1.3x speedup)
+      quality=100 → max error tolerance → max speed (~2x speedup)
     """
 
     @classmethod
@@ -166,11 +237,11 @@ class TeaCacheAnima:
         return {
             "required": {
                 "model": ("MODEL", {"tooltip": "The Anima diffusion model from Load Diffusion Model."}),
-                "steps": ("INT", {"default": 30, "min": 20, "max": 60, "step": 1,
-                                   "tooltip": "Number of sampling steps in your KSampler."}),
+                "steps": ("INT", {"default": 30, "min": 10, "max": 100, "step": 1,
+                                    "tooltip": "Number of sampling steps in your KSampler. Threshold auto-scales."}),
                 "quality": ("FLOAT", {"default": 50.0, "min": 0.0, "max": 100.0, "step": 1.0,
-                                       "display": "slider",
-                                       "tooltip": "0 = max quality (lossless), 50 = balanced, 100 = max speed"}),
+                                        "display": "slider",
+                                        "tooltip": "0 = max quality (lossless), 50 = balanced, 100 = max speed"}),
             },
         }
 
@@ -179,26 +250,44 @@ class TeaCacheAnima:
     CATEGORY = "TeaCache"
 
     def apply_teacache_anima(self, model, steps, quality):
-        thresh, speedup, lpips, zone = _quality_to_thresh(quality)
-        cfg = _build_config(quality)
+        cfg, speedup, lpips_est = _quality_to_config(quality, steps=steps)
 
         new_model = _apply_teacache(model, cfg)
 
-        # Build info string for the node status
-        label = zone.get("label", "Tuned config")
         info = (
-            f"[{label}]  "
-            f"thresh={thresh:.3f}  "
+            f"err≈{_quality_to_error(quality):.3f}  "
+            f"thresh={cfg.rel_l1_thresh:.3f}  "
             f"est. {speedup:.1f}x  "
-            f"LPIPS≈{lpips:.3f}"
+            f"LPIPS≈{lpips_est:.3f}  "
+            f"src={cfg.source}"
         )
 
-        # ComfyUI node info display
         if hasattr(new_model, "widget_values"):
             new_model.widget_values = info
 
-        print(f"  TeaCacheAnima: quality={quality:.0f} → {info}")
+        print(f"  TeaCacheAnima: quality={quality:.0f} steps={steps} → {info}")
         return (new_model,)
+
+
+def _quality_to_error(quality: float) -> float:
+    """Helper: map quality slider to target accumulated_error (for display)."""
+    presets = _load_presets()
+    if not _is_new_format(presets):
+        # Legacy: approximate from first quality zone
+        for z in presets.get("quality_zones", []):
+            pts = sorted(z["control_points"], key=lambda p: p["quality"])
+            if pts:
+                lo = pts[0]
+                hi = pts[-1]
+                t = quality / 100.0
+                lpips = lo["lpips"] + t * (hi["lpips"] - lo["lpips"])
+                return lpips / _DEFAULT_LPIPS_SCALE
+        return 0.05 * quality / 100.0
+
+    points = presets["control_points"]
+    error_range = presets.get("_error_range", [points[0]["error"], points[-1]["error"]])
+    lo_err, hi_err = error_range
+    return lo_err + (quality / 100.0) * (hi_err - lo_err)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -217,7 +306,7 @@ class TeaCacheAnimaAdvanced:
         return {
             "required": {
                 "model": ("MODEL", {"tooltip": "The Anima diffusion model."}),
-                "steps": ("INT", {"default": 30, "min": 20, "max": 60, "step": 1}),
+                "steps": ("INT", {"default": 30, "min": 10, "max": 100, "step": 1}),
                 "source": (
                     ["t_emb", "first_block_shift", "pooled_latent"],
                     {"default": "pooled_latent",
@@ -229,14 +318,14 @@ class TeaCacheAnimaAdvanced:
                      "tooltip": "How to combine delta statistics into distance."},
                 ),
                 "signal_scale": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 1000.0, "step": 0.1,
-                                             "tooltip": "Multiplier for numerical stability (t_emb needs 50-200)."}),
+                                              "tooltip": "Multiplier for numerical stability (t_emb needs 50-200)."}),
                 "mapping_type": (
                     ["identity", "polynomial", "power_law", "softplus"],
                     {"default": "identity",
                      "tooltip": "How to map distance to predicted output change."},
                 ),
                 "rel_l1_thresh": ("FLOAT", {"default": 0.51, "min": 0.001, "max": 10.0, "step": 0.001,
-                                              "tooltip": "Accumulation threshold. Higher = faster, lower = better quality."}),
+                                               "tooltip": "Accumulation threshold. Higher = faster, lower = better quality."}),
                 "accumulation": (
                     ["hard_reset", "carry_over", "leaky", "windowed"],
                     {"default": "carry_over",
@@ -253,9 +342,9 @@ class TeaCacheAnimaAdvanced:
                      "tooltip": "How cached residual is applied when skipping blocks."},
                 ),
                 "start_percent": ("FLOAT", {"default": 0.05, "min": 0.0, "max": 0.5, "step": 0.01,
-                                              "tooltip": "Don't cache until this fraction of steps."}),
+                                               "tooltip": "Don't cache until this fraction of steps."}),
                 "end_percent": ("FLOAT", {"default": 0.95, "min": 0.5, "max": 1.0, "step": 0.01,
-                                            "tooltip": "Stop caching after this fraction of steps."}),
+                                             "tooltip": "Stop caching after this fraction of steps."}),
                 "block_mode": (
                     ["all_or_nothing", "split_fraction", "split_groups"],
                     {"default": "all_or_nothing",
