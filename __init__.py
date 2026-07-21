@@ -2,6 +2,8 @@ from .nodes import NODE_CLASS_MAPPINGS as NODES_CLASS, NODE_DISPLAY_NAME_MAPPING
 from .nodes_diffusers import NODE_CLASS_MAPPINGS as DIFFUSERS_NODE_CLASS, NODE_DISPLAY_NAME_MAPPINGS as DIFFUSERS_NODES_DISPLAY
 from .nodes_anima import TeaCacheAnima, TeaCacheAnimaAdvanced
 
+WEB_DIRECTORY = "./web"
+
 NODE_CLASS_MAPPINGS = {
     **NODES_CLASS,
     **DIFFUSERS_NODE_CLASS,

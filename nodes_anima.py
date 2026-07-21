@@ -272,9 +272,10 @@ class TeaCacheAnima:
       quality=50 → balanced (~1.3x speedup)
       quality=100 → max error tolerance → max speed (~2x speedup)
 
-    Optional overrides let you change discrete parameters (residual strategy,
-    block mode, accumulation type, step schedule) without leaving the auto
-    slider. Left at "auto", they use the preset's own value.
+    A collapsible override section (toggle in the node) reveals optional
+    parameter overrides.  When a dropdown's value changes, relevant sub-
+    widgets appear automatically (e.g. residual_blend when residual_strategy
+    is "blended").  The override state survives workflow save and reload.
     """
 
     @classmethod
@@ -286,54 +287,45 @@ class TeaCacheAnima:
                                         "display": "slider",
                                         "tooltip": "0 = max quality (lossless), 50 = balanced, 100 = max speed"}),
             },
-            "optional": {
-                "residual_strategy": (
-                    ["auto", "hard", "blended", "scaled"],
-                    {"default": "auto",
-                     "tooltip": "Override residual application. 'auto' uses the preset's strategy."},
-                ),
-                "block_mode": (
-                    ["auto", "all_or_nothing", "split_fraction", "split_groups"],
-                    {"default": "auto",
-                     "tooltip": "Override which blocks to cache. 'auto' uses the preset's mode."},
-                ),
-                "accumulation_type": (
-                    ["auto", "hard_reset", "carry_over", "leaky", "windowed"],
-                    {"default": "auto",
-                     "tooltip": "Override how distance accumulates. 'auto' uses the preset's type."},
-                ),
-                "step_schedule": (
-                    ["auto", "constant", "cosine", "linear_ramp", "linear_decay", "bell"],
-                    {"default": "auto",
-                     "tooltip": "Override how threshold varies across steps. 'auto' uses the preset's schedule."},
-                ),
-            },
         }
 
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "apply_teacache_anima"
     CATEGORY = "TeaCache"
 
-    def apply_teacache_anima(self, model, quality,
-                              residual_strategy="auto",
-                              block_mode="auto",
-                              accumulation_type="auto",
-                              step_schedule="auto"):
+    def apply_teacache_anima(self, model, quality, **kwargs):
         cfg, speedup, lpips_est, preset_steps = _quality_to_config(quality)
 
         overrides = []
-        if residual_strategy != "auto":
-            cfg.residual_strategy = residual_strategy
-            overrides.append(f"res={residual_strategy}")
-        if block_mode != "auto":
-            cfg.block_mode = block_mode
-            overrides.append(f"blk={block_mode}")
-        if accumulation_type != "auto":
-            cfg.accumulation_type = accumulation_type
-            overrides.append(f"acc={accumulation_type}")
-        if step_schedule != "auto":
-            cfg.step_schedule = step_schedule
-            overrides.append(f"sched={step_schedule}")
+        if kwargs.get("residual_strategy", "auto") != "auto":
+            cfg.residual_strategy = kwargs["residual_strategy"]
+            overrides.append(f"res={kwargs['residual_strategy']}")
+        if kwargs.get("block_mode", "auto") != "auto":
+            cfg.block_mode = kwargs["block_mode"]
+            overrides.append(f"blk={kwargs['block_mode']}")
+        if kwargs.get("accumulation_type", "auto") != "auto":
+            cfg.accumulation_type = kwargs["accumulation_type"]
+            overrides.append(f"acc={kwargs['accumulation_type']}")
+        if kwargs.get("step_schedule", "auto") != "auto":
+            cfg.step_schedule = kwargs["step_schedule"]
+            overrides.append(f"sched={kwargs['step_schedule']}")
+
+        # Conditional sub-parameters
+        if "residual_blend" in kwargs:
+            cfg.residual_params = {"scale": kwargs["residual_blend"]}
+            overrides.append(f"blend={kwargs['residual_blend']}")
+        if "residual_scale" in kwargs:
+            cfg.residual_params = {"scale": kwargs["residual_scale"]}
+            overrides.append(f"rscale={kwargs['residual_scale']}")
+        if "leak_factor" in kwargs:
+            cfg.accumulation_params = {"leak_factor": kwargs["leak_factor"]}
+            overrides.append(f"leak={kwargs['leak_factor']}")
+        if "window_size" in kwargs:
+            cfg.accumulation_params = {"window_size": int(kwargs["window_size"])}
+            overrides.append(f"win={kwargs['window_size']}")
+        if "always_fraction" in kwargs:
+            cfg.block_params["always_fraction"] = kwargs["always_fraction"]
+            overrides.append(f"frac={kwargs['always_fraction']}")
 
         new_model = _apply_teacache(model, cfg, preset_steps=preset_steps)
 
