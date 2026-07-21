@@ -26,7 +26,7 @@ from pathlib import Path
 import torch
 
 from .config_types import CalibrationEntry, TuningConfig
-from .utils import load_models, sample, get_diffusion_model, estimate_calibration_time, detect_gpu
+from .utils import load_models, sample, get_diffusion_model, detect_gpu, print_schedule_estimate, print_speed_summary
 from .recorder import make_calibration_forward
 from .prompt_loader import load_prompt_config, select_prompts, resolve_prompt
 
@@ -184,29 +184,30 @@ def run_calibration(comfy_dir: str, config_path: str = None):
 
     total_runs = len(prompts) * len(seeds) * len(step_variants)
     # Estimate entries: each run produces ~ (steps - 1) × 2 cond slots
-    avg_steps = sum(step_variants) / max(len(step_variants), 1)
+    if step_weights and len(step_weights) == len(step_variants):
+        ws = step_weights
+    else:
+        ws = [1.0 / len(step_variants)] * len(step_variants)
+    avg_steps = sum(s * w for s, w in zip(step_variants, ws)) / sum(ws)
     est_entries = int(total_runs * (avg_steps - 1) * 2)
 
-    # Estimate time based on real GPU, step mix, and resolution
     w = tcfg.sampling["width"]
     h = tcfg.sampling["height"]
-    est_seconds, gpu_name, gpu_factor = estimate_calibration_time(
-        total_runs, step_variants, step_weights, w, h,
-    )
+    permutation = f"{len(prompts)} prompts \u00d7 {len(seeds)} seeds \u00d7 {len(step_variants)} step variants = {total_runs} total generations"
 
-    print(f"\n  {'─' * 56}")
-    print(f"  Run schedule")
-    print(f"  {'─' * 56}")
-    print(f"  Permutation:  {len(prompts)} prompts × {len(seeds)} seeds × {len(step_variants)} step variants")
-    print(f"                = {total_runs} total generations")
-    print(f"  GPU:          {gpu_name}  (×{gpu_factor:.1f} vs V100)")
-    print(f"  Resolution:   {w}×{h}")
-    print(f"  Avg. steps:   {avg_steps:.1f} (weighted)")
-    print(f"  Est. entries: ~{est_entries} ({int(est_entries/1000)}k) calibration data points")
-    print(f"  Est. time:    ~{int(est_seconds // 60)}m {int(est_seconds % 60)}s")
-    print(f"  Est. disk:    ~{est_entries * 300 // 1000}k kB  (JSONL)")
-    print(f"  Output dir:   {out_dir}")
-    print(f"  {'─' * 56}\n")
+    print_schedule_estimate(
+        "Calibration run schedule",
+        total_generations=total_runs,
+        avg_steps=avg_steps,
+        width=w,
+        height=h,
+        extra_lines=[
+            f"Permutation:   {permutation}",
+            f"Est. entries: ~{est_entries} ({int(est_entries/1000)}k) calibration data points",
+            f"Est. disk:    ~{est_entries * 300 // 1000}k kB  (JSONL)",
+            f"Output dir:   {out_dir}",
+        ],
+    )
     print(f"  Press Ctrl+C to abort, or wait 3 seconds...")
     try:
         time.sleep(3)
@@ -216,6 +217,7 @@ def run_calibration(comfy_dir: str, config_path: str = None):
 
     all_entries: list[CalibrationEntry] = []
     run_idx = 0
+    total_iterations = 0
     wall_start = time.time()
 
     data_file = out_dir / "calibration_data.jsonl"
@@ -257,6 +259,7 @@ def run_calibration(comfy_dir: str, config_path: str = None):
                     restore_model(dm, original_fwd, unet)
 
                 dt = time.time() - t0
+                total_iterations += steps
                 run_entries = list(dm.calibration_log)
 
                 # Tag entries with step variant info
@@ -289,16 +292,12 @@ def run_calibration(comfy_dir: str, config_path: str = None):
     wall_elapsed = time.time() - wall_start
     valid_all = [e for e in all_entries if e.out_rel > 0]
 
-    it_per_sec = total_runs / wall_elapsed if wall_elapsed > 0 else 0.0
-    if it_per_sec >= 1.0:
-        speed_str = f"{it_per_sec:.1f} it/s"
-    else:
-        speed_str = f"{wall_elapsed / total_runs:.1f} s/it" if total_runs > 0 else "N/A"
-
-    print(f"\n{'=' * 60}")
-    print(f"  Calibration complete")
-    print(f"  Total time:      {int(wall_elapsed // 60)}m {int(wall_elapsed % 60)}s")
-    print(f"  Throughput:      {speed_str}  ({total_runs} runs)")
+    print_speed_summary(
+        label="Calibration complete",
+        total_generations=total_runs,
+        total_iterations=total_iterations,
+        wall_seconds=wall_elapsed,
+    )
     print(f"  Total entries:   {len(all_entries)}")
     print(f"  Valid entries:   {len(valid_all)}  (with out_rel)")
     if record_blocks:

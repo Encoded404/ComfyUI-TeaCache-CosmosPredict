@@ -454,6 +454,112 @@ def estimate_calibration_time(
     return seconds, gpu_name, gpu_factor
 
 
+def estimate_generation_time(
+    total_generations: int,
+    avg_steps: float,
+    width: int = 512,
+    height: int = 512,
+) -> tuple[float, str, float]:
+    """Return (total_seconds, gpu_name, gpu_factor) for a batch of generations.
+
+    Generalised form of estimate_calibration_time — takes a simple avg_steps
+    instead of step_variant/step_weight lists so it works for both calibration
+    and validation phases.
+    """
+    gpu_name, gpu_factor = detect_gpu()
+    pixel_ratio = (width * height) / (512.0 * 512.0)
+    seconds = (total_generations * avg_steps * pixel_ratio *
+               _V100_SECONDS_PER_STEP_AT_512SQ / max(gpu_factor, 0.1))
+    return seconds, gpu_name, gpu_factor
+
+
+def compute_total_iterations(step_counts: dict[int, int]) -> int:
+    """Sum steps × count for all planned generations.
+
+    Args:
+        step_counts: {num_steps: num_generations_at_that_step_count, ...}
+    """
+    return sum(steps * count for steps, count in step_counts.items())
+
+
+def print_schedule_estimate(
+    label: str,
+    total_generations: int,
+    avg_steps: float,
+    width: int,
+    height: int,
+    extra_lines: list[str] | None = None,
+) -> float:
+    """Print a pre-run estimate block and return estimated seconds.
+
+    Example output:
+      ──────────────────────────────────────────────────────────
+      Baseline schedule
+      ──────────────────────────────────────────────────────────
+      Generations:  24
+      Avg. steps:   30.0
+      Resolution:   512×512
+      GPU:          NVIDIA A100  (×2.3 vs V100)
+      Est. time:    ~12m 30s
+      ──────────────────────────────────────────────────────────
+    """
+    secs, gpu, factor = estimate_generation_time(
+        total_generations, avg_steps, width, height,
+    )
+    w = 56
+    print(f"\n  {'─' * w}")
+    print(f"  {label}")
+    print(f"  {'─' * w}")
+    print(f"  Generations:  {total_generations}")
+    print(f"  Avg. steps:   {avg_steps:.1f}")
+    print(f"  Resolution:   {width}×{height}")
+    print(f"  GPU:          {gpu}  (×{factor:.1f} vs V100)")
+    print(f"  Est. time:    ~{int(secs // 60)}m {int(secs % 60)}s")
+    if extra_lines:
+        for line in extra_lines:
+            print(f"  {line}")
+    print(f"  {'─' * w}\n")
+    return secs
+
+
+def print_speed_summary(
+    label: str,
+    total_generations: int,
+    total_iterations: int,
+    wall_seconds: float,
+) -> None:
+    """Print the final throughput report.
+
+    Distinguishes generations/second (images) from actual denoising
+    iterations/second (UNet forward calls).
+
+    Example output:
+      ============================================================
+      Validation complete
+      Total time:        14m 32s
+      Images:            0.08 img/s  (24 images)
+      Denoising steps:   2.5 it/s    (720 iterations)
+      ============================================================
+    """
+    gen_per_sec = total_generations / wall_seconds if wall_seconds > 0 else 0.0
+    it_per_sec = total_iterations / wall_seconds if wall_seconds > 0 else 0.0
+
+    if gen_per_sec >= 1.0:
+        gen_str = f"{gen_per_sec:.1f} img/s  ({total_generations} images)"
+    else:
+        sec_per_gen = wall_seconds / total_generations if total_generations > 0 else 0.0
+        gen_str = f"{sec_per_gen:.1f} s/img  ({total_generations} images)"
+
+    it_str = f"{it_per_sec:.1f} it/s  ({total_iterations} denoising steps)"
+
+    print(f"\n{'=' * 60}")
+    print(f"  {label}")
+    print(f"  Total time:        {int(wall_seconds // 60)}m {int(wall_seconds % 60)}s")
+    print(f"  Throughput:        {gen_str}")
+    print(f"  Throughput:        {it_str}")
+    print(f"{'=' * 60}")
+
+
 def score_from_legend(name: str, val: float) -> str:
     """Rate a metric value using the shared legend thresholds."""
     for n, direction, _, good, mid in METRIC_LEGEND:

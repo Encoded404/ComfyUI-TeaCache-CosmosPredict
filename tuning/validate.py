@@ -32,7 +32,7 @@ from .config_types import (
 from .utils import (
     load_models, sample, get_diffusion_model,
     compute_quality_metrics, img_to_tensor, QualityMetrics,
-    print_metrics_legend,
+    print_metrics_legend, print_schedule_estimate, print_speed_summary,
 )
 from .forward import teacache_anima_forward
 from .prompt_loader import load_prompt_config, select_prompts, resolve_prompt
@@ -222,14 +222,18 @@ def run_single_teacache(
     width: int, height: int,
     cfg_val: float = 5.0,
 ) -> tuple:
-    """Run one TeaCache generation. Returns (image, wall_time_sec).
+    """Run one TeaCache generation. Returns (image, wall_time_sec, total_steps, cached_steps).
 
-    Handles patching, step-tracking wrapper, sampling, and cleanup.
-    Used by both validate_config() and the smoke test.
+    total_steps is the number of denoising steps where TeaCache was active.
+    cached_steps is the number of those steps where caching was used.
     """
     dm = get_diffusion_model(unet)
     if hasattr(dm, "teacache_state"):
         delattr(dm, "teacache_state")
+
+    # Reset diagnostic counters for this generation
+    dm._tc_diag_runs = 0
+    dm._tc_diag_skips = 0
 
     original = dm._forward
     dm._forward = teacache_anima_forward.__get__(dm, dm.__class__)
@@ -271,11 +275,13 @@ def run_single_teacache(
             negative=negative,
         )
         dt = time.time() - t0
+        total_steps = getattr(dm, "_tc_diag_runs", 0)
+        cached_steps = getattr(dm, "_tc_diag_skips", 0)
     finally:
         dm._forward = original
         _cleanup_patch(dm, unet)
 
-    return img, dt
+    return img, dt, total_steps, cached_steps
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Validation core
@@ -304,6 +310,7 @@ def validate_config(
     all_scores: Dict[str, List[float]] = {k: [] for k in metric_names}
     all_speedups: List[float] = []
     all_times: List[float] = []
+    all_skip_rates: List[float] = []
     sampler = tcfg.sampling["sampler"]
     scheduler = tcfg.sampling["scheduler"]
     cfg_val = tcfg.sampling["cfg"]
@@ -319,7 +326,7 @@ def validate_config(
             img_base = bl["image"]
             t_base = bl["time"]
 
-            img_tc, t_tc = run_single_teacache(
+            img_tc, t_tc, total_diag_steps, cached_diag_steps = run_single_teacache(
                 unet, clip, vae,
                 pdata["prompt"], pdata["negative"],
                 cfg,
@@ -333,6 +340,12 @@ def validate_config(
             all_speedups.append(speedup)
             all_times.append(t_tc)
 
+            if total_diag_steps > 0:
+                skip_rate = cached_diag_steps / total_diag_steps
+            else:
+                skip_rate = 0.0
+            all_skip_rates.append(round(skip_rate, 4))
+
             scores = qm.measure(img_tc, img_base)
             for k in metric_names:
                 all_scores[k].append(scores.get(k, float("nan")))
@@ -340,7 +353,8 @@ def validate_config(
             if not quiet:
                 lpips = scores.get("lpips_alex", float("inf"))
                 print(f"  p={pi} s={seed} thresh={cfg.rel_l1_thresh} "
-                      f"speedup={speedup:.2f}x  LPIPS={lpips:.4f}")
+                      f"speedup={speedup:.2f}x  LPIPS={lpips:.4f}  "
+                      f"skip={skip_rate:.1%} ({cached_diag_steps}/{total_diag_steps})")
 
     n = len(all_speedups)
     if n == 0:
@@ -348,12 +362,15 @@ def validate_config(
             config=cfg, mean_speedup=1.0,
             mean_psnr=float("inf"), mean_ssim=1.0, mean_lpips=0.0,
             mean_time_sec=0.0, n_samples=0, mean_metrics={},
+            actual_skip_rate=0.0, skip_rates=[],
         )
 
     mean_metrics = {}
     for k in metric_names:
         vals = [v for v in all_scores[k] if v == v and v != float("inf")]
         mean_metrics[k] = round(sum(vals) / max(len(vals), 1), 4) if vals else float("nan")
+
+    mean_skip = round(sum(all_skip_rates) / len(all_skip_rates), 4) if all_skip_rates else 0.0
 
     return ValidationResult(
         config=cfg,
@@ -364,6 +381,8 @@ def validate_config(
         mean_time_sec=round(sum(all_times) / n, 2),
         n_samples=n,
         mean_metrics=mean_metrics,
+        actual_skip_rate=mean_skip,
+        skip_rates=all_skip_rates,
     )
 
 
@@ -608,13 +627,63 @@ def main():
     print(f"[prompts] {len(prompts)} prompts x {len(seeds)} seeds\n")
 
     # ── Precompute baselines ───────────────────────────────────────────
+    total_per_combo = len(prompts) * len(seeds)
+    total_baseline_images = len(resolutions) * len(step_counts) * total_per_combo
+
+    total_bsl_iterations = 0
+    total_bsl_pixel_steps = 0.0
+    for w, h in resolutions:
+        for s in step_counts:
+            total_bsl_iterations += s * total_per_combo
+            total_bsl_pixel_steps += (w * h) * s * total_per_combo
+    avg_bsl_steps = total_bsl_iterations / total_baseline_images if total_baseline_images > 0 else 1.0
+    est_res = int((total_bsl_pixel_steps / max(total_bsl_iterations, 1)) ** 0.5)
+
+    print_schedule_estimate(
+        label="Baseline generation schedule",
+        total_generations=total_baseline_images,
+        avg_steps=avg_bsl_steps,
+        width=est_res,
+        height=est_res,
+        extra_lines=[
+            f"Resolutions:    {resolutions}",
+            f"Step counts:    {step_counts}",
+            f"Prompts x seeds: {len(prompts)} x {len(seeds)} = {total_per_combo}",
+        ],
+    )
+
+    bsl_start = time.time()
     baselines = precompute_baselines(
         unet, clip, vae, prompts, seeds, resolutions, step_counts, tcfg,
     )
+    bsl_elapsed = time.time() - bsl_start
 
     # ── Validate each (config × resolution × steps) ────────────────────
     all_results: List[tuple] = []  # (ValidationResult, width, height, steps)
     total_validations = len(selected_cfgs) * len(resolutions) * len(step_counts)
+    total_val_images = total_validations * total_per_combo
+
+    val_iterations_per_combo = 0
+    for w, h in resolutions:
+        for s in step_counts:
+            val_iterations_per_combo += s * total_per_combo
+    total_val_iterations = val_iterations_per_combo * len(selected_cfgs)
+
+    print_schedule_estimate(
+        label="Validation schedule",
+        total_generations=total_val_images,
+        avg_steps=avg_bsl_steps,
+        width=est_res,
+        height=est_res,
+        extra_lines=[
+            f"Configs:        {len(selected_cfgs)}",
+            f"Resolutions:    {resolutions}",
+            f"Step counts:    {step_counts}",
+            f"Prompts x seeds: {len(prompts)} x {len(seeds)} = {total_per_combo}",
+        ],
+    )
+
+    val_start = time.time()
     done = 0
 
     for cfg in selected_cfgs:
@@ -631,6 +700,10 @@ def main():
                 )
                 all_results.append((result, w, h, steps))
 
+    val_elapsed = time.time() - val_start
+    sweep_gens = 0
+    sweep_iters = 0
+
     # ── Extra threshold sweeps (at default resolution) ─────────────────
     if do_extra_sweep and extra_sweep_errors:
         sweep_threshes = vcfg.get("extra_threshold_sweep", [
@@ -643,6 +716,7 @@ def main():
         pareto_by_error = sorted(pareto_results,
                                  key=lambda r: r.accumulated_error)
 
+        sweep_start = time.time()
         for target_err in extra_sweep_errors:
             nearest = min(pareto_by_error,
                           key=lambda r: abs(r.accumulated_error - target_err))
@@ -657,12 +731,36 @@ def main():
             )
             for r in sweep_results:
                 all_results.append((r, sw, sh, ssteps))
+            sweep_gens += len(sweep_threshes) * total_per_combo
+            sweep_iters += len(sweep_threshes) * ssteps * total_per_combo
+        sweep_elapsed = time.time() - sweep_start
+        val_elapsed += sweep_elapsed
+        total_val_images += sweep_gens
+        total_val_iterations += sweep_iters
 
     # ── Save results ───────────────────────────────────────────────────
     flat = _build_flat_results(all_results)
     (out_dir / "validation_results.json").write_text(
         json.dumps(flat, indent=2)
     )
+
+    # ── Final speed summary across all GPU work ────────────────────────
+    total_wall = bsl_elapsed + val_elapsed
+    total_images = total_baseline_images + total_val_images
+    total_iterations = total_bsl_iterations + total_val_iterations
+
+    print_speed_summary(
+        label="Validation run complete",
+        total_generations=total_images,
+        total_iterations=total_iterations,
+        wall_seconds=total_wall,
+    )
+    print(f"  Baseline phase:  {int(bsl_elapsed // 60)}m {int(bsl_elapsed % 60)}s  ({total_baseline_images} images)")
+    print(f"  Validation phase:{int(val_elapsed // 60)}m {int(val_elapsed % 60)}s  ({total_val_images} images)")
+    if sweep_gens:
+        print(f"    incl. sweeps:  {sweep_gens} sweep images")
+    print(f"  {'─' * 56}")
+    print(f"  Results saved to: {out_dir}/validation_results.json")
 
     # ── Print summary tables grouped by (resolution, steps) ────────────
     print(f"\n{'=' * 60}")
@@ -689,7 +787,7 @@ def main():
         primary = [r for r in group_results
                    if not hasattr(r.config, '_is_sweep')]
         print(f"\n  {w}x{h} @ {steps} steps  ({n_configs} results)")
-        header = (f"  {'#':>3} | {'source':<20} | {'speed':>6} | "
+        header = (f"  {'#':>3} | {'source':<20} | {'speed':>6} | {'skip':>6} | "
                   + " | ".join(f"{d:>7}" for d in display_names))
         print(header)
         print(f"  {'-' * len(header)}")
@@ -700,7 +798,8 @@ def main():
                 f"{r.mean_metrics.get(n, float('nan')):>7.4f}"
                 for n in metric_names
             )
-            print(f"  {i+1:>3} | {c.source:<20} | {r.mean_speedup:>5.2f}x | {vals}")
+            print(f"  {i+1:>3} | {c.source:<20} | {r.mean_speedup:>5.2f}x | "
+                  f"{r.actual_skip_rate:>5.1%} | {vals}")
 
         # Best by LPIPS < 0.05
         good = [r for r in group_results if not (r.mean_lpips >= 0.05)]

@@ -289,6 +289,8 @@ class ValidationResult:
     mean_time_sec: float
     n_samples: int
     mean_metrics: dict = field(default_factory=dict)
+    actual_skip_rate: float = 0.0
+    skip_rates: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         d = {
@@ -299,6 +301,8 @@ class ValidationResult:
             "mean_lpips": self.mean_lpips,
             "mean_time_sec": self.mean_time_sec,
             "n_samples": self.n_samples,
+            "actual_skip_rate": self.actual_skip_rate,
+            "skip_rates": self.skip_rates,
         }
         if self.mean_metrics:
             d["mean_metrics"] = self.mean_metrics

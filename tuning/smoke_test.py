@@ -393,7 +393,7 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
         cfg_cmp = p["config"]
 
         try:
-            img, dt = run_single_teacache(
+            img, dt, total_steps, cached_steps = run_single_teacache(
                 unet, clip, vae,
                 SMOKE_FULL, SMOKE_NEGATIVE,
                 cfg_cmp,
@@ -403,7 +403,9 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
                 cfg_val=base_run["cfg"],
             )
             su = t_base / max(dt, 0.001)
+            skip_rate = cached_steps / max(total_steps, 1) if total_steps > 0 else 0.0
             print(f"  {label:>14}: thresh={cfg_cmp.rel_l1_thresh:.3f}  {dt:.1f}s  speedup={su:.2f}x  "
+                  f"skip={skip_rate:.1%} ({cached_steps}/{total_steps})  "
                   f"({cfg_cmp.source} {cfg_cmp.metric_type} {cfg_cmp.mapping_type})")
             comparison[label] = {"time": dt, "speedup": su, "thresh": cfg_cmp.rel_l1_thresh, "img": img}
         except Exception as e:
@@ -416,7 +418,7 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
     print(f"  Reference: daraskme config (first_block_shift, polynomial, thresh=0.07)")
     print(f"  Source: github.com/daraskme/comfy_anima_tea_cache")
     try:
-        img_ref, dt_ref = run_single_teacache(
+        img_ref, dt_ref, total_ref, cached_ref = run_single_teacache(
             unet, clip, vae,
             SMOKE_FULL, SMOKE_NEGATIVE,
             DARASKME_CONFIG,
@@ -426,7 +428,9 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
             cfg_val=base_run["cfg"],
         )
         su_ref = t_base / max(dt_ref, 0.001)
-        print(f"  {'daraskme':>14}: thresh={DARASKME_CONFIG.rel_l1_thresh:.3f}  {dt_ref:.1f}s  speedup={su_ref:.2f}x")
+        skip_ref = cached_ref / max(total_ref, 1) if total_ref > 0 else 0.0
+        print(f"  {'daraskme':>14}: thresh={DARASKME_CONFIG.rel_l1_thresh:.3f}  {dt_ref:.1f}s  speedup={su_ref:.2f}x  "
+              f"skip={skip_ref:.1%} ({cached_ref}/{total_ref})")
         comparison["daraskme"] = {"time": dt_ref, "speedup": su_ref,
                                    "thresh": DARASKME_CONFIG.rel_l1_thresh, "img": img_ref}
     except Exception as e:
