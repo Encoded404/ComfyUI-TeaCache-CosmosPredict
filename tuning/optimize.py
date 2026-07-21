@@ -31,8 +31,10 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 import argparse
 import json
 import math
+import random
 import sys
 import time as time_mod
+from itertools import product
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -242,18 +244,29 @@ def _signal_signature(cfg: TeacacheConfig) -> tuple:
 
     Coefficients are NOT included because they are derived from the polyfit
     (keyed by source + metric_type + weights + scale) and populated later.
+
+    block_level + per_group configs ARE included because they change the
+    accumulation pattern and thus produce different simulation results.
     """
-    return (
+    sig = (
         cfg.source,
         cfg.metric_type,
         tuple(sorted(cfg.metric_weights.items())),
         cfg.signal_scale,
         cfg.mapping_type,
         tuple(sorted(cfg.mapping_params.items())),
+        # Note: coefficients are intentionally left out (fitted per key)
         cfg.accumulation_type,
         tuple(sorted(cfg.accumulation_params.items())),
         cfg.step_schedule,
+        cfg.block_level,
     )
+    if cfg.block_level == "per_group" and isinstance(cfg.block_params.get("per_group"), dict):
+        # Hash the per-group configs to differentiate group combos
+        pg = cfg.block_params["per_group"]
+        pg_sig = tuple(sorted((k, str(v)) for k, v in pg.items()))
+        sig += (pg_sig,)
+    return sig
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -549,6 +562,44 @@ def expand_thresholds(specs: list) -> list:
     return result
 
 
+def _generate_per_group_configs(opt: dict, scope: list) -> list:
+    """Return all valid (acc_type, acc_params, schedule) triples for one group.
+
+    When scope contains '*' or specific param names, the corresponding params
+    are varied.  Returns a list of dicts, each with keys matching the scope.
+    """
+    acc_params_list = expand_sweeps(opt["accumulation_params"])
+    combos = []
+    acc_types = opt["accumulation_types"] if ("*" in scope or "accumulation_type" in scope) else [opt.get("default_accumulation_type", "leaky")]
+    schedules = opt["step_schedules"] if ("*" in scope or "step_schedule" in scope) else [opt.get("default_step_schedule", "constant")]
+
+    for acc_type in acc_types:
+        for acc_params in acc_params_list:
+            # skip invalid type/param combos (same logic as main generation)
+            if acc_type == "hard_reset" and acc_params != {}:
+                continue
+            if acc_type == "carry_over" and acc_params != {}:
+                continue
+            if acc_type == "leaky" and "leak_factor" not in acc_params:
+                continue
+            if acc_type == "windowed" and "window_size" not in acc_params:
+                continue
+            for schedule in schedules:
+                combo = {"accumulation_type": acc_type,
+                         "accumulation_params": dict(acc_params),
+                         "step_schedule": schedule}
+                combos.append(combo)
+    return combos
+
+
+def _sample_or_exhaustive(items: list, max_count: int = 0) -> list:
+    """Return items, possibly randomly sampled down to max_count."""
+    if max_count <= 0 or len(items) <= max_count:
+        return items
+    rng = random.Random(42)
+    return rng.sample(items, max_count)
+
+
 def generate_candidate_configs(tcfg: TuningConfig,
                                 entries: Optional[List[CalibrationEntry]] = None,
                                 ) -> List[TeacacheConfig]:
@@ -647,31 +698,76 @@ def generate_candidate_configs(tcfg: TuningConfig,
 
                                             for res_params in res_params_list:
                                                 for block_mode in block_modes:
-                                                    block_params_list = [{}]
-                                                    block_scenarios = opt.get("block_params_scenarios", {})
-                                                    if block_mode in block_scenarios:
-                                                        block_params_list = expand_sweeps(block_scenarios[block_mode])
+                                                    # Sweep cosim_threshold for modes that use it
+                                                    cosim_thresh_iter = [0.95]
+                                                    if block_mode in ("split_groups", "dynamic"):
+                                                        cosim_thresh_iter = [v["cosim_threshold"] for v in expand_sweeps(opt.get("cosim_thresholds", [{"param": "cosim_threshold", "start": 0.95, "end": 0.95, "steps": 1}]))]
 
-                                                    for block_params in block_params_list:
-                                                        cfg = TeacacheConfig(
-                                                            source=source,
-                                                            metric_type=metric_type,
-                                                            metric_weights=metric_weights_scenario,
-                                                            signal_scale=scale,
-                                                            mapping_type=mapping_type,
-                                                            coefficients=[],
-                                                            mapping_params=mapping_params,
-                                                            accumulation_type=accum_type,
-                                                            accumulation_params=accum_params_dict,
-                                                            step_schedule=schedule,
-                                                            start_percent=0.05,
-                                                            end_percent=0.95,
-                                                            residual_strategy=residual_strat,
-                                                            residual_params=res_params,
-                                                            block_mode=block_mode,
-                                                            block_params=block_params,
-                                                        )
-                                                        configs.append(cfg)
+                                                    for cosim_thresh in cosim_thresh_iter:
+                                                        # Block-level variants for dynamic mode
+                                                        block_level_iter = ["unified"]
+                                                        if block_mode == "dynamic":
+                                                            block_level_iter = opt.get("block_levels", ["unified"])
+
+                                                        for block_level in block_level_iter:
+                                                            # Per-group configuration generation
+                                                            if block_mode == "dynamic" and block_level == "per_group":
+                                                                scope = opt.get("block_level_config_scope", ["*"])
+                                                                group_combos = _generate_per_group_configs(opt, scope)
+                                                                max_combos = opt.get("per_group_max_combos", 10000)
+                                                                n_gc = len(group_combos)
+                                                                total_space = n_gc ** 3
+                                                                if max_combos > 0 and total_space > max_combos:
+                                                                    indices = random.sample(range(total_space), min(max_combos, total_space))
+                                                                else:
+                                                                    indices = range(min(total_space, max_combos if max_combos > 0 else total_space))
+                                                                for idx in indices:
+                                                                    i0 = idx % n_gc
+                                                                    i1 = (idx // n_gc) % n_gc
+                                                                    i2 = idx // (n_gc * n_gc)
+                                                                    g0, g1, g2 = group_combos[i0], group_combos[i1], group_combos[i2]
+                                                                    cfg = TeacacheConfig(
+                                                                        source=source, metric_type=metric_type,
+                                                                        metric_weights=metric_weights_scenario,
+                                                                        signal_scale=scale, mapping_type=mapping_type,
+                                                                        coefficients=[], mapping_params=mapping_params,
+                                                                        accumulation_type=accum_type,
+                                                                        accumulation_params=accum_params_dict,
+                                                                        step_schedule=schedule,
+                                                                        start_percent=0.05, end_percent=0.95,
+                                                                        residual_strategy=residual_strat,
+                                                                        residual_params=res_params,
+                                                                        block_mode=block_mode,
+                                                                        cosim_threshold=cosim_thresh,
+                                                                        block_level=block_level,
+                                                                        block_params={"per_group": {"groups": [g0, g1, g2]}},
+                                                                    )
+                                                                    configs.append(cfg)
+                                                            else:
+                                                                # Non-per-group modes: sweep block_params scenarios
+                                                                block_params_list = [{}]
+                                                                block_scenarios = opt.get("block_params_scenarios", {})
+                                                                if block_mode in block_scenarios:
+                                                                    block_params_list = expand_sweeps(block_scenarios[block_mode])
+
+                                                                for block_params in block_params_list:
+                                                                    cfg = TeacacheConfig(
+                                                                        source=source, metric_type=metric_type,
+                                                                        metric_weights=metric_weights_scenario,
+                                                                        signal_scale=scale, mapping_type=mapping_type,
+                                                                        coefficients=[], mapping_params=mapping_params,
+                                                                        accumulation_type=accum_type,
+                                                                        accumulation_params=accum_params_dict,
+                                                                        step_schedule=schedule,
+                                                                        start_percent=0.05, end_percent=0.95,
+                                                                        residual_strategy=residual_strat,
+                                                                        residual_params=res_params,
+                                                                        block_mode=block_mode,
+                                                                        cosim_threshold=cosim_thresh,
+                                                                        block_level=block_level,
+                                                                        block_params=dict(block_params),
+                                                                    )
+                                                                    configs.append(cfg)
 
     # ── Cap total candidates if configured ────────────────────────────
     max_cap = opt.get("max_candidates", 0)
@@ -748,6 +844,20 @@ def optimize(configs: List[TeacacheConfig],
         print(f"  [precompute] {n_fits} unique mapping fits "
               f"in {t_pre_elapsed:.1f}s "
               f"({t_pre_elapsed/max(n_fits,1)*1000:.0f}ms each)")
+
+    # ── 4.5. Inject data-driven block params ────────────────────────────
+    if train_sd.has_per_block_data:
+        from .sim_runner import _compute_block_cosim_means, _inject_data_driven_block_params
+        block_means = _compute_block_cosim_means(train_sd.groups)
+        if block_means is not None:
+            injected = 0
+            for cfg in unique_signal_configs:
+                if cfg.block_mode in ("split_groups", "dynamic"):
+                    _inject_data_driven_block_params(cfg, block_means)
+                    injected += 1
+            if injected:
+                print(f"  [block-data] Injected learned block params for {injected} configs "
+                      f"(n_blocks={len(block_means)})")
 
     # ── 5. Simulate unique signal configs ───────────────────────────────
     thresholds = expand_thresholds(opt.get("candidate_thresholds", [0.07]))
@@ -874,6 +984,8 @@ def optimize(configs: List[TeacacheConfig],
                 cross_feed_enabled=full_cfg.cross_feed_enabled,
                 cross_feed_strength=full_cfg.cross_feed_strength,
                 cosim_threshold=full_cfg.cosim_threshold,
+                block_level=full_cfg.block_level,
+                block_level_config_scope=list(full_cfg.block_level_config_scope),
             )
 
             bf = _block_fraction(result_cfg)
