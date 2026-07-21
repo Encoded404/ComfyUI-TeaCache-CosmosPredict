@@ -38,6 +38,13 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+# ── scipy is optional (needed for softplus parameter fitting) ──────
+try:
+    from scipy.optimize import curve_fit  # type: ignore[import-untyped]
+    _HAS_SCIPY = True
+except ImportError:
+    _HAS_SCIPY = False
+
 from .config_types import (
     CalibrationEntry, TeacacheConfig, OptimizationResult, TuningConfig,
 )
@@ -106,6 +113,120 @@ def compute_quality_score(error: float, scoring: dict) -> float:
 
     # fallback
     return 1.0 / (1.0 + error)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Mapping parameter fitting (power_law, softplus)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def fit_power_law_params(
+    sim_data: SimData,
+    cfg: TeacacheConfig,
+) -> Dict[str, float]:
+    """Fit power-law parameters (k, alpha) from calibration data.
+
+    Uses log-log linear regression:  log(y) = log(k) + alpha * log(x).
+    Returns {"k": k, "alpha": alpha}, or coarse fallback on failure.
+    """
+    xs_list, ys_list = [], []
+    for group in sim_data.groups:
+        stats = _get_group_stats(group, cfg.source)
+        if stats is None:
+            continue
+        dist = _compute_distance(stats, cfg)
+        if cfg.signal_scale != 1.0:
+            dist *= cfg.signal_scale
+        y = np.where(group.out_rel > 0, group.out_rel, group.res_rel)
+        mask = np.isfinite(dist) & np.isfinite(y) & (dist > 1e-12) & (y > 1e-12)
+        if mask.any():
+            xs_list.append(np.log(dist[mask]))
+            ys_list.append(np.log(y[mask]))
+    if not xs_list:
+        return {"k": 1.0, "alpha": 0.5}
+    xs = np.concatenate(xs_list)
+    ys = np.concatenate(ys_list)
+    if len(xs) < 20:
+        return {"k": 1.0, "alpha": 0.5}
+    # OLS on log-log data
+    alpha = float(np.polyfit(xs, ys, deg=1)[0])
+    log_k = float(np.mean(ys - alpha * xs))
+    k = min(float(np.exp(log_k)), 1e9)
+    alpha = max(0.05, min(alpha, 3.0))
+    predicted = k * np.exp(alpha * xs)
+    rmse = float(np.sqrt(np.mean((ys - np.log(predicted + 1e-15)) ** 2)))
+    print(f"  [fit-power_law] n={len(xs)}  k={k:.4g}  alpha={alpha:.4f}  "
+          f"RMSE(in_log)={rmse:.4f}")
+    return {"k": k, "alpha": alpha}
+
+
+def _softplus_fn(x: np.ndarray, k: float, offset: float) -> np.ndarray:
+    """softplus(k*(x - offset)) — vectorised."""
+    arg = k * (x - offset)
+    result = arg.copy()
+    small = arg < 20.0
+    result[small] = np.log1p(np.exp(arg[small]))
+    return result
+
+
+def fit_softplus_params(
+    sim_data: SimData,
+    cfg: TeacacheConfig,
+) -> Dict[str, float]:
+    """Fit softplus parameters (k, offset) from calibration data.
+
+    Uses scipy.optimize.curve_fit when available; falls back to coarse grid
+    search otherwise.  Returns {"k": k, "offset": offset}.
+    """
+    xs_list, ys_list = [], []
+    for group in sim_data.groups:
+        stats = _get_group_stats(group, cfg.source)
+        if stats is None:
+            continue
+        dist = _compute_distance(stats, cfg)
+        if cfg.signal_scale != 1.0:
+            dist *= cfg.signal_scale
+        y = np.where(group.out_rel > 0, group.out_rel, group.res_rel)
+        mask = np.isfinite(dist) & np.isfinite(y) & (dist > 1e-12) & (y > 1e-12)
+        if mask.any():
+            xs_list.append(dist[mask])
+            ys_list.append(y[mask])
+    if not xs_list:
+        return {"k": 10.0, "offset": 0.05}
+    xs = np.concatenate(xs_list)
+    ys = np.concatenate(ys_list)
+    if len(xs) < 30:
+        return {"k": 10.0, "offset": 0.05}
+
+    if _HAS_SCIPY:
+        try:
+            popt, _pcov = curve_fit(
+                _softplus_fn, xs, ys,
+                p0=[10.0, 0.05],
+                bounds=([0.1, 1e-6], [1000.0, 10.0]),
+                maxfev=500,  # type: ignore[call-arg]
+            )
+            k, offset = float(popt[0]), float(popt[1])
+            predicted = _softplus_fn(xs, k, offset)
+            rmse = float(np.sqrt(np.mean((ys - predicted) ** 2)))
+            print(f"  [fit-softplus(scipy)] n={len(xs)}  k={k:.3g}  "
+                  f"offset={offset:.5f}  RMSE={rmse:.4f}")
+            return {"k": k, "offset": offset}
+        except Exception:
+            pass
+
+    # Fallback: coarse grid search
+    best_rmse = float("inf")
+    best = {"k": 10.0, "offset": 0.05}
+    for k in [1.0, 3.0, 5.0, 10.0, 20.0, 50.0, 100.0]:
+        for offset in np.linspace(0.001, 0.2, 10):
+            predicted = _softplus_fn(xs, k, offset)
+            rmse = float(np.sqrt(np.mean((ys - predicted) ** 2)))
+            if rmse < best_rmse:
+                best_rmse = rmse
+                best = {"k": k, "offset": offset}
+    print(f"  [fit-softplus(grid)] n={len(xs)}  k={best['k']:.3g}  "
+          f"offset={best['offset']:.5f}  RMSE={best_rmse:.4f}")
+    return best
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -193,20 +314,22 @@ def fit_polynomial_coefficients(
     return coeffs
 
 
-def precompute_polyfits(
+def precompute_mapping_params(
     configs: List[TeacacheConfig],
     sim_data: SimData,
     poly_degree: int = 4,
-) -> Dict[tuple, list]:
-    """Fit polynomial coefficients for every unique (source, metric, scale) combo.
+) -> Dict[tuple, dict]:
+    """Precompute mapping parameters for every unique (source, metric, scale) combo.
 
-    Only configs with mapping_type="polynomial" are fitted. Identity,
-    power_law, and softplus configs don't need coefficients.
+    Returns Dict[signal_key → params_dict], where params_dict contains:
+      - "coefficients": [...]   for polynomial
+      - "k" + "alpha":           for power_law
+      - "k" + "offset":           for softplus
+      - identity: empty dict
     """
     unique_keys = set()
     for cfg in configs:
-        if cfg.mapping_type == "polynomial":
-            unique_keys.add(_poly_fit_key(cfg))
+        unique_keys.add(_poly_fit_key(cfg))
 
     cache = {}
     for key in sorted(unique_keys):
@@ -215,10 +338,26 @@ def precompute_polyfits(
             metric_type=key[1],
             metric_weights=dict(key[2]),
             signal_scale=key[3],
-            mapping_type="polynomial",
         )
-        coeffs = fit_polynomial_coefficients(sim_data, dummy, degree=poly_degree, quiet=True)
-        cache[key] = coeffs
+        mapping_type = None
+        for cfg in configs:
+            if _poly_fit_key(cfg) == key:
+                mapping_type = cfg.mapping_type
+                break
+
+        if mapping_type == "polynomial":
+            dummy.mapping_type = "polynomial"
+            coeffs = fit_polynomial_coefficients(sim_data, dummy, degree=poly_degree, quiet=True)
+            cache[key] = {"coefficients": coeffs}
+        elif mapping_type == "power_law":
+            params = fit_power_law_params(sim_data, dummy)
+            cache[key] = params
+        elif mapping_type == "softplus":
+            params = fit_softplus_params(sim_data, dummy)
+            cache[key] = params
+        else:
+            cache[key] = {}  # identity — nothing to fit
+
     return cache
 
 
@@ -227,15 +366,15 @@ def precompute_polyfits(
 # ═══════════════════════════════════════════════════════════════════════════
 
 _worker_sim_data: Optional[SimData] = None
-_worker_poly_cache: Dict = {}
+_worker_mapping_cache: Dict = {}
 _worker_opt: dict = {}
 
 
-def _init_worker(sim_data: SimData, poly_cache: dict, opt: dict):
+def _init_worker(sim_data: SimData, mapping_cache: dict, opt: dict):
     """Called once per worker process to share read-only simulation data."""
-    global _worker_sim_data, _worker_poly_cache, _worker_opt
+    global _worker_sim_data, _worker_mapping_cache, _worker_opt
     _worker_sim_data = sim_data
-    _worker_poly_cache = poly_cache
+    _worker_mapping_cache = mapping_cache
     _worker_opt = opt
 
 
@@ -266,11 +405,18 @@ def _process_config(idx_and_cfg: tuple) -> tuple:
     Returns (idx, skip, err, sp, quality, best_thresh).
     """
     idx, cfg = idx_and_cfg
-    global _worker_sim_data, _worker_poly_cache, _worker_opt
+    global _worker_sim_data, _worker_mapping_cache, _worker_opt
 
+    key = _poly_fit_key(cfg)
+    params = _worker_mapping_cache.get(key, {})
     if cfg.mapping_type == "polynomial":
-        key = _poly_fit_key(cfg)
-        cfg.coefficients = _worker_poly_cache.get(key, [])
+        cfg.coefficients = params.get("coefficients", [])
+    elif cfg.mapping_type == "power_law":
+        if "k" in params:
+            cfg.mapping_params = {"k": params["k"], "alpha": params["alpha"]}
+    elif cfg.mapping_type == "softplus":
+        if "k" in params:
+            cfg.mapping_params = {"k": params["k"], "offset": params["offset"]}
 
     thresholds = _worker_opt.get("candidate_thresholds", [0.07])
     scoring_config = _worker_opt.get("quality_scoring",
@@ -330,8 +476,74 @@ def load_calibration_data(data_path: str) -> List[CalibrationEntry]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  Candidate generation  (unchanged from prior version)
+#  Candidate generation
 # ═══════════════════════════════════════════════════════════════════════════
+
+def expand_sweeps(specs: list, spacing: str = "linear") -> list:
+    """Expand sweep specifications into concrete parameter dicts.
+
+    Each entry in *specs* is either:
+      - A concrete dict (no "param" key) — returned as-is.
+      - A sweep spec with keys: "param", "start", "end", "steps",
+        and optional "spacing" ("linear" or "geom", default "linear").
+
+    Returns a flat list of concrete dicts, each with a single key from
+    *param* mapped to one sweep value.  Integer params are rounded and
+    deduplicated.
+
+    Example:
+        expand_sweeps([{}, {"param": "leak_factor", "start": 0.5, "end": 0.99, "steps": 5}])
+        → [{}, {"leak_factor": 0.5}, {"leak_factor": 0.6225}, ...]
+    """
+    result = []
+    for spec in specs:
+        if "param" not in spec:
+            result.append(spec)
+            continue
+        param = spec["param"]
+        start = spec["start"]
+        end = spec["end"]
+        steps = int(spec["steps"])
+        spc = spec.get("spacing", spacing)
+        if steps < 1:
+            continue
+        if spc == "geom":
+            values = np.geomspace(start, end, steps).tolist()
+        else:
+            values = np.linspace(start, end, steps).tolist()
+        seen = set()
+        for v in values:
+            v = round(v, 8)
+            if v in seen:
+                continue
+            seen.add(v)
+            result.append({param: v})
+    return result
+
+
+def expand_thresholds(specs: list) -> list:
+    """Expand threshold sweep specs. Same as expand_sweeps but returns floats."""
+    result = []
+    for spec in specs:
+        if isinstance(spec, (int, float)):
+            result.append(float(spec))
+            continue
+        if "param" not in spec:
+            continue
+        start = spec["start"]
+        end = spec["end"]
+        steps = int(spec["steps"])
+        spc = spec.get("spacing", "geom")
+        if steps < 1:
+            continue
+        if spc == "geom":
+            values = np.geomspace(start, end, steps).tolist()
+        else:
+            values = np.linspace(start, end, steps).tolist()
+        for v in values:
+            result.append(float(v))
+    return result
+
 
 def generate_candidate_configs(tcfg: TuningConfig,
                                 entries: Optional[List[CalibrationEntry]] = None,
@@ -373,6 +585,13 @@ def generate_candidate_configs(tcfg: TuningConfig,
 
     # ── Generate candidates ────────────────────────────────────────────
 
+    has_per_block = entries is not None and any(
+        e.block_cos_sims is not None for e in entries
+    ) if entries else False
+    block_modes = list(opt.get("block_modes", ["all_or_nothing"]))
+    if not has_per_block:
+        block_modes = [m for m in block_modes if m != "dynamic"]
+
     for source in opt["sources"]:
         for metric_type in opt["metric_types"]:
             for metric_weights_scenario in opt["metric_weights_scenarios"]:
@@ -386,8 +605,8 @@ def generate_candidate_configs(tcfg: TuningConfig,
                     mapping_type_key = opt.get("mapping_params_scenarios", {}).get(mapping_type, [])
                     if mapping_type_key:
                         mapping_params_list = mapping_type_key
-                    elif mapping_type == "polynomial":
-                        mapping_params_list = [{}]
+                    elif mapping_type in ("polynomial", "power_law", "softplus"):
+                        mapping_params_list = [{}]  # fitted from data, single config each
 
                     for mapping_params in mapping_params_list:
                         if source == "pooled_latent":
@@ -395,7 +614,8 @@ def generate_candidate_configs(tcfg: TuningConfig,
                             if "pooled_latent_mode" not in mapping_params:
                                 mapping_params = dict(mapping_params, pooled_latent_mode=pl_mode)
                         for accum_type in opt["accumulation_types"]:
-                            for accum_params_dict in opt["accumulation_params"]:
+                            accum_params_list = expand_sweeps(opt["accumulation_params"])
+                            for accum_params_dict in accum_params_list:
                                 if accum_type == "hard_reset" and accum_params_dict != {}:
                                     continue
                                 if accum_type == "carry_over" and accum_params_dict != {}:
@@ -417,7 +637,7 @@ def generate_candidate_configs(tcfg: TuningConfig,
                                                 res_params_list = opt.get("residual_params_scenarios", [{}])
 
                                             for res_params in res_params_list:
-                                                for block_mode in opt.get("block_modes", ["all_or_nothing"]):
+                                                for block_mode in block_modes:
                                                     block_params_list = [{}]
                                                     block_scenarios = opt.get("block_params_scenarios", {})
                                                     if block_mode in block_scenarios:
@@ -508,21 +728,21 @@ def optimize(configs: List[TeacacheConfig],
     print(f"  Dedup: {len(configs)} → {len(unique_signal_configs)} "
           f"unique signal-space configs ({ratio:.1f}× reduction)")
 
-    # ── 4. Polynomial fits ─────────────────────────────────────────────
+    # ── 4. Mapping parameter fits ───────────────────────────────────────
     t_pre = time_mod.time()
-    poly_cache = precompute_polyfits(
+    mapping_cache = precompute_mapping_params(
         unique_signal_configs, train_sd,
         poly_degree=opt.get("poly_degree", 4),
     )
-    n_fits = len(poly_cache)
+    n_fits = len(mapping_cache)
     t_pre_elapsed = time_mod.time() - t_pre
     if n_fits:
-        print(f"  [precompute] {n_fits} unique polynomial fits "
+        print(f"  [precompute] {n_fits} unique mapping fits "
               f"in {t_pre_elapsed:.1f}s "
               f"({t_pre_elapsed/max(n_fits,1)*1000:.0f}ms each)")
 
     # ── 5. Simulate unique signal configs ───────────────────────────────
-    thresholds = opt.get("candidate_thresholds", [0.07])
+    thresholds = expand_thresholds(opt.get("candidate_thresholds", [0.07]))
     scoring_config = opt.get("quality_scoring",
                               {"type": "thresholded_power", "target": 0.05, "power": 3.0})
     print(f"  Candidate thresholds: {thresholds}")
@@ -553,7 +773,7 @@ def optimize(configs: List[TeacacheConfig],
         with ctx.Pool(
             processes=n_workers,
             initializer=_init_worker,
-            initargs=(holdout_sd, poly_cache, opt),
+            initargs=(holdout_sd, mapping_cache, opt),
         ) as pool:
             for idx, skip, err, sp, quality, best_thresh in pool.imap_unordered(
                 _process_config, indexed, chunksize=chunksz
@@ -584,9 +804,16 @@ def optimize(configs: List[TeacacheConfig],
             sim_results[sig] = r
     else:
         for i, cfg in enumerate(unique_signal_configs):
+            key = _poly_fit_key(cfg)
+            params = mapping_cache.get(key, {})
             if cfg.mapping_type == "polynomial":
-                key = _poly_fit_key(cfg)
-                cfg.coefficients = poly_cache.get(key, [])
+                cfg.coefficients = params.get("coefficients", [])
+            elif cfg.mapping_type == "power_law":
+                if "k" in params:
+                    cfg.mapping_params = {"k": params["k"], "alpha": params["alpha"]}
+            elif cfg.mapping_type == "softplus":
+                if "k" in params:
+                    cfg.mapping_params = {"k": params["k"], "offset": params["offset"]}
 
             best_skip, best_err, best_sp, best_quality, best_thresh = _best_threshold(
                 holdout_sd, cfg, thresholds, scoring_config,
@@ -638,6 +865,7 @@ def optimize(configs: List[TeacacheConfig],
                 residual_params=full_cfg.residual_params,
                 cross_feed_enabled=full_cfg.cross_feed_enabled,
                 cross_feed_strength=full_cfg.cross_feed_strength,
+                cosim_threshold=full_cfg.cosim_threshold,
             )
 
             bf = _block_fraction(result_cfg)

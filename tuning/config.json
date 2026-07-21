@@ -54,12 +54,9 @@
         "accumulation_types": ["hard_reset", "carry_over", "leaky", "windowed"],
         "accumulation_params": [
             {},
-            {"leak_factor": 0.95},
-            {"leak_factor": 0.90},
-            {"leak_factor": 0.80},
-            {"window_size": 3},
-            {"window_size": 5},
-            {"window_size": 7}
+            {"param": "leak_factor", "start": 0.50, "end": 0.99, "steps": 12, "spacing": "linear"},
+            {"param": "leak_factor", "start": 0.991, "end": 0.999, "steps": 3, "spacing": "linear"},
+            {"param": "window_size", "start": 2, "end": 15, "steps": 12, "spacing": "linear"}
         ],
         "residual_strategies": ["hard", "blended", "scaled"],
         "residual_params_scenarios": [
@@ -74,7 +71,7 @@
             "pooled_latent": [1.0, 10, 50]
         },
         "auto_scale_target": 1.0,
-        "block_modes": ["all_or_nothing", "split_fraction", "split_groups"],
+        "block_modes": ["all_or_nothing", "split_fraction", "split_groups", "dynamic"],
         "block_params_scenarios": {
             "split_fraction": [
                 {"always_fraction": 0.25},
@@ -87,7 +84,9 @@
                 {"always_groups": [0, 1, 2], "cache_groups": []}
             ]
         },
-        "candidate_thresholds": [0.01, 0.07, 0.20],
+        "candidate_thresholds": [
+            {"param": "thresh", "start": 0.005, "end": 0.50, "steps": 12, "spacing": "geom"}
+        ],
         "pareto_threshold_range": [0.001, 10.0],
         "pareto_threshold_count": 500,
         "poly_degree": 4,
