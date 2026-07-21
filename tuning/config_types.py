@@ -47,7 +47,9 @@ class TeacacheConfig:
     # Knob 8: Block skipping
     block_mode: str = "all_or_nothing"
     block_params: Dict = field(default_factory=dict)
-    cosim_threshold: float = 0.95  # for dynamic mode: cosine-sim threshold for caching a block
+    cosim_threshold: float = 0.95  # threshold for split_groups partition + dynamic mode
+    block_level: str = "unified"   # "unified" | "per_group" (dynamic mode only)
+    block_level_config_scope: List[str] = field(default_factory=lambda: ["*"])  # params varied at group level
 
     # Knob 9: Residual strategy
     residual_strategy: str = "hard"
@@ -79,6 +81,8 @@ class TeacacheConfig:
             "cross_feed_enabled": self.cross_feed_enabled,
             "cross_feed_strength": self.cross_feed_strength,
             "cosim_threshold": self.cosim_threshold,
+            "block_level": self.block_level,
+            "block_level_config_scope": self.block_level_config_scope,
         }
 
     @classmethod
@@ -104,6 +108,8 @@ class TeacacheConfig:
             cross_feed_enabled=d.get("cross_feed_enabled", False),
             cross_feed_strength=d.get("cross_feed_strength", 0.5),
             cosim_threshold=d.get("cosim_threshold", 0.95),
+            block_level=d.get("block_level", "unified"),
+            block_level_config_scope=d.get("block_level_config_scope", ["*"]),
         )
 
     @classmethod
@@ -119,7 +125,7 @@ class TeacacheConfig:
             "block_mode", "block_params",
             "residual_strategy", "residual_params",
             "cross_feed_enabled", "cross_feed_strength",
-            "cosim_threshold",
+            "cosim_threshold", "block_level", "block_level_config_scope",
         ]:
             if f"tc_{key}" in to:
                 d[key] = to[f"tc_{key}"]
