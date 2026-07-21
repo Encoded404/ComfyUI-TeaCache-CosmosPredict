@@ -1213,7 +1213,7 @@ def optimize(configs: List[TeacacheConfig],
 
     if use_parallel:
         n_workers = min(os.cpu_count() or 4, 16)
-        chunksz = max(50, min(5000, total // (n_workers * 25)))
+        chunksz = max(50, min(5000, total // (n_workers * 10)))
         print(f"  [parallel] {n_workers} workers × {total} configs, "
               f"chunksize={chunksz} ({iter_count//1_000_000}M entry-iterations, "
               f"~{total/(n_workers*chunksz):.0f} rounds)")
