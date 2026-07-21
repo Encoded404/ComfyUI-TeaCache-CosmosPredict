@@ -40,13 +40,13 @@ class GroupData:
     shift_stats: Optional[Dict[str, np.ndarray]]
     latent_stats: Optional[Dict[str, np.ndarray]]
 
+    # Precomputed threshold multipliers for all 5 schedule types
+    step_mult: Dict[str, np.ndarray]  # {"constant": (n,), "cosine": (n,), ...}
+
     # Per-block cosine similarity — shape (n_blocks, n_steps) or None.
     # Only populated when calibration had track_per_block enabled.
     block_cos_sim: Optional[np.ndarray] = None
     n_blocks: int = 0
-
-    # Precomputed threshold multipliers for all 5 schedule types
-    step_mult: Dict[str, np.ndarray]  # {"constant": (n,), "cosine": (n,), ...}
 
 
 @dataclass(frozen=True, slots=True)
