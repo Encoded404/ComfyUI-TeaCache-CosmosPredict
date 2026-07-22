@@ -406,6 +406,7 @@ def teacache_anima_forward(
     # ── Read config from transformer_options ──
     transformer_options = kwargs.get("transformer_options", {})
     cfg = TeacacheConfig.from_transformer_options(transformer_options)
+    print(f"  [TeaCache Debug] forward cfg: residual_strategy={cfg.residual_strategy!r}  residual_params={cfg.residual_params}")
 
     # One-time diagnostic: confirm TeaCache is active
     if not hasattr(self, "_tc_diag_printed"):
@@ -649,6 +650,10 @@ def teacache_anima_forward(
                 resid = state.get("prev_residual")
                 if resid is not None:
                     confidence = min(state["accumulated"] / max(effective_thresh, 1e-8), 1.0)
+                    print(f"  [TeaCache Debug] SKIP all_or_nothing k={k} strategy={cfg.residual_strategy!r} "
+                          f"params={cfg.residual_params} resid_mean={resid.abs().mean().item():.6f} "
+                          f"x_mean={x_B_T_H_W_D[i*b:(i+1)*b].abs().mean().item():.6f} "
+                          f"confidence={confidence:.4f}")
                     x_B_T_H_W_D[i * b : (i + 1) * b] = apply_residual(
                         x_B_T_H_W_D[i * b : (i + 1) * b], resid,
                         cfg.residual_strategy, confidence=confidence, params=cfg.residual_params,
@@ -661,6 +666,10 @@ def teacache_anima_forward(
                 resid_late = state.get("prev_residual_late")
                 if resid_late is not None:
                     confidence = min(state["accumulated"] / max(effective_thresh, 1e-8), 1.0)
+                    print(f"  [TeaCache Debug] SKIP split_late k={k} strategy={cfg.residual_strategy!r} "
+                          f"params={cfg.residual_params} resid_mean={resid_late.abs().mean().item():.6f} "
+                          f"x_mean={x_B_T_H_W_D[i*b:(i+1)*b].abs().mean().item():.6f} "
+                          f"confidence={confidence:.4f}")
                     x_B_T_H_W_D[i * b : (i + 1) * b] = apply_residual(
                         x_B_T_H_W_D[i * b : (i + 1) * b], resid_late,
                         cfg.residual_strategy, confidence=confidence, params=cfg.residual_params,
@@ -685,6 +694,10 @@ def teacache_anima_forward(
                                 acc = pg["accumulated"][gi]
                                 eff = cfg.rel_l1_thresh * transformer_options.get("tc_threshold_mult", torch.tensor(1.0)).item() * cfg.signal_scale * step_scale
                                 conf = min(acc / max(eff, 1e-8), 1.0)
+                                print(f"  [TeaCache Debug] SKIP per_group k={k} gi={gi} strategy={cfg.residual_strategy!r} "
+                                      f"params={cfg.residual_params} resid_mean={resid.abs().mean().item():.6f} "
+                                      f"x_mean={x_B_T_H_W_D[i*b:(i+1)*b].abs().mean().item():.6f} "
+                                      f"confidence={conf:.4f}")
                                 x_B_T_H_W_D[i * b : (i + 1) * b] = apply_residual(
                                     x_B_T_H_W_D[i * b : (i + 1) * b], resid,
                                     cfg.residual_strategy, confidence=conf, params=cfg.residual_params,

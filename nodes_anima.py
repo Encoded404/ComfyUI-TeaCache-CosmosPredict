@@ -254,6 +254,7 @@ def _apply_teacache(model, cfg: TeacacheConfig, preset_steps: int = 30):
     to = new_model.model_options.setdefault("transformer_options", {})
     cfg.inject_into_transformer_options(to)
     to["preset_steps"] = preset_steps
+    print(f"  [TeaCache Debug] _apply_teacache: tc_residual_strategy={to.get('tc_residual_strategy')!r}  tc_residual_params={to.get('tc_residual_params')!r}")
 
     # Context manager for _forward patching (restores original on exit)
     context = patch.object(
@@ -388,6 +389,8 @@ class TeaCacheAnima:
         if "always_fraction" in kwargs:
             cfg.block_params["always_fraction"] = kwargs["always_fraction"]
             overrides.append(f"frac={kwargs['always_fraction']}")
+
+        print(f"  [TeaCache Debug] apply_teacache_anima: residual_strategy={cfg.residual_strategy!r}  residual_params={cfg.residual_params}  rel_l1_thresh={cfg.rel_l1_thresh}  source={cfg.source!r}")
 
         new_model = _apply_teacache(model, cfg, preset_steps=preset_steps)
 
