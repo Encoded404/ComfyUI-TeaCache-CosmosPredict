@@ -19,23 +19,99 @@ Usage:
     python -m tuning.build_presets --pareto outputs/optimization/pareto_frontier.json
     python -m tuning.build_presets --pareto pareto.json --points 12 \\
         --error-min 0.005 --error-max 0.12 --steps 30
+    python -m tuning.build_presets --pareto pareto.json \\
+        --error-min 0.02 --error-max 0.12 \\
+        --quality-curve power --quality-power 2.0
 """
 
 import argparse
 import json
 from pathlib import Path
-from typing import Optional
 
 
-def _find_nearest(pareto, target_error):
-    """Return the Pareto point whose accumulated_error is closest to target."""
-    return min(pareto, key=lambda r: abs(r["accumulated_error"] - target_error))
+def _make_control_point(p):
+    """Build a control point dict from a Pareto frontier entry."""
+    cfg = p["config"]
+    slim_config = {
+        "source": cfg.get("source", "pooled_latent"),
+        "metric_type": cfg.get("metric_type", "mean_only"),
+        "metric_weights": cfg.get("metric_weights", {}),
+        "signal_scale": cfg.get("signal_scale", 1.0),
+        "mapping_type": cfg.get("mapping_type", "identity"),
+        "coefficients": cfg.get("coefficients", []),
+        "mapping_params": cfg.get("mapping_params", {}),
+        "accumulation_type": cfg.get("accumulation_type", "hard_reset"),
+        "accumulation_params": cfg.get("accumulation_params", {}),
+        "rel_l1_thresh": cfg.get("rel_l1_thresh", 0.07),
+        "step_schedule": cfg.get("step_schedule", "constant"),
+        "start_percent": cfg.get("start_percent", 0.05),
+        "end_percent": cfg.get("end_percent", 0.95),
+        "block_mode": cfg.get("block_mode", "all_or_nothing"),
+        "block_params": cfg.get("block_params", {}),
+        "residual_strategy": cfg.get("residual_strategy", "hard"),
+        "residual_params": cfg.get("residual_params", {}),
+        "cross_feed_enabled": cfg.get("cross_feed_enabled", False),
+        "cross_feed_strength": cfg.get("cross_feed_strength", 0.5),
+        "cosim_threshold": cfg.get("cosim_threshold", 0.95),
+        "block_level": cfg.get("block_level", "unified"),
+        "block_level_config_scope": cfg.get("block_level_config_scope", ["*"]),
+    }
+    return {
+        "error": round(p["accumulated_error"], 6),
+        "config": slim_config,
+        "speedup": round(p["estimated_speedup"], 3),
+    }
 
 
-def _deduplicate_by_error(control_points):
-    """Drop points with duplicate error values, keeping last."""
+def _collect_all_in_range(pareto, lo, hi):
+    """Return a control point for every Pareto point within [lo, hi]."""
+    return [_make_control_point(p) for p in pareto if lo <= p["accumulated_error"] <= hi]
+
+
+def _sample_control_points(pareto, lo, hi, num_points,
+                           quality_curve="linear", quality_power=2.0):
+    """Sample *num_points* control points using 2-nearest-neighbor with greedy resolution.
+
+    For each target error (evenly spaced in normalized-quality space), finds the
+    top 2 closest Pareto points.  Candidates sorted by proximity (best-justified
+    first) then greedily assigned: first choice if free, second choice if taken,
+    forced first if both taken.  Final dedup via *error* key.
+    """
+    targets = [_apply_quality_curve(i / (num_points - 1), lo, hi,
+                                    curve=quality_curve, power=quality_power)
+               for i in range(num_points)]
+
+    # Top-2 nearest neighbor per target
+    candidates = []
+    for t in targets:
+        idx_sorted = sorted(range(len(pareto)),
+                            key=lambda i: abs(pareto[i]["accumulated_error"] - t))
+        fst, snd = idx_sorted[0], idx_sorted[1] if len(idx_sorted) > 1 else idx_sorted[0]
+        candidates.append({
+            "first_pidx":  fst,
+            "first_dist":  abs(pareto[fst]["accumulated_error"] - t),
+            "second_pidx": snd,
+            "second_dist": abs(pareto[snd]["accumulated_error"] - t),
+        })
+
+    # Greedy assign: best-justified targets first
+    candidates.sort(key=lambda c: (c["first_dist"], c["first_pidx"]))
+    assigned = set()
+    pts = []
+    for c in candidates:
+        if c["first_pidx"] not in assigned:
+            chosen = c["first_pidx"]
+        elif c["second_pidx"] not in assigned:
+            chosen = c["second_pidx"]
+        else:
+            chosen = c["first_pidx"]
+        assigned.add(chosen)
+        pts.append(pareto[chosen])
+
+    # Deduplicate by error
     seen = {}
-    for cp in control_points:
+    for p in pts:
+        cp = _make_control_point(p)
         seen[cp["error"]] = cp
     return sorted(seen.values(), key=lambda cp: cp["error"])
 
@@ -81,7 +157,7 @@ def _apply_quality_curve(frac: float, lo: float, hi: float,
 
 def build_presets(
     pareto_path,
-    num_points=8,
+    num_points=None,
     error_min=None,
     error_max=None,
     preset_steps=None,
@@ -98,49 +174,13 @@ def build_presets(
     pareto.sort(key=lambda r: r["accumulated_error"])
     lo, hi = _resolve_error_range(pareto, error_min, error_max)
 
-    control_points = []
-    for i in range(num_points):
-        frac = i / (num_points - 1)
-        target_error = _apply_quality_curve(
-            frac, lo, hi, curve=quality_curve, power=quality_power,
+    if num_points is not None:
+        control_points = _sample_control_points(
+            pareto, lo, hi, num_points,
+            quality_curve=quality_curve, quality_power=quality_power,
         )
-
-        nearest = _find_nearest(pareto, target_error)
-
-        # Extract only the fields the node needs from the full config
-        cfg = nearest["config"]
-        slim_config = {
-            "source": cfg.get("source", "pooled_latent"),
-            "metric_type": cfg.get("metric_type", "mean_only"),
-            "metric_weights": cfg.get("metric_weights", {}),
-            "signal_scale": cfg.get("signal_scale", 1.0),
-            "mapping_type": cfg.get("mapping_type", "identity"),
-            "coefficients": cfg.get("coefficients", []),
-            "mapping_params": cfg.get("mapping_params", {}),
-            "accumulation_type": cfg.get("accumulation_type", "hard_reset"),
-            "accumulation_params": cfg.get("accumulation_params", {}),
-            "rel_l1_thresh": cfg.get("rel_l1_thresh", 0.07),
-            "step_schedule": cfg.get("step_schedule", "constant"),
-            "start_percent": cfg.get("start_percent", 0.05),
-            "end_percent": cfg.get("end_percent", 0.95),
-            "block_mode": cfg.get("block_mode", "all_or_nothing"),
-            "block_params": cfg.get("block_params", {}),
-            "residual_strategy": cfg.get("residual_strategy", "hard"),
-            "residual_params": cfg.get("residual_params", {}),
-            "cross_feed_enabled": cfg.get("cross_feed_enabled", False),
-            "cross_feed_strength": cfg.get("cross_feed_strength", 0.5),
-            "cosim_threshold": cfg.get("cosim_threshold", 0.95),
-            "block_level": cfg.get("block_level", "unified"),
-            "block_level_config_scope": cfg.get("block_level_config_scope", ["*"]),
-        }
-
-        control_points.append({
-            "error": round(nearest["accumulated_error"], 6),
-            "config": slim_config,
-            "speedup": round(nearest["estimated_speedup"], 3),
-        })
-
-    control_points = _deduplicate_by_error(control_points)
+    else:
+        control_points = _collect_all_in_range(pareto, lo, hi)
 
     presets = {
         "_description": (
@@ -178,8 +218,8 @@ def main():
         help="Output path (default: <project_root>/anima_presets.json)",
     )
     parser.add_argument(
-        "--points", type=int, default=8,
-        help="Number of control points to sample (default: 8)",
+        "--points", type=int, default=None,
+        help="Limit to N control points (default: include every Pareto point in range)",
     )
     parser.add_argument(
         "--error-min", type=float, default=None,
@@ -231,15 +271,14 @@ def main():
     print(f"Wrote {n} control points → {out_path}")
     print(f"  Error range: {lo:.6f} → {hi:.6f}")
     print(f"  LPIPS display: {lo * args.lpips_scale:.4f} → {hi * args.lpips_scale:.4f}")
-    print(f"  {'─' * 72}")
-    print(f"  {'error':>10}  {'quality':>7}  {'thresh':>8}  "
+    print(f"  {'─' * 78}")
+    print(f"  {'#':>3}  {'error':>10}  {'thresh':>8}  "
           f"{'speedup':>7}  {'lpips~':>7}  {'source':<20}  {'acc':<12}")
-    print(f"  {'─' * 72}")
+    print(f"  {'─' * 78}")
     for i, cp in enumerate(presets["control_points"]):
-        q = round(i * 100 / (n - 1)) if n > 1 else 50
         cfg = cp["config"]
         lpips_est = round(cp["error"] * args.lpips_scale, 3)
-        print(f"  {cp['error']:>10.5f}  {q:>7}  {cfg['rel_l1_thresh']:>8.4f}  "
+        print(f"  {i:>3}  {cp['error']:>10.5f}  {cfg['rel_l1_thresh']:>8.4f}  "
               f"{cp['speedup']:>6.2f}x  {lpips_est:>7.3f}  "
               f"{cfg['source']:<20}  {cfg['accumulation_type']:<12}")
 
