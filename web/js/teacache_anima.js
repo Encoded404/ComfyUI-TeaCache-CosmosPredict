@@ -94,7 +94,7 @@
     // ---------------------------------------------------------------------------
     function reflow(node) {
       if (node._setConcreteSlots) node._setConcreteSlots();
-      if (node.arrange) node.arrange();
+      if (node.graph && node.arrange) node.arrange();
       var app = resolveApp();
       var canvas = app && app.canvas;
       if (canvas) canvas.setDirty(true, true);
@@ -117,7 +117,7 @@
       for (var i = 0; i < widgets.length; i++) {
         if (widgets[i].name === cfg.name) return;
       }
-      node.addWidget(cfg.type, cfg.name, (saved && saved[cfg.name] !== undefined) ? saved[cfg.name] : cfg.default, null, cfg.opts);
+      node.addWidget(cfg.type, cfg.name, (saved && saved[cfg.name] !== undefined) ? saved[cfg.name] : cfg.default, function() {}, cfg.opts);
     }
 
     function syncCond(node, saved) {
@@ -150,7 +150,7 @@
         }
         if (exists) continue;
         var cfg = OVERRIDES[name];
-        var w = node.addWidget(cfg.type, name, (saved && saved[name] !== undefined) ? saved[name] : cfg.default, null, cfg.opts);
+        var w = node.addWidget(cfg.type, name, (saved && saved[name] !== undefined) ? saved[name] : cfg.default, function() {}, cfg.opts);
         if (CONDITIONAL[name]) {
           var orig = w.callback;
           w.callback = function(v, canvas, n) {
