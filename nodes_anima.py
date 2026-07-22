@@ -128,19 +128,56 @@ def _quality_to_config(quality: float) -> Tuple[TeacacheConfig, float, float, in
             lo = hi = points[-1]
             t = 1.0
 
-    # Threshold: linear interpolation between bracketing points
-    lo_thresh = lo["config"]["rel_l1_thresh"]
-    hi_thresh = hi["config"]["rel_l1_thresh"]
-    thresh = lo_thresh + t * (hi_thresh - lo_thresh)
+    # Threshold: two-phase midpoint-aware interpolation.
+    #
+    # When consecutive control points use the same signal config the
+    # interpolation is a simple lerp between their base thresholds.
+    # When they use *different* configs (e.g. crossing from pooled_latent
+    # to t_emb), the threshold is interpolated separately on each side of
+    # the midpoint, using that side's pre-computed midpoint threshold.
+    # At the midpoint the config snaps from one source to the other.
+    mid_data_available = (
+        lo.get("high_mid") is not None and hi.get("low_mid") is not None
+    )
 
-    # Discrete params: snap to nearest control point
-    base_config = hi["config"] if t > 0.5 else lo["config"]
-    cfg = TeacacheConfig.from_dict(base_config)
-    cfg.rel_l1_thresh = round(max(thresh, 0.001), 4)
+    if mid_data_available:
+        mid_err = (lo["error"] + hi["error"]) / 2
 
-    # Display hints (at preset step count)
-    speedup = lo["speedup"] + t * (hi["speedup"] - lo["speedup"])
-    lpips_est = target_error * lpips_scale
+        if target_error <= mid_err:
+            # Lower half: lo's config, lerp between lo base and lo high_mid
+            base = lo
+            lo_thresh = base["config"]["rel_l1_thresh"]
+            lo_mid = base["high_mid"]
+            seg = lo_mid["error"] - base["error"]
+            t_seg = (target_error - base["error"]) / seg if seg > 0 else 0
+            t_seg = max(0.0, min(1.0, t_seg))
+            thresh = lo_thresh + t_seg * (lo_mid["thresh"] - lo_thresh)
+            speedup = base["speedup"] + t_seg * (lo_mid["speedup"] - base["speedup"])
+        else:
+            # Upper half: hi's config, lerp between hi low_mid and hi base
+            base = hi
+            hi_thresh = base["config"]["rel_l1_thresh"]
+            hi_mid = base["low_mid"]
+            seg = base["error"] - hi_mid["error"]
+            t_seg = (target_error - hi_mid["error"]) / seg if seg > 0 else 0
+            t_seg = max(0.0, min(1.0, t_seg))
+            thresh = hi_mid["thresh"] + t_seg * (hi_thresh - hi_mid["thresh"])
+            speedup = hi_mid["speedup"] + t_seg * (base["speedup"] - hi_mid["speedup"])
+
+        base_config = base["config"]
+        cfg = TeacacheConfig.from_dict(base_config)
+        cfg.rel_l1_thresh = round(max(thresh, 0.001), 4)
+        lpips_est = target_error * lpips_scale
+
+    else:
+        # Legacy / presets without midpoint data — snap to nearest anchor
+        base_config = hi["config"] if t > 0.5 else lo["config"]
+        thresh = base_config.get("rel_l1_thresh", 0.07)
+        cfg = TeacacheConfig.from_dict(base_config)
+        cfg.rel_l1_thresh = round(max(thresh, 0.001), 4)
+        nearest = hi if t > 0.5 else lo
+        speedup = nearest["speedup"]
+        lpips_est = target_error * lpips_scale
 
     return cfg, speedup, lpips_est, preset_steps
 

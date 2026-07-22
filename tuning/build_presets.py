@@ -95,17 +95,30 @@ def _collect_all_in_range(pareto, lo, hi):
     When *lo* is below the Pareto minimum or *hi* above the maximum,
     synthetic edge points are created by adjusting the nearest config's
     threshold via its pre-computed threshold curve.
+
+    Each control point carries a ``_pareto_idx`` key (popped later by
+    ``_add_midpoints``) so the midpoint data can be looked up from the
+    original Pareto entries.
     """
     p_min = pareto[0]["accumulated_error"]
     p_max = pareto[-1]["accumulated_error"]
 
-    points = [_make_control_point(p) for p in pareto if lo <= p["accumulated_error"] <= hi]
+    points = []
+    for idx, p in enumerate(pareto):
+        if lo <= p["accumulated_error"] <= hi:
+            cp = _make_control_point(p)
+            cp["_pareto_idx"] = idx
+            points.append(cp)
 
     if lo < p_min and pareto[0].get("threshold_curve"):
-        points.insert(0, _make_control_point(pareto[0], target_error=lo))
+        cp = _make_control_point(pareto[0], target_error=lo)
+        cp["_pareto_idx"] = 0
+        points.insert(0, cp)
 
     if hi > p_max and pareto[-1].get("threshold_curve"):
-        points.append(_make_control_point(pareto[-1], target_error=hi))
+        cp = _make_control_point(pareto[-1], target_error=hi)
+        cp["_pareto_idx"] = len(pareto) - 1
+        points.append(cp)
 
     return points
 
@@ -156,9 +169,60 @@ def _sample_control_points(pareto, lo, hi, num_points,
         assigned.add(chosen)
 
         cp = _make_control_point(pareto[chosen], target_error=c["target"])
+        cp["_pareto_idx"] = chosen
         seen[cp["error"]] = cp
 
     return sorted(seen.values(), key=lambda cp: cp["error"])
+
+
+def _add_midpoints(pareto, control_points):
+    """Enrich control points with ``low_mid`` / ``high_mid`` threshold data.
+
+    For each adjacent pair (A → B), computes the midpoint error and uses each
+    config's ``threshold_curve`` to find the threshold on that config whose
+    simulated error is closest to the midpoint.  The result is stored directly
+    on the control-point dicts:
+
+      - A gets ``high_mid`` (threshold on A's config at the A↔B midpoint)
+      - B gets ``low_mid``  (threshold on B's config at the A↔B midpoint)
+
+    The curves come from the Pareto entries identified by each control point's
+    internal ``_pareto_idx`` field (set by the sampling / collection helpers and
+    popped here before writing).
+    """
+    n = len(control_points)
+    for i in range(n):
+        cp = control_points[i]
+        pareto_idx = cp.pop("_pareto_idx", None)
+        p = pareto[pareto_idx] if (pareto_idx is not None
+                                   and 0 <= pareto_idx < len(pareto)) else None
+
+        can_compute = p is not None and p.get("threshold_curve")
+
+        if not can_compute:
+            cp["low_mid"] = None
+            cp["high_mid"] = None
+            continue
+
+        if i > 0:
+            prev = control_points[i - 1]
+            mid_err = (prev["error"] + cp["error"]) / 2
+            t, err, sp = _find_closest_on_curve(p["threshold_curve"], mid_err)
+            cp["low_mid"] = {"error": round(err, 6), "thresh": t,
+                             "speedup": round(sp, 3)}
+        else:
+            cp["low_mid"] = None
+
+        if i < n - 1:
+            nxt = control_points[i + 1]
+            mid_err = (cp["error"] + nxt["error"]) / 2
+            t, err, sp = _find_closest_on_curve(p["threshold_curve"], mid_err)
+            cp["high_mid"] = {"error": round(err, 6), "thresh": t,
+                              "speedup": round(sp, 3)}
+        else:
+            cp["high_mid"] = None
+
+    return control_points
 
 
 def _resolve_error_range(pareto, error_min, error_max):
@@ -229,12 +293,14 @@ def build_presets(
     else:
         control_points = _collect_all_in_range(pareto, lo, hi)
 
+    control_points = _add_midpoints(pareto, control_points)
+
     presets = {
         "_description": (
             "Auto-generated TeaCache presets for Anima/Cosmos-Predict2. "
             "Each control point is a full configuration from the Pareto frontier. "
-            "The slider interpolates threshold between neighboring points; "
-            "discrete params snap to the nearer anchor."
+            "Thresholds are interpolated within each config's error range via "
+            "pre-computed midpoint thresholds; config changes snap at midpoints."
         ),
         "_error_range": [round(lo, 6), round(hi, 6)],
         "_lpips_scale": lpips_scale,
