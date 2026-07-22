@@ -198,7 +198,19 @@
           if (origConfigure) origConfigure.call(this, data);
           var saved = data && data._teacache_overrides;
           if (saved && Object.keys(saved).length > 0) {
-            showOver(this, saved);
+            var widgets = this.widgets || [];
+            var overW = null;
+            for (var i = 0; i < widgets.length; i++) {
+              if (widgets[i].name === "overrides") { overW = widgets[i]; break; }
+            }
+            var overrideVal = saved.overrides !== undefined ? saved.overrides : "hide";
+            if (overW) overW.value = overrideVal;
+
+            if (overrideVal === "show") {
+              showOver(this, saved);
+            } else {
+              hideOver(this);
+            }
             reflow(this);
           }
         };
