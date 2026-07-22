@@ -6,14 +6,22 @@
 //  3.  Widget state survives workflow save/reload via onSerialize/onConfigure.
 
 (function () {
+  // Debug: confirm the JS file itself loaded
+  console.log("[TeaCache] JS file loaded, checking environment...");
+  console.log("[TeaCache] window.comfyAPI =", window.comfyAPI);
+  console.log("[TeaCache] window.app =", window.app);
+
   // Wait for comfyAPI before registering (poll up to 6 seconds)
   var attempts = 0;
   function register() {
     var app = window.comfyAPI && window.comfyAPI.app;
     if (!app) {
+      if (attempts === 0) console.log("[TeaCache] comfyAPI not available yet, polling...");
       if (++attempts < 60) { setTimeout(register, 100); }
+      else console.log("[TeaCache] GAVE UP after " + attempts + " attempts — window.comfyAPI still undefined");
       return;
     }
+    console.log("[TeaCache] Found window.comfyAPI.app, registering extension...");
 
     // ---------------------------------------------------------------------------
     //  Override dropdown definitions
