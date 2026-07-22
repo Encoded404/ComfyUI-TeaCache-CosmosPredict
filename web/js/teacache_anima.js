@@ -1,181 +1,117 @@
 // TeaCacheAnima — collapsible override section + conditional sub-widgets
 //
-//  1.  An "overrides" combo (hide/show) toggles four override dropdowns.
-//  2.  Each dropdown shows conditional sub-widgets (e.g. residual_blend
-//      appears only when residual_strategy="blended").
+//  Uses widgets defined in Python INPUT_TYPES['optional'] and toggles
+//  their visibility (widget.hidden) rather than add/removing them.
+//  This ensures the new ComfyUI frontend includes their values in the
+//  prompt payload.
+//
+//  1.  An "overrides" combo (hide/show) toggles the override widgets.
+//  2.  Each dropdown shows conditional sub-widgets (e.g. residual_scale
+//      appears only when residual_strategy="scaled").
 //  3.  Widget state survives workflow save/reload via onSerialize/onConfigure.
 
 (function () {
-  // Resolve the ComfyApp instance from the global API surface.
-  //   New frontend (~1.45+): window.comfyAPI.app = module, .app.app = instance
-  //   Old frontend:           window.comfyAPI.app = instance directly
   function resolveApp() {
     var m = window.comfyAPI && window.comfyAPI.app;
     return (m && m.registerExtension) ? m : (m && m.app);
   }
 
-  // Debug: confirm the JS file itself loaded
   console.log("[TeaCache] JS file loaded, checking environment...");
-  console.log("[TeaCache] window.comfyAPI keys:", window.comfyAPI ? Object.keys(window.comfyAPI) : "N/A");
-  console.log("[TeaCache] window.comfyAPI.app =", window.comfyAPI && window.comfyAPI.app);
   if (window.comfyAPI && window.comfyAPI.app) {
     console.log("[TeaCache] window.comfyAPI.app.app =", window.comfyAPI.app.app);
   }
-  console.log("[TeaCache] Resolved app =", resolveApp());
 
-  // Wait for comfyAPI before registering (poll up to 6 seconds)
   var attempts = 0;
   function register() {
     var app = resolveApp();
     if (!app || !app.registerExtension) {
       if (attempts === 0) console.log("[TeaCache] comfyAPI.app not ready yet, polling...");
       if (++attempts < 60) { setTimeout(register, 100); }
-      else console.log("[TeaCache] GAVE UP after " + attempts + " attempts — app still not ready");
+      else console.log("[TeaCache] GAVE UP after " + attempts + " attempts");
       return;
     }
-    console.log("[TeaCache] Found ComfyApp instance, registering extension...");
 
-    // ---------------------------------------------------------------------------
-    //  Override dropdown definitions
-    // ---------------------------------------------------------------------------
-    var OVERRIDES = {
+    // ---- Widget names (must match Python INPUT_TYPES['optional'] keys) ----
+    var MAIN_OVERRIDES = ["residual_strategy", "block_mode", "accumulation_type", "step_schedule"];
+    var CONDITIONALS = {
       residual_strategy: {
-        type: "combo", default: "auto",
-        opts: { values: ["auto", "hard", "blended", "scaled"] },
-      },
-      block_mode: {
-        type: "combo", default: "auto",
-        opts: { values: ["auto", "all_or_nothing", "split_fraction", "split_groups"] },
+        blended:  "residual_blend",
+        scaled:   "residual_scale",
       },
       accumulation_type: {
-        type: "combo", default: "auto",
-        opts: { values: ["auto", "hard_reset", "carry_over", "leaky", "windowed"] },
-      },
-      step_schedule: {
-        type: "combo", default: "auto",
-        opts: { values: ["auto", "constant", "cosine", "linear_ramp", "linear_decay", "bell"] },
-      },
-    };
-
-    // ---------------------------------------------------------------------------
-    //  Conditional sub-widgets keyed by parent dropdown name
-    // ---------------------------------------------------------------------------
-    var CONDITIONAL = {
-      residual_strategy: {
-        blended:  { name: "residual_blend",  type: "number", default: 0.5, opts: { min: 0.0, max: 1.0, step: 0.01 } },
-        scaled:   { name: "residual_scale",  type: "number", default: 0.8, opts: { min: 0.01, max: 1.0, step: 0.01 } },
-      },
-      accumulation_type: {
-        leaky:    { name: "leak_factor",     type: "number", default: 0.9, opts: { min: 0.01, max: 0.999, step: 0.001 } },
-        windowed: { name: "window_size",     type: "number", default: 5,   opts: { min: 2, max: 50, step: 1 } },
+        leaky:    "leak_factor",
+        windowed: "window_size",
       },
       block_mode: {
-        split_fraction: { name: "always_fraction", type: "number", default: 0.36, opts: { min: 0.01, max: 0.99, step: 0.01 } },
+        split_fraction: "always_fraction",
       },
     };
-
-    var CONDITIONAL_NAMES = new Set();
-    for (var k in CONDITIONAL) {
-      if (!CONDITIONAL.hasOwnProperty(k)) continue;
-      for (var k2 in CONDITIONAL[k]) {
-        if (!CONDITIONAL[k].hasOwnProperty(k2)) continue;
-        CONDITIONAL_NAMES.add(CONDITIONAL[k][k2].name);
+    var ALL_NAMES = new Set(MAIN_OVERRIDES.concat("overrides"));
+    for (var p in CONDITIONALS) {
+      if (!CONDITIONALS.hasOwnProperty(p)) continue;
+      for (var v in CONDITIONALS[p]) {
+        if (CONDITIONALS[p].hasOwnProperty(v)) ALL_NAMES.add(CONDITIONALS[p][v]);
       }
     }
-    var ALL_DYNAMIC = new Set();
-    for (var n in OVERRIDES) {
-      if (OVERRIDES.hasOwnProperty(n)) ALL_DYNAMIC.add(n);
-    }
-    CONDITIONAL_NAMES.forEach(function(n) { ALL_DYNAMIC.add(n); });
-    ALL_DYNAMIC.add("overrides");
 
-    // ---------------------------------------------------------------------------
-    //  Helpers
-    // ---------------------------------------------------------------------------
+    // ---- Helpers ----
+    function getWidget(node, name) {
+      var w = node.widgets || [];
+      for (var i = 0; i < w.length; i++) { if (w[i].name === name) return w[i]; }
+      return null;
+    }
+
+    function setHidden(node, name, hidden) {
+      var w = getWidget(node, name);
+      if (w) w.hidden = hidden;
+    }
+
     function reflow(node) {
       if (node._setConcreteSlots) node._setConcreteSlots();
       if (node.graph && node.arrange) node.arrange();
-      var app = resolveApp();
-      var canvas = app && app.canvas;
-      if (canvas) canvas.setDirty(true, true);
-    }
-
-    function removeW(node, name) {
-      var widgets = node.widgets || [];
-      for (var i = 0; i < widgets.length; i++) {
-        if (widgets[i].name === name && node.removeWidget) {
-          node.removeWidget(widgets[i]);
-          return;
-        }
-      }
-    }
-
-    function addCond(node, typeName, value, saved) {
-      var cfg = CONDITIONAL[typeName] && CONDITIONAL[typeName][value];
-      if (!cfg) return;
-      var widgets = node.widgets || [];
-      for (var i = 0; i < widgets.length; i++) {
-        if (widgets[i].name === cfg.name) return;
-      }
-      node.addWidget(cfg.type, cfg.name, (saved && saved[cfg.name] !== undefined) ? saved[cfg.name] : cfg.default, function() {}, cfg.opts);
+      var a = resolveApp();
+      var c = a && a.canvas;
+      if (c) c.setDirty(true, true);
     }
 
     function syncCond(node, saved) {
-      for (var typeName in CONDITIONAL) {
-        if (!CONDITIONAL.hasOwnProperty(typeName)) continue;
-        var widgets = node.widgets || [];
-        var dd = null;
-        for (var i = 0; i < widgets.length; i++) {
-          if (widgets[i].name === typeName) { dd = widgets[i]; break; }
-        }
+      for (var typeName in CONDITIONALS) {
+        if (!CONDITIONALS.hasOwnProperty(typeName)) continue;
+        var dd = getWidget(node, typeName);
         if (!dd) continue;
-        var owned = {};
-        for (var k in CONDITIONAL[typeName]) {
-          if (CONDITIONAL[typeName].hasOwnProperty(k))
-            owned[CONDITIONAL[typeName][k].name] = true;
+        // Hide all children of this type
+        for (var k in CONDITIONALS[typeName]) {
+          if (CONDITIONALS[typeName].hasOwnProperty(k))
+            setHidden(node, CONDITIONALS[typeName][k], true);
         }
-        for (var i = (node.widgets || []).length - 1; i >= 0; i--) {
-          if (owned[node.widgets[i].name]) removeW(node, node.widgets[i].name);
+        // Show the matching child (if we know it)
+        var child = CONDITIONALS[typeName][dd.value];
+        if (child) {
+          var savedVal = saved && saved[child] !== undefined ? saved[child] : undefined;
+          setHidden(node, child, false);
+          var cw = getWidget(node, child);
+          if (cw && savedVal !== undefined) cw.value = savedVal;
         }
-        addCond(node, typeName, dd.value, saved);
       }
     }
 
     function showOver(node, saved) {
-      for (var name in OVERRIDES) {
-        if (!OVERRIDES.hasOwnProperty(name)) continue;
-        var exists = false;
-        for (var i = 0; i < (node.widgets || []).length; i++) {
-          if (node.widgets[i].name === name) { exists = true; break; }
-        }
-        if (exists) continue;
-        var cfg = OVERRIDES[name];
-        var w = node.addWidget(cfg.type, name, (saved && saved[name] !== undefined) ? saved[name] : cfg.default, function() {}, cfg.opts);
-        if (CONDITIONAL[name]) {
-          var orig = w.callback;
-          w.callback = function(v, canvas, n) {
-            var node_ = n || this; // ComfyUI passes node as 3rd arg
-            if (orig) orig.call(w, v, canvas, node_);
-            syncCond(node_, {});
-            reflow(node_);
-          };
-        }
+      for (var i = 0; i < MAIN_OVERRIDES.length; i++) {
+        setHidden(node, MAIN_OVERRIDES[i], false);
+        var w = getWidget(node, MAIN_OVERRIDES[i]);
+        if (w && saved && saved[MAIN_OVERRIDES[i]] !== undefined)
+          w.value = saved[MAIN_OVERRIDES[i]];
       }
       syncCond(node, saved);
     }
 
     function hideOver(node) {
-      var widgets = node.widgets || [];
-      for (var i = widgets.length - 1; i >= 0; i--) {
-        if (ALL_DYNAMIC.has(widgets[i].name) && widgets[i].name !== "overrides") {
-          if (node.removeWidget) node.removeWidget(widgets[i]);
-        }
-      }
+      ALL_NAMES.forEach(function(n) {
+        if (n !== "overrides") setHidden(node, n, true);
+      });
     }
 
-    // ---------------------------------------------------------------------------
-    //  Register extension
-    // ---------------------------------------------------------------------------
+    // ---- Register extension ----
     app.registerExtension({
       name: "TeaCache.AnimaOverrides",
 
@@ -185,12 +121,32 @@
         var origCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
           if (origCreated) origCreated.call(this);
+
+          // Override dropdown callbacks so conditional widgets respond
+          var attachCb = function(n, name) {
+            var w = getWidget(n, name);
+            if (!w || w._tcHooked) return;
+            w._tcHooked = true;
+            var orig = w.callback;
+            w.callback = function(v, canvas, node_) {
+              var nn = node_ || n;
+              if (orig) orig.call(w, v, canvas, nn);
+              syncCond(nn, {});
+              reflow(nn);
+            };
+          };
+          for (var i = 0; i < MAIN_OVERRIDES.length; i++) attachCb(this, MAIN_OVERRIDES[i]);
+
+          // Add the "overrides" toggle at the end
           this.addWidget("combo", "overrides", "hide", function(v, canvas, node) {
             var n = node || this;
             if (v === "show") showOver(n, {});
             else hideOver(n);
             reflow(n);
           }, { values: ["hide", "show"] });
+
+          // Start with all override widgets hidden
+          hideOver(this);
         };
 
         var origConfigure = nodeType.prototype.onConfigure;
@@ -198,16 +154,12 @@
           if (origConfigure) origConfigure.call(this, data);
           var saved = data && data._teacache_overrides;
           if (saved && Object.keys(saved).length > 0) {
-            var widgets = this.widgets || [];
-            var overW = null;
-            for (var i = 0; i < widgets.length; i++) {
-              if (widgets[i].name === "overrides") { overW = widgets[i]; break; }
-            }
+            var overW = getWidget(this, "overrides");
             var overrideVal = saved.overrides !== undefined ? saved.overrides : "hide";
-            if (overW) overW.value = overrideVal;
-
-            if (overrideVal === "show") {
-              showOver(this, saved);
+            if (overW) {
+              overW.value = overrideVal;
+              if (overrideVal === "show") showOver(this, saved);
+              else hideOver(this);
             } else {
               hideOver(this);
             }
@@ -219,17 +171,17 @@
         nodeType.prototype.onSerialize = function (data) {
           if (origSerialize) origSerialize.call(this, data);
           var saved = {};
-          var widgets = this.widgets || [];
-          for (var i = 0; i < widgets.length; i++) {
-            if (ALL_DYNAMIC.has(widgets[i].name))
-              saved[widgets[i].name] = widgets[i].value;
+          var ws = this.widgets || [];
+          for (var i = 0; i < ws.length; i++) {
+            if (ALL_NAMES.has(ws[i].name))
+              saved[ws[i].name] = ws[i].value;
           }
           if (Object.keys(saved).length > 0) data._teacache_overrides = saved;
         };
       },
     });
 
-    console.log("TeaCacheAnima: override extension loaded");
+    console.log("TeaCacheAnima: override extension loaded (hidden-based)");
   }
 
   register();

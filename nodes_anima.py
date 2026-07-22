@@ -350,6 +350,38 @@ class TeaCacheAnima:
                                         "display": "slider",
                                         "tooltip": "0 = max quality (lossless), 50 = balanced, 100 = max speed"}),
             },
+            "optional": {
+                "residual_strategy": (
+                    ["auto", "hard", "blended", "scaled"],
+                    {"default": "auto",
+                     "tooltip": "Override preset's residual strategy."},
+                ),
+                "residual_blend": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01,
+                                                "tooltip": "Blend factor for 'blended' strategy (unused; actual blend = 1 - confidence)."}),
+                "residual_scale": ("FLOAT", {"default": 0.8, "min": 0.01, "max": 1.0, "step": 0.01,
+                                                "tooltip": "Scale factor for 'scaled' strategy."}),
+                "block_mode": (
+                    ["auto", "all_or_nothing", "split_fraction", "split_groups"],
+                    {"default": "auto",
+                     "tooltip": "Override preset's block mode."},
+                ),
+                "accumulation_type": (
+                    ["auto", "hard_reset", "carry_over", "leaky", "windowed"],
+                    {"default": "auto",
+                     "tooltip": "Override preset's accumulation type."},
+                ),
+                "step_schedule": (
+                    ["auto", "constant", "cosine", "linear_ramp", "linear_decay", "bell"],
+                    {"default": "auto",
+                     "tooltip": "Override preset's step schedule."},
+                ),
+                "leak_factor": ("FLOAT", {"default": 0.9, "min": 0.01, "max": 0.999, "step": 0.001,
+                                             "tooltip": "Leak decay factor for 'leaky' accumulation."}),
+                "window_size": ("INT", {"default": 5, "min": 2, "max": 50, "step": 1,
+                                           "tooltip": "Window size for 'windowed' accumulation."}),
+                "always_fraction": ("FLOAT", {"default": 0.36, "min": 0.01, "max": 0.99, "step": 0.01,
+                                                 "tooltip": "Fraction of always-run blocks for 'split_fraction' mode."}),
+            },
         }
 
     RETURN_TYPES = ("MODEL",)
