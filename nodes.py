@@ -1176,10 +1176,10 @@ class TeaCache:
             teacache_enabled = start_percent <= current_percent <= end_percent
             c["transformer_options"]["enable_teacache"] = teacache_enabled
                 
-            if teacache_enabled:
-                with context:
-                    return model_function(input, timestep, **c)
-            else:
+            # Always apply the _forward patch so torch.compile sees a stable
+            # function identity.  The teacache forward handles the
+            # enable_teacache=False case efficiently by running all blocks.
+            with context:
                 return model_function(input, timestep, **c)
 
         new_model.set_model_unet_function_wrapper(unet_wrapper_function)

@@ -309,10 +309,10 @@ def _apply_teacache(model, cfg: TeacacheConfig, preset_steps: int = 30):
             if step_idx == 0 and hasattr(diffusion_model, 'teacache_state'):
                 delattr(diffusion_model, 'teacache_state')
 
-        if teacache_enabled:
-            with context:
-                return model_function(input_x, timestep, **c)
-        else:
+        # Always apply the _forward patch so torch.compile sees a stable
+        # function identity.  teacache_anima_forward handles the
+        # enable_teacache=False case efficiently by running all blocks.
+        with context:
             return model_function(input_x, timestep, **c)
 
     new_model.set_model_unet_function_wrapper(unet_wrapper)
