@@ -1276,16 +1276,31 @@ class CompileModel:
         torch._dynamo.config.suppress_errors = True
         
         new_model = model.clone()
+        dm = new_model.get_model_object("diffusion_model")
+
+        # Normalize context=None -> zero-tensor so torch.compile never sees
+        # None, avoiding dynamo type-guard recompiles on the MiniTrainDIT.forward
+        # context: torch.Tensor annotation (predict2.py:203).
+        _crossattn_dim = getattr(dm, "crossattn_emb_channels", 1024)
+        _orig_forward = dm.forward
+        def _context_safe_forward(x, timesteps, context, fps=None,
+                                  padding_mask=None, **kwargs):
+            if context is None:
+                context = x.new_zeros(1, 0, _crossattn_dim)
+            return _orig_forward(x, timesteps, context, fps, padding_mask,
+                                 **kwargs)
+        dm.forward = _context_safe_forward.__get__(dm, dm.__class__)
+
         new_model.add_object_patch(
-                                "diffusion_model",
-                                torch.compile(
-                                    new_model.get_model_object("diffusion_model"),
-                                    mode=mode,
-                                    backend=backend,
-                                    fullgraph=fullgraph,
-                                    dynamic=dynamic
-                                )
-                            )
+            "diffusion_model",
+            torch.compile(
+                dm,
+                mode=mode,
+                backend=backend,
+                fullgraph=fullgraph,
+                dynamic=dynamic
+            )
+        )
         
         return (new_model,)
     
