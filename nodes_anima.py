@@ -293,10 +293,9 @@ def _apply_teacache(model, cfg: TeacacheConfig, preset_steps: int = 30):
             step_frac = step_idx / max(len(sigmas) - 1, 1)
 
             # ── Fix 2: Precompute step-schedule multiplier as 0-d tensor ──
-            # Passing the raw float through transformer_options causes dynamo
+            # Passing raw floats through transformer_options causes dynamo
             # to specialize on each distinct value → recompilation every step.
             # A 0-d tensor has stable shape/dtype so dynamo doesn't recompile.
-            c_to["current_percent"] = step_frac
             c_to["tc_current_percent"] = torch.tensor(step_frac)
             c_to["tc_threshold_mult"] = torch.tensor(
                 step_schedule_multiplier(step_frac, cfg.step_schedule)

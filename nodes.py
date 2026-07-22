@@ -1173,7 +1173,6 @@ class TeaCache:
             
             current_percent = current_step_index / (len(sigmas) - 1)
             c["transformer_options"]["tc_current_percent"] = torch.tensor(current_percent)
-            c["transformer_options"]["current_percent"] = current_percent
             teacache_enabled = start_percent <= current_percent <= end_percent
             c["transformer_options"]["enable_teacache"] = teacache_enabled
                 
