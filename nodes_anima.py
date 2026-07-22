@@ -21,6 +21,7 @@ from typing import Dict, List, Tuple
 
 from .tuning.config_types import TeacacheConfig
 
+import torch
 
 # ── Rough heuristic: LPIPS ≈ accumulated_error × scale ────────────────
 # Calibrated empirically from a few validation runs.  The exact LPIPS
