@@ -6,22 +6,34 @@
 //  3.  Widget state survives workflow save/reload via onSerialize/onConfigure.
 
 (function () {
+  // Resolve the ComfyApp instance from the global API surface.
+  //   New frontend (~1.45+): window.comfyAPI.app = module, .app.app = instance
+  //   Old frontend:           window.comfyAPI.app = instance directly
+  function resolveApp() {
+    var m = window.comfyAPI && window.comfyAPI.app;
+    return (m && m.registerExtension) ? m : (m && m.app);
+  }
+
   // Debug: confirm the JS file itself loaded
   console.log("[TeaCache] JS file loaded, checking environment...");
-  console.log("[TeaCache] window.comfyAPI =", window.comfyAPI);
-  console.log("[TeaCache] window.app =", window.app);
+  console.log("[TeaCache] window.comfyAPI keys:", window.comfyAPI ? Object.keys(window.comfyAPI) : "N/A");
+  console.log("[TeaCache] window.comfyAPI.app =", window.comfyAPI && window.comfyAPI.app);
+  if (window.comfyAPI && window.comfyAPI.app) {
+    console.log("[TeaCache] window.comfyAPI.app.app =", window.comfyAPI.app.app);
+  }
+  console.log("[TeaCache] Resolved app =", resolveApp());
 
   // Wait for comfyAPI before registering (poll up to 6 seconds)
   var attempts = 0;
   function register() {
-    var app = window.comfyAPI && window.comfyAPI.app;
-    if (!app) {
-      if (attempts === 0) console.log("[TeaCache] comfyAPI not available yet, polling...");
+    var app = resolveApp();
+    if (!app || !app.registerExtension) {
+      if (attempts === 0) console.log("[TeaCache] comfyAPI.app not ready yet, polling...");
       if (++attempts < 60) { setTimeout(register, 100); }
-      else console.log("[TeaCache] GAVE UP after " + attempts + " attempts — window.comfyAPI still undefined");
+      else console.log("[TeaCache] GAVE UP after " + attempts + " attempts — app still not ready");
       return;
     }
-    console.log("[TeaCache] Found window.comfyAPI.app, registering extension...");
+    console.log("[TeaCache] Found ComfyApp instance, registering extension...");
 
     // ---------------------------------------------------------------------------
     //  Override dropdown definitions
@@ -83,7 +95,8 @@
     function reflow(node) {
       if (node._setConcreteSlots) node._setConcreteSlots();
       if (node.arrange) node.arrange();
-      var canvas = window.comfyAPI && window.comfyAPI.app && window.comfyAPI.app.canvas;
+      var app = resolveApp();
+      var canvas = app && app.canvas;
       if (canvas) canvas.setDirty(true, true);
     }
 
