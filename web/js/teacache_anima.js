@@ -167,7 +167,7 @@
     function hideOver(node) {
       var widgets = node.widgets || [];
       for (var i = widgets.length - 1; i >= 0; i--) {
-        if (ALL_DYNAMIC.has(widgets[i].name)) {
+        if (ALL_DYNAMIC.has(widgets[i].name) && widgets[i].name !== "overrides") {
           if (node.removeWidget) node.removeWidget(widgets[i]);
         }
       }
