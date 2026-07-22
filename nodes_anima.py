@@ -201,10 +201,16 @@ def _apply_teacache(model, cfg: TeacacheConfig, preset_steps: int = 30):
     original forward is restored when TeaCache is not active.
     """
     from unittest.mock import patch
-    from .tuning.forward import teacache_anima_forward
+    from .tuning.forward import teacache_anima_forward, step_schedule_multiplier
 
     new_model = model.clone()
     diffusion_model = new_model.get_model_object("diffusion_model")
+
+    # Pre-acquire cross-attention dimension for context=None normalization
+    _crossattn_dim = getattr(
+        diffusion_model.blocks[0].cross_attn, "context_dim",
+        getattr(diffusion_model, "crossattn_emb_channels", 1024),
+    )
 
     # Inject config + step baseline into transformer_options
     to = new_model.model_options.setdefault("transformer_options", {})
@@ -224,6 +230,15 @@ def _apply_teacache(model, cfg: TeacacheConfig, preset_steps: int = 30):
         timestep = kwargs["timestep"]
         c = kwargs["c"]
         c_to = c.setdefault("transformer_options", {})
+
+        # ── Fix 1: Normalize context=None → zero-tensor for torch.compile ──
+        # The outer MiniTrainDIT.forward has context: torch.Tensor (non-optional).
+        # When CFG unconditional passes None, dynamo recompiles every call.
+        # A zero-token tensor preserves the None → self-attention fallback in
+        # Attention.compute_qkv because 0-token k/v produce zero output.
+        if c.get("c_crossattn") is None:
+            c["c_crossattn"] = input_x.new_zeros(1, 0, _crossattn_dim)
+
         sigmas = c_to.get("sample_sigmas")
 
         teacache_enabled = False
@@ -237,9 +252,19 @@ def _apply_teacache(model, cfg: TeacacheConfig, preset_steps: int = 30):
                     if (sigmas[i] - timestep[0]) * (sigmas[i + 1] - timestep[0]) <= 0:
                         step_idx = i
                         break
-            c_to["current_percent"] = step_idx / max(len(sigmas) - 1, 1)
+            step_frac = step_idx / max(len(sigmas) - 1, 1)
+
+            # ── Fix 2: Precompute step-schedule multiplier as 0-d tensor ──
+            # Passing the raw float through transformer_options causes dynamo
+            # to specialize on each distinct value → recompilation every step.
+            # A 0-d tensor has stable shape/dtype so dynamo doesn't recompile.
+            c_to["current_percent"] = step_frac
+            c_to["tc_current_percent"] = torch.tensor(step_frac)
+            c_to["tc_threshold_mult"] = torch.tensor(
+                step_schedule_multiplier(step_frac, cfg.step_schedule)
+            )
             teacache_enabled = (
-                cfg.start_percent <= c_to["current_percent"] <= cfg.end_percent
+                cfg.start_percent <= step_frac <= cfg.end_percent
             )
             c_to["enable_teacache"] = teacache_enabled
 

@@ -511,7 +511,12 @@ def teacache_anima_forward(
 
     # ── 3b. Determine current step index and runtime step-count scaling ──
     sigmas = transformer_options.get("sample_sigmas", None)
-    current_percent = transformer_options.get("current_percent", 0.0)
+    # Read from 0-d tensor (wrapped by unet_wrapper) rather than raw float
+    # in transformer_options — dynamo specializes on dict-read float values
+    # and recompiles every step when current_percent changes.
+    current_percent = transformer_options.get(
+        "tc_current_percent", torch.tensor(0.0)
+    ).item()
     if sigmas is not None:
         n_steps = max(len(sigmas) - 1, 1)
         preset_steps = transformer_options.get("preset_steps", n_steps)
@@ -546,8 +551,10 @@ def teacache_anima_forward(
                 )
                 state["last_predicted"] = float(predicted) if isinstance(predicted, (int, float)) else float(predicted.item())
 
-                # Knob 7: Step schedule
-                mult = step_schedule_multiplier(current_percent, cfg.step_schedule)
+                # Knob 7: Step schedule (mult precomputed as 0-d tensor in wrapper)
+                mult = transformer_options.get(
+                    "tc_threshold_mult", torch.tensor(1.0)
+                ).item()
                 effective_thresh = cfg.rel_l1_thresh * mult * cfg.signal_scale * step_scale
 
                 # Knob 5+6: Accumulation + threshold
@@ -608,8 +615,7 @@ def teacache_anima_forward(
     if not should_calc_global:
         self._tc_diag_skips += 1
     # Print summary on the last cache-eligible step (before end_percent cutoff)
-    cp = transformer_options.get("current_percent", 0)
-    if cp > 0 and cp >= cfg.end_percent and self._tc_diag_runs > 1 and not hasattr(self, "_tc_diag_final"):
+    if current_percent > 0 and current_percent >= cfg.end_percent and self._tc_diag_runs > 1 and not hasattr(self, "_tc_diag_final"):
         self._tc_diag_final = True
         total = self._tc_diag_runs
         skipped = self._tc_diag_skips
@@ -630,7 +636,9 @@ def teacache_anima_forward(
 
     if not should_calc_global:
         # ── Knob 9: Apply cached residual(s) ──
-        mult = step_schedule_multiplier(current_percent, cfg.step_schedule)
+        mult = transformer_options.get(
+            "tc_threshold_mult", torch.tensor(1.0)
+        ).item()
         effective_thresh = cfg.rel_l1_thresh * mult * cfg.signal_scale * step_scale
 
         for i, k in enumerate(cond_or_uncond):
@@ -674,7 +682,7 @@ def teacache_anima_forward(
                             resid = pg.get("prev_residuals", [None] * len(groups))[gi]
                             if resid is not None:
                                 acc = pg["accumulated"][gi]
-                                eff = cfg.rel_l1_thresh * step_schedule_multiplier(current_percent, cfg.step_schedule) * cfg.signal_scale * step_scale
+                                eff = cfg.rel_l1_thresh * transformer_options.get("tc_threshold_mult", torch.tensor(1.0)).item() * cfg.signal_scale * step_scale
                                 conf = min(acc / max(eff, 1e-8), 1.0)
                                 x_B_T_H_W_D[i * b : (i + 1) * b] = apply_residual(
                                     x_B_T_H_W_D[i * b : (i + 1) * b], resid,

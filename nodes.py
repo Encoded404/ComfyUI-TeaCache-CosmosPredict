@@ -1143,6 +1143,11 @@ class TeaCache:
             input = kwargs["input"]
             timestep = kwargs["timestep"]
             c = kwargs["c"]
+
+            # Normalize context=None → zero-tensor for torch.compile type stability
+            if c.get("c_crossattn") is None:
+                c["c_crossattn"] = input.new_zeros(1, 0, 1)
+
             # referenced from https://github.com/kijai/ComfyUI-KJNodes/blob/d126b62cebee81ea14ec06ea7cd7526999cb0554/nodes/model_optimization_nodes.py#L868
             sigmas = c["transformer_options"]["sample_sigmas"]
             matched_step_index = (sigmas == timestep[0]).nonzero()
@@ -1167,6 +1172,7 @@ class TeaCache:
                     delattr(diffusion_model, 'previous_residual')
             
             current_percent = current_step_index / (len(sigmas) - 1)
+            c["transformer_options"]["tc_current_percent"] = torch.tensor(current_percent)
             c["transformer_options"]["current_percent"] = current_percent
             teacache_enabled = start_percent <= current_percent <= end_percent
             c["transformer_options"]["enable_teacache"] = teacache_enabled
