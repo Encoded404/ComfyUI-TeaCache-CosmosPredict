@@ -29,8 +29,22 @@ import json
 from pathlib import Path
 
 
-def _make_control_point(p):
-    """Build a control point dict from a Pareto frontier entry."""
+def _find_closest_on_curve(curve, target_error):
+    """From a threshold_curve [(t, err, sp), ...], find the triple whose
+    error is closest to *target_error*.  Returns (threshold, actual_error, speedup)."""
+    best = min(curve, key=lambda x: abs(x[1] - target_error))
+    return best[0], best[1], best[2]
+
+
+def _make_control_point(p, target_error=None):
+    """Build a control point dict from a Pareto frontier entry.
+
+    When *target_error* is provided and the Pareto entry carries a
+    ``threshold_curve``, the threshold is refined by finding the point
+    on the curve whose error is closest to *target_error*.  This lets
+    us create synthetic control points at arbitrary error levels that
+    correspond to real simulation results for that config.
+    """
     cfg = p["config"]
     slim_config = {
         "source": cfg.get("source", "pooled_latent"),
@@ -56,6 +70,18 @@ def _make_control_point(p):
         "block_level": cfg.get("block_level", "unified"),
         "block_level_config_scope": cfg.get("block_level_config_scope", ["*"]),
     }
+
+    if target_error is not None and p.get("threshold_curve"):
+        t, actual_err, actual_sp = _find_closest_on_curve(
+            p["threshold_curve"], target_error,
+        )
+        slim_config["rel_l1_thresh"] = t
+        return {
+            "error": round(actual_err, 6),
+            "config": slim_config,
+            "speedup": round(actual_sp, 3),
+        }
+
     return {
         "error": round(p["accumulated_error"], 6),
         "config": slim_config,
@@ -64,8 +90,24 @@ def _make_control_point(p):
 
 
 def _collect_all_in_range(pareto, lo, hi):
-    """Return a control point for every Pareto point within [lo, hi]."""
-    return [_make_control_point(p) for p in pareto if lo <= p["accumulated_error"] <= hi]
+    """Return a control point for every Pareto point within [lo, hi].
+
+    When *lo* is below the Pareto minimum or *hi* above the maximum,
+    synthetic edge points are created by adjusting the nearest config's
+    threshold via its pre-computed threshold curve.
+    """
+    p_min = pareto[0]["accumulated_error"]
+    p_max = pareto[-1]["accumulated_error"]
+
+    points = [_make_control_point(p) for p in pareto if lo <= p["accumulated_error"] <= hi]
+
+    if lo < p_min and pareto[0].get("threshold_curve"):
+        points.insert(0, _make_control_point(pareto[0], target_error=lo))
+
+    if hi > p_max and pareto[-1].get("threshold_curve"):
+        points.append(_make_control_point(pareto[-1], target_error=hi))
+
+    return points
 
 
 def _sample_control_points(pareto, lo, hi, num_points,
@@ -75,21 +117,27 @@ def _sample_control_points(pareto, lo, hi, num_points,
     For each target error (evenly spaced in normalized-quality space), finds the
     top 2 closest Pareto points.  Candidates sorted by proximity (best-justified
     first) then greedily assigned: first choice if free, second choice if taken,
-    forced first if both taken.  Final dedup via *error* key.
+    forced first if both taken.
+
+    Each assigned point then refines its threshold via the Pareto entry's
+    ``threshold_curve`` so the threshold exactly matches the target error
+    (rather than relying on the Pareto-optimal threshold for that config).
+    Final dedup via *error* key.
     """
     targets = [_apply_quality_curve(i / (num_points - 1), lo, hi,
                                     curve=quality_curve, power=quality_power)
                for i in range(num_points)]
 
-    # Top-2 nearest neighbor per target
+    # Top-2 nearest neighbor per target (track original target)
     candidates = []
     for t in targets:
         idx_sorted = sorted(range(len(pareto)),
                             key=lambda i: abs(pareto[i]["accumulated_error"] - t))
         fst, snd = idx_sorted[0], idx_sorted[1] if len(idx_sorted) > 1 else idx_sorted[0]
         candidates.append({
-            "first_pidx":  fst,
-            "first_dist":  abs(pareto[fst]["accumulated_error"] - t),
+            "target":     t,
+            "first_pidx": fst,
+            "first_dist": abs(pareto[fst]["accumulated_error"] - t),
             "second_pidx": snd,
             "second_dist": abs(pareto[snd]["accumulated_error"] - t),
         })
@@ -97,7 +145,7 @@ def _sample_control_points(pareto, lo, hi, num_points,
     # Greedy assign: best-justified targets first
     candidates.sort(key=lambda c: (c["first_dist"], c["first_pidx"]))
     assigned = set()
-    pts = []
+    seen = {}
     for c in candidates:
         if c["first_pidx"] not in assigned:
             chosen = c["first_pidx"]
@@ -106,27 +154,26 @@ def _sample_control_points(pareto, lo, hi, num_points,
         else:
             chosen = c["first_pidx"]
         assigned.add(chosen)
-        pts.append(pareto[chosen])
 
-    # Deduplicate by error
-    seen = {}
-    for p in pts:
-        cp = _make_control_point(p)
+        cp = _make_control_point(pareto[chosen], target_error=c["target"])
         seen[cp["error"]] = cp
+
     return sorted(seen.values(), key=lambda cp: cp["error"])
 
 
 def _resolve_error_range(pareto, error_min, error_max):
-    """Determine min/max error bounds from inputs or data."""
+    """Determine min/max error bounds from inputs or data.
+
+    Does *not* clamp to the Pareto data range — the callers
+    (``_collect_all_in_range`` / ``_sample_control_points``) handle
+    out-of-range values by creating synthetic edge points via the
+    threshold curves stored on each Pareto entry.
+    """
     p_min = pareto[0]["accumulated_error"]
     p_max = pareto[-1]["accumulated_error"]
 
     lo = error_min if error_min is not None else p_min
     hi = error_max if error_max is not None else p_max
-
-    # Clamp to data range so every point has a real config to sample
-    lo = max(lo, p_min)
-    hi = min(hi, p_max)
 
     if lo >= hi:
         lo, hi = p_min, p_max

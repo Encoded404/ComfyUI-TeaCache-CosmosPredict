@@ -257,24 +257,30 @@ class OptimizationResult:
     estimated_speedup: float
     accumulated_error: float
     score: float  # combined quality × speedup
+    threshold_curve: Optional[List] = None  # [(threshold, err, speedup), ...] from Pareto sweep
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "config": self.config.to_dict(),
             "skip_rate": self.skip_rate,
             "estimated_speedup": self.estimated_speedup,
             "accumulated_error": self.accumulated_error,
             "score": self.score,
         }
+        if self.threshold_curve is not None:
+            d["threshold_curve"] = [list(triple) for triple in self.threshold_curve]
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "OptimizationResult":
+        curve = d.get("threshold_curve")
         return cls(
             config=TeacacheConfig.from_dict(d["config"]),
             skip_rate=d["skip_rate"],
             estimated_speedup=d["estimated_speedup"],
             accumulated_error=d["accumulated_error"],
             score=d["score"],
+            threshold_curve=[tuple(x) for x in curve] if curve is not None else None,
         )
 
 

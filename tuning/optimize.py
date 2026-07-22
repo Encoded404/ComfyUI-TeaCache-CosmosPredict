@@ -439,6 +439,35 @@ def _best_threshold(
     return best
 
 
+def _sweep_threshold_curve(
+    sim_data: SimData,
+    cfg: TeacacheConfig,
+    thresholds: list,
+    scoring_config: dict,
+) -> tuple:
+    """Simulate *cfg* at all *thresholds*, returning (best, curve).
+
+    *best*  is the same 5-tuple as _best_threshold.
+    *curve* is a list of (threshold, accumulated_error, estimated_speedup) triples
+            for every threshold in the sweep — used downstream by build_presets to
+            find exact thresholds for arbitrary target errors.
+    """
+    best_sc = -1.0
+    best = (0.0, 0.0, 1.0, 1.0, thresholds[0])
+    curve = []
+
+    for t in thresholds:
+        skip, err, sp, _ = _simulate_config_sd(sim_data, cfg, t)
+        curve.append((t, err, sp))
+        quality = compute_quality_score(err, scoring_config)
+        sc = sp * quality
+        if sc > best_sc:
+            best_sc = sc
+            best = (skip, err, sp, quality, t)
+
+    return best, curve
+
+
 def _process_config(idx_and_cfg: tuple) -> tuple:
     """Process a single config in a worker process. Sweeps candidate thresholds.
 
@@ -487,14 +516,14 @@ def _init_sweep_worker(sim_data: SimData, sweep_values: list, scoring_config: di
 
 def _sweep_pareto_config(idx_and_cfg: tuple) -> tuple:
     """Sweep all thresholds for one Pareto config.
-    Returns (idx, skip, err, sp, best_t)."""
+    Returns (idx, skip, err, sp, best_t, curve)."""
     idx, cfg = idx_and_cfg
     global _worker_sim_data, _worker_sweep_values, _worker_scoring
 
-    skip, err, sp, _quality, best_t = _best_threshold(
+    (skip, err, sp, _quality, best_t), curve = _sweep_threshold_curve(
         _worker_sim_data, cfg, _worker_sweep_values, _worker_scoring,
     )
-    return idx, skip, err, sp, best_t
+    return idx, skip, err, sp, best_t, curve
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1436,7 +1465,7 @@ def optimize(configs: List[TeacacheConfig],
             initializer=_init_sweep_worker,
             initargs=(holdout_sd, sweep_values, scoring_config),
         ) as pool:
-            for idx, skip, err, sp, best_t in pool.imap_unordered(
+            for idx, skip, err, sp, best_t, curve in pool.imap_unordered(
                 _sweep_pareto_config, indexed, chunksize=1
             ):
                 r = pareto[idx]
@@ -1444,6 +1473,7 @@ def optimize(configs: List[TeacacheConfig],
                 r.skip_rate = skip
                 r.accumulated_error = err
                 r.estimated_speedup = sp
+                r.threshold_curve = curve
                 r.score = sp * compute_quality_score(err, scoring_config)
 
                 done += 1
@@ -1461,13 +1491,14 @@ def optimize(configs: List[TeacacheConfig],
         print()
     else:
         for i, r in enumerate(pareto):
-            best_skip, best_err, best_sp, _quality, best_t = _best_threshold(
+            (best_skip, best_err, best_sp, _quality, best_t), curve = _sweep_threshold_curve(
                 holdout_sd, r.config, sweep_values, scoring_config,
             )
             r.config.rel_l1_thresh = best_t
             r.skip_rate = best_skip
             r.accumulated_error = best_err
             r.estimated_speedup = best_sp
+            r.threshold_curve = curve
             r.score = best_sp * compute_quality_score(best_err, scoring_config)
 
             elapsed = time_mod.time() - t_sweep_start
