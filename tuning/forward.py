@@ -487,27 +487,28 @@ def teacache_anima_forward(
     if not hasattr(self, "teacache_state"):
         self.teacache_state = {}
 
-    if enable_teacache:
+    for k in cond_or_uncond:
+        if k not in self.teacache_state:
+            self.teacache_state[k] = {
+                "accumulated": 0.0,
+                "should_calc": True,
+                "prev_mod": None,
+                "prev_residual": None,
+                "prev_residual_late": None,
+                "accum_state": {},
+                "per_group": None,
+            }
+
+    if enable_teacache and cfg.block_mode == "dynamic" and cfg.block_level == "per_group":
+        groups = detect_block_groups(self.blocks)
         for k in cond_or_uncond:
-            if k not in self.teacache_state:
-                self.teacache_state[k] = {
-                    "accumulated": 0.0,
-                    "should_calc": True,
-                    "prev_mod": None,
-                    "prev_residual": None,
-                    "prev_residual_late": None,
-                    "accum_state": {},
-                    "per_group": None,
+            if self.teacache_state[k].get("per_group") is None:
+                self.teacache_state[k]["per_group"] = {
+                    "accumulated": [0.0] * len(groups),
+                    "should_calc": [True] * len(groups),
+                    "accum_state": [{} for _ in groups],
+                    "prev_residuals": [None] * len(groups),
                 }
-            if cfg.block_mode == "dynamic" and cfg.block_level == "per_group":
-                groups = detect_block_groups(self.blocks)
-                if self.teacache_state[k].get("per_group") is None:
-                    self.teacache_state[k]["per_group"] = {
-                        "accumulated": [0.0] * len(groups),
-                        "should_calc": [True] * len(groups),
-                        "accum_state": [{} for _ in groups],
-                        "prev_residuals": [None] * len(groups),
-                    }
 
     # ── 3b. Determine current step index and runtime step-count scaling ──
     sigmas = transformer_options.get("sample_sigmas", None)
