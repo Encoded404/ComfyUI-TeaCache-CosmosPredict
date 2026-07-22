@@ -152,6 +152,20 @@
         var origConfigure = nodeType.prototype.onConfigure;
         nodeType.prototype.onConfigure = function (data) {
           if (origConfigure) origConfigure.call(this, data);
+
+          // Reset override/conditional widget values to INPUT_TYPES defaults.
+          // origConfigure restores widgets_values by position, but old
+          // serialised workflows had a completely different widget order so
+          // values end up in the wrong widget (e.g. "auto" string in a FLOAT).
+          var ws = this.widgets || [];
+          for (var i = 0; i < ws.length; i++) {
+            if (ALL_NAMES.has(ws[i].name) && ws[i].name !== "overrides") {
+              var def = ws[i].options && ws[i].options.default;
+              if (def !== undefined) ws[i].value = def;
+            }
+          }
+
+          // Now restore saved override state on top of clean defaults
           var saved = data && data._teacache_overrides;
           if (saved && Object.keys(saved).length > 0) {
             var overW = getWidget(this, "overrides");
@@ -164,6 +178,9 @@
               hideOver(this);
             }
             reflow(this);
+          } else {
+            // No saved overrides — ensure override widgets stay hidden
+            hideOver(this);
           }
         };
 
