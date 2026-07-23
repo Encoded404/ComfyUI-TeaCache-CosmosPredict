@@ -307,19 +307,10 @@ def apply_residual(
         if params is None:
             params = {}
         scale = params.get("scale", 0.8)
-        result = x + residual.to(x.device) * scale
-        print(f"  [TeaCache DEBUG apply_residual] strategy=scaled scale={scale:.4f} "
-              f"x_mean={x.abs().mean().item():.4f} resid_mean={residual.abs().mean().item():.4f} "
-              f"result_mean={result.abs().mean().item():.4f} "
-              f"diff_vs_hard={((x + residual.to(x.device)) - result).abs().mean().item():.4f}")
-        return result
+        return x + residual.to(x.device) * scale
 
     # "hard" (default)
-    result = x + residual.to(x.device)
-    print(f"  [TeaCache DEBUG apply_residual] strategy=hard "
-          f"x_mean={x.abs().mean().item():.4f} resid_mean={residual.abs().mean().item():.4f} "
-          f"result_mean={result.abs().mean().item():.4f}")
-    return result
+    return x + residual.to(x.device)
 
 
 # ═════════════════════════════════════════════════════════════════════
