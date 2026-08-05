@@ -167,6 +167,7 @@ def _quality_to_config(quality: float) -> Tuple[TeacacheConfig, float, float, in
         base_config = base["config"]
         cfg = TeacacheConfig.from_dict(base_config)
         cfg.rel_l1_thresh = round(max(thresh, 0.001), 4)
+        cfg.step_mults = base.get("step_mults")
         lpips_est = target_error * lpips_scale
 
     else:
@@ -176,6 +177,7 @@ def _quality_to_config(quality: float) -> Tuple[TeacacheConfig, float, float, in
         cfg = TeacacheConfig.from_dict(base_config)
         cfg.rel_l1_thresh = round(max(thresh, 0.001), 4)
         nearest = hi if t > 0.5 else lo
+        cfg.step_mults = nearest.get("step_mults")
         speedup = nearest["speedup"]
         lpips_est = target_error * lpips_scale
 
@@ -239,7 +241,7 @@ def _apply_teacache(model, cfg: TeacacheConfig, preset_steps: int = 30):
     original forward is restored when TeaCache is not active.
     """
     from unittest.mock import patch
-    from .tuning.forward import teacache_anima_forward, step_schedule_multiplier
+    from .tuning.forward import teacache_anima_forward, step_schedule_multiplier, step_count_multiplier
 
     new_model = model.clone()
     diffusion_model = new_model.get_model_object("diffusion_model")
@@ -299,6 +301,9 @@ def _apply_teacache(model, cfg: TeacacheConfig, preset_steps: int = 30):
             c_to["tc_current_percent"] = torch.tensor(step_frac)
             c_to["tc_threshold_mult"] = torch.tensor(
                 step_schedule_multiplier(step_frac, cfg.step_schedule)
+            )
+            c_to["tc_step_mult"] = torch.tensor(
+                step_count_multiplier(max(len(sigmas) - 1, 1), cfg.step_mults)
             )
             teacache_enabled = (
                 cfg.start_percent <= step_frac <= cfg.end_percent

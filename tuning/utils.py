@@ -482,6 +482,26 @@ def compute_total_iterations(step_counts: dict[int, int]) -> int:
     return sum(steps * count for steps, count in step_counts.items())
 
 
+def derive_step_anchors(variants: list, base: int) -> list:
+    """Derive the step-count anchor list for step-multiplier measurement.
+
+    Starts from the user-provided *variants*, sorts/dedupes, force-includes
+    *base* (the calibrated default step count), and inserts the midpoint
+    ``(a + b) // 2`` for each adjacent pair of user variants (skipped when
+    no integer lies between them).
+
+    Example: ``derive_step_anchors([3, 15, 45, 60], 30)`` →
+    ``[3, 9, 15, 30, 45, 52, 60]``.
+    """
+    vs = sorted(set(variants))
+    midpoints = []
+    for a, b in zip(vs, vs[1:]):
+        m = (a + b) // 2
+        if a < m < b:
+            midpoints.append(m)
+    return sorted(set(vs) | set(midpoints) | {base})
+
+
 def print_schedule_estimate(
     label: str,
     total_generations: int,

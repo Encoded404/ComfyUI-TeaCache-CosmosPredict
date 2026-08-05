@@ -225,6 +225,22 @@ def _add_midpoints(pareto, control_points):
     return control_points
 
 
+def _add_step_mults(pareto, control_points):
+    """Enrich control points with their Pareto entry's ``step_mults`` table.
+
+    Called *before* ``_add_midpoints``: it reads (but does not pop) each
+    control point's internal ``_pareto_idx`` key, which ``_add_midpoints``
+    pops before writing.  Pareto entries without a table (e.g. legacy
+    rebuilds from an old pareto_frontier.json) produce ``"step_mults": None``.
+    """
+    for cp in control_points:
+        pareto_idx = cp.get("_pareto_idx")
+        p = pareto[pareto_idx] if (pareto_idx is not None
+                                   and 0 <= pareto_idx < len(pareto)) else None
+        cp["step_mults"] = p.get("step_mults") if p is not None else None
+    return control_points
+
+
 def _resolve_error_range(pareto, error_min, error_max):
     """Determine min/max error bounds from inputs or data.
 
@@ -293,6 +309,7 @@ def build_presets(
     else:
         control_points = _collect_all_in_range(pareto, lo, hi)
 
+    control_points = _add_step_mults(pareto, control_points)
     control_points = _add_midpoints(pareto, control_points)
 
     presets = {
@@ -312,7 +329,17 @@ def build_presets(
         if quality_curve == "power":
             presets["_quality_power"] = quality_power
 
-    if preset_steps is not None:
+    # _steps must equal the measured base of the step-mult tables (the true
+    # anchor), falling back to the explicit --steps arg when no tables exist.
+    measured_base = None
+    for cp in control_points:
+        sm = cp.get("step_mults")
+        if isinstance(sm, dict) and sm.get("base") is not None:
+            measured_base = sm["base"]
+            break
+    if measured_base is not None:
+        presets["_steps"] = measured_base
+    elif preset_steps is not None:
         presets["_steps"] = preset_steps
 
     return presets

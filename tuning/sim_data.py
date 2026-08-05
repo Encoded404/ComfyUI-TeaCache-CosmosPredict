@@ -27,6 +27,7 @@ class GroupData:
     """
 
     n_steps: int
+    total_steps: int  # step count the group was calibrated at (n_steps = total_steps - 1 per cond slot)
     prompt_id: int
     seed: int
     cond: int  # 0 or 1 for cond / uncond CFG slot
@@ -107,6 +108,7 @@ class SimData:
 
             groups.append(GroupData(
                 n_steps=n,
+                total_steps=total_steps,
                 prompt_id=prompt_id,
                 seed=seed,
                 cond=cond,
@@ -131,6 +133,15 @@ class SimData:
     def filter_by_prompt_ids(self, keep_ids: set) -> "SimData":
         """Return new SimData containing only groups whose prompt_id is in keep_ids."""
         kept = tuple(g for g in self.groups if g.prompt_id in keep_ids)
+        return SimData(groups=kept, n_entries=sum(g.n_steps for g in kept))
+
+    def filter_by_step_count(self, n: int) -> "SimData":
+        """Return new SimData containing only groups calibrated at *n* total steps.
+
+        Filters on ``GroupData.total_steps`` (not ``n_steps``, which is
+        entries-per-cond = total_steps - 1) to avoid off-by-one errors.
+        """
+        kept = tuple(g for g in self.groups if g.total_steps == n)
         return SimData(groups=kept, n_entries=sum(g.n_steps for g in kept))
 
 

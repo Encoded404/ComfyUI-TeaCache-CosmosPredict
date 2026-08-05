@@ -230,6 +230,31 @@ def step_schedule_multiplier(step_fraction: float, schedule_type: str) -> float:
     return 1.0
 
 
+def step_count_multiplier(n_steps: int, mults: Optional[dict]) -> float:
+    """Return the measured step-count threshold multiplier for *n_steps*.
+
+    Piecewise-linear interpolation over the table's sorted ``points``
+    (``[[step_count, ratio], ...]``), clamped at the endpoints — never
+    extrapolated.  Returns 1.0 (no compensation) when *mults* is None or
+    has fewer than 2 points.
+    """
+    if not mults:
+        return 1.0
+    points = sorted(mults.get("points") or [])
+    if len(points) < 2:
+        return 1.0
+    if n_steps <= points[0][0]:
+        return points[0][1]
+    if n_steps >= points[-1][0]:
+        return points[-1][1]
+    for (xa, ya), (xb, yb) in zip(points, points[1:]):
+        if xa <= n_steps <= xb:
+            if xb == xa:
+                return ya
+            return ya + (yb - ya) * (n_steps - xa) / (xb - xa)
+    return points[-1][1]
+
+
 # ═════════════════════════════════════════════════════════════════════
 #  Knob 8: Block group detection
 # ═════════════════════════════════════════════════════════════════════
@@ -511,19 +536,17 @@ def teacache_anima_forward(
                 }
 
     # ── 3b. Determine current step index and runtime step-count scaling ──
-    sigmas = transformer_options.get("sample_sigmas", None)
     # Read from 0-d tensor (wrapped by unet_wrapper) rather than raw float
     # in transformer_options — dynamo specializes on dict-read float values
     # and recompiles every step when current_percent changes.
     current_percent = transformer_options.get(
         "tc_current_percent", torch.tensor(0.0)
     ).item()
-    if sigmas is not None:
-        n_steps = max(len(sigmas) - 1, 1)
-        preset_steps = transformer_options.get("preset_steps", n_steps)
-        step_scale = preset_steps / n_steps
-    else:
-        step_scale = 1.0
+    # Measured step-count multiplier (0-d tensor set by unet_wrapper) —
+    # replaces the old unvalidated preset_steps / n_steps linear rule.
+    step_scale = transformer_options.get(
+        "tc_step_mult", torch.tensor(1.0)
+    ).item()
 
     # ── 4. Per-slot distance → mapping → accumulation (Knobs 2–7) ──
     if enable_teacache:

@@ -59,6 +59,11 @@ class TeacacheConfig:
     cross_feed_enabled: bool = False
     cross_feed_strength: float = 0.5
 
+    # Step-count threshold multiplier table {"base": int, "points": [[N, ratio], ...]}.
+    # Runtime metadata carried on the Python object only — never serialized
+    # into the slim preset config (it arrives via the control point instead).
+    step_mults: Optional[dict] = None
+
     def __post_init__(self):
         if isinstance(self.signal_scale, dict):
             raise TypeError(
@@ -258,6 +263,7 @@ class OptimizationResult:
     accumulated_error: float
     score: float  # combined quality × speedup
     threshold_curve: Optional[List] = None  # [(threshold, err, speedup), ...] from Pareto sweep
+    step_mults: Optional[dict] = None  # {"base": int, "points": [[N, ratio], ...]}
 
     def to_dict(self) -> dict:
         d = {
@@ -269,6 +275,8 @@ class OptimizationResult:
         }
         if self.threshold_curve is not None:
             d["threshold_curve"] = [list(triple) for triple in self.threshold_curve]
+        if self.step_mults is not None:
+            d["step_mults"] = self.step_mults
         return d
 
     @classmethod
@@ -281,6 +289,7 @@ class OptimizationResult:
             accumulated_error=d["accumulated_error"],
             score=d["score"],
             threshold_curve=[tuple(x) for x in curve] if curve is not None else None,
+            step_mults=d.get("step_mults"),
         )
 
 

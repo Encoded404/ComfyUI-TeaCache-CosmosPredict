@@ -31,6 +31,7 @@
 
     "optimization": {
         "sources": ["t_emb", "first_block_shift", "pooled_latent"],
+        "step_count_variants": [3, 15, 45, 60],
         "pooled_latent_mode": "mean",
         "metric_types": ["mean_only", "mean_and_max", "mean_max_std"],
         "metric_weights_scenarios": [
