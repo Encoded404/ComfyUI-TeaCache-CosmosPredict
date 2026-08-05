@@ -14,6 +14,7 @@
         "scheduler": "normal",
         "width": 512,
         "height": 512,
+        "resolution_mix": {"512x512": 0.75, "1024x1024": 0.15, "1024x512": 0.1},
         "sampler_variants": ["er_sde", "dpmpp_2m_sde", "euler_a"],
         "scheduler_variants": ["normal", "simple"],
         "cfg_variants": [4.0, 4.5, 5.0, 5.5]
@@ -104,8 +105,7 @@
         "record_slots": "both",
         "dtype": "bfloat16",
         "keep_all": true,
-        "eval_prompts": 6,
-        "resolution_mix": {"512x512": 0.8, "1024x1024": 0.2}
+        "eval_prompts": 6
     },
 
     "output_dir": "outputs",

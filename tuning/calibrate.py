@@ -245,12 +245,14 @@ def run_calibration(comfy_dir: str, config_path: str = None, overrides: dict = N
         config_path = str(Path(__file__).parent / "config.json")
     tcfg = TuningConfig.load(config_path)
 
-    # CLI/API overrides (num_prompts, seeds, refiner)
+    # CLI/API overrides (num_prompts, seeds, sampling, refiner)
     overrides = overrides or {}
     if "num_prompts" in overrides:
         tcfg.calibration["num_prompts"] = overrides["num_prompts"]
     if "seeds" in overrides:
         tcfg.calibration["seeds"] = overrides["seeds"]
+    if "sampling" in overrides:
+        tcfg.sampling.update(overrides["sampling"])
     refiner_cfg = dict(getattr(tcfg, "refiner", {}) or {})
     refiner_cfg.update(overrides.get("refiner", {}) or {})
 
@@ -263,15 +265,24 @@ def run_calibration(comfy_dir: str, config_path: str = None, overrides: dict = N
     refiner_cfg["mode"] = refiner_mode
 
     if refiner_mode != "off":
-        mix = refiner_cfg.get("resolution_mix") or {}
-        try:
-            refiner_cfg["resolution_mix"] = refiner_data.parse_resolution_mix(mix)
-        except ValueError as e:
-            raise SystemExit(f"[refiner] invalid resolution_mix: {e}") from e
         record_slots = refiner_cfg.get("record_slots", "both")
         if record_slots not in ("both", "cond"):
             print(f"  ⚠ invalid refiner record_slots {record_slots!r} — using 'both'")
             refiner_cfg["record_slots"] = "both"
+
+    # Resolution mix lives in the base sampling config (plan Task 1, revised):
+    # it is a sampling property, not a refiner-recording one, so it applies to
+    # every calibration generation regardless of refiner mode. Deterministic
+    # assignment per generation index (seeded RNG, independent of
+    # prompt/seed/step selection). Absent/empty → all generations at the base
+    # sampling width/height (legacy behavior).
+    mix_spec = tcfg.sampling.get("resolution_mix") or None
+    res_mix = None
+    if mix_spec:
+        try:
+            res_mix = refiner_data.parse_resolution_mix(mix_spec)
+        except ValueError as e:
+            raise SystemExit(f"[calibrate] invalid sampling.resolution_mix: {e}") from e
 
     # Setup output
     out_dir = Path(tcfg.output_dir) / time.strftime("%Y%m%d-%H%M%S")
@@ -311,8 +322,9 @@ def run_calibration(comfy_dir: str, config_path: str = None, overrides: dict = N
     print(f"  Block data:     {'ON  (per-block deltas recorded)' if record_blocks else 'OFF'}")
     print(f"  Refiner data:   {refiner_mode}"
           + (f"  (slots={refiner_cfg.get('record_slots', 'both')}, "
-             f"mix={refiner_cfg.get('resolution_mix')}, "
              f"top_n={refiner_cfg.get('top_n', -1)})" if refiner_mode != "off" else ""))
+    res_display = res_mix or f"{tcfg.sampling['width']}x{tcfg.sampling['height']} (fixed)"
+    print(f"  Resolutions:    {res_display}")
     print(f"  Output:         {out_dir}")
     print("=" * 60)
 
@@ -361,7 +373,7 @@ def run_calibration(comfy_dir: str, config_path: str = None, overrides: dict = N
     ]
     if refiner_mode != "off":
         refiner_disk = refiner_data.estimate_refiner_disk_bytes(
-            total_runs, avg_steps, refiner_cfg["resolution_mix"],
+            total_runs, avg_steps, res_mix or {f"{w}x{h}": 1.0},
             refiner_cfg.get("record_slots", "both"),
         )
         extra_lines.append(
@@ -395,7 +407,15 @@ def run_calibration(comfy_dir: str, config_path: str = None, overrides: dict = N
     refiner_dir = out_dir / "refiner_data"
     refiner_manifest = None
     eval_prompt_ids = set()
+    # Resolution assignments: deterministic per generation index (plan Task 1);
+    # applies to all calibration generations whenever sampling.resolution_mix
+    # is set, independent of refiner mode.
     res_assignments = []
+    if res_mix is not None:
+        rng = random.Random(_RESOLUTION_RNG_SEED)
+        res_assignments = [_draw_resolution(rng, res_mix) for _ in range(total_runs)]
+        print(f"  [calibrate] resolutions: "
+              f"{ {k: res_assignments.count(k) for k in res_mix} }")
     if refiner_mode != "off":
         refiner_dir.mkdir(parents=True, exist_ok=True)
         refiner_manifest = refiner_data.init_manifest(refiner_cfg)
@@ -405,14 +425,9 @@ def run_calibration(comfy_dir: str, config_path: str = None, overrides: dict = N
         # training pairs (plan Task 1).
         eval_n = int(refiner_cfg.get("eval_prompts", 6))
         eval_prompt_ids = set(range(max(len(prompts) - eval_n, 0), len(prompts)))
-        rng = random.Random(_RESOLUTION_RNG_SEED)
-        res_assignments = [_draw_resolution(rng, refiner_cfg["resolution_mix"])
-                           for _ in range(total_runs)]
         print(f"  [refiner] recording to {refiner_dir}")
         print(f"  [refiner] eval prompts: {sorted(eval_prompt_ids)} "
               f"(recorded, excluded from training pairs)")
-        print(f"  [refiner] resolutions: "
-              f"{ {k: res_assignments.count(k) for k in refiner_cfg['resolution_mix']} }")
 
     for pi, pdata in enumerate(prompts):
         # Cycle sampler / scheduler / cfg per prompt for variety
@@ -428,9 +443,9 @@ def run_calibration(comfy_dir: str, config_path: str = None, overrides: dict = N
                 run_idx += 1
                 t0 = time.time()
 
-                # Refiner resolution mix: deterministic per generation index
-                # (plan Task 1); scalar-only runs stay at the config resolution.
-                if refiner_mode != "off":
+                # Resolution mix: deterministic per generation index (plan
+                # Task 1, lives in sampling config); absent → base resolution.
+                if res_assignments:
                     res_key = res_assignments[run_idx - 1]
                     width, height = refiner_data.parse_resolution(res_key)
                 else:
@@ -576,7 +591,7 @@ def main():
                         help="Keep at most N most-volatile generations per "
                              "resolution (default: config; -1 = keep all)")
     parser.add_argument("--refiner-resolutions", default=None,
-                        help="Override resolution mix, e.g. "
+                        help="Override sampling.resolution_mix, e.g. "
                              "'512x512:0.8,1024x1024:0.2' (plain 'WxH' entries "
                              "get equal shares)")
     args = parser.parse_args()
@@ -590,6 +605,8 @@ def main():
         overrides["num_prompts"] = args.prompts
     if args.seeds is not None:
         overrides["seeds"] = [int(s) for s in args.seeds.split(",")]
+    if args.refiner_resolutions is not None:
+        overrides["sampling"] = {"resolution_mix": args.refiner_resolutions}
 
     refiner_overrides = {}
     if args.refiner_data is not None:
@@ -597,8 +614,6 @@ def main():
     if args.refiner_top_n is not None:
         refiner_overrides["top_n"] = args.refiner_top_n
         refiner_overrides["keep_all"] = args.refiner_top_n < 0
-    if args.refiner_resolutions is not None:
-        refiner_overrides["resolution_mix"] = args.refiner_resolutions
     if refiner_overrides:
         overrides["refiner"] = refiner_overrides
 
