@@ -492,6 +492,51 @@ Validation tests multiple resolutions and step counts to verify generalization b
 | `extra_threshold_sweep` | Threshold values swept when `--extra-sweep` is passed. Default: 14 values from 0.02 to 5.0 |
 | `extra_threshold_sweep_errors` | Sweep the config nearest each error target. Default: `[0.01,0.03,0.05,0.10]` |
 
+### Artist tags (`artist_tags`)
+
+Anima uses artist tags (`@artist name`) heavily. The pool in `prompts/artists.json`
+drives weighted per-generation injection: each generation (prompt × seed ×
+steps × resolution) draws its own prefix/negative variant and artist tags, so
+a run covers many more artists and variants without extra generations.
+
+```json
+"artist_tags": {
+    "enabled": true,
+    "pool_file": "prompts/artists.json",
+    "weight_mode": "relative",
+    "max_tags": 1,
+    "seed": 42
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `enabled` | Master switch. `false` (or missing pool file) → prompts unchanged |
+| `pool_file` | Path to the artist pool JSON (relative to `tuning/`) |
+| `weight_mode` | `relative`: weights are likelihoods — 3 is 3× as likely as 1. `static`: weights must sum to 1.0 (loader warns + auto-normalizes) |
+| `max_tags` | Max non-empty artists injected per generation (drawn without replacement) |
+| `seed` | RNG salt — combined with the generation key, keeps runs reproducible |
+
+Pool format:
+
+```json
+{
+  "artists": [
+    { "tag": null,           "weight": 60 },   // null = "nothing": NO artist block
+    { "tag": "@artgerm",     "weight": 3 },
+    { "tag": "@anima \\(togashi\\)", "weight": 0.5 }
+  ]
+}
+```
+
+Tags are injected verbatim between the prefix and the prompt text and pass
+straight through to the model — backslashes, unicode, slashes and escaped
+parens are preserved (`\(` is a literal paren; `(text)` would be emphasis).
+Entries with `weight <= 0` are never drawn but stay in the file. Tags
+containing commas/newlines trigger a load warning. Baseline and TeaCache runs
+in validation always use the identical prompt per generation key, so metrics
+remain comparable.
+
 #### CLI presets
 
 | Flag | Effect |

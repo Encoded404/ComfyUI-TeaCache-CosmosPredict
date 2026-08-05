@@ -13,6 +13,7 @@ Usage:
 
 import argparse
 import json
+import random
 import sys
 import time
 from pathlib import Path
@@ -536,6 +537,87 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
     return True
 
 
+def _run_artist_system_test():
+    """Test the per-generation artist-tag + variant sampler (pure CPU, no GPU).
+
+    Covers: determinism (same generation key → same draw), variation across
+    keys, the weighted distribution (incl. the empty "nothing" sentinel), and
+    verbatim rendering between prefix and prompt text.
+    """
+    from .artist_tags import ArtistPool, ArtistTag, render_artist_block, select_artists
+    from .prompt_loader import (PromptConfig, PromptEntry,
+                                GenerationPromptSampler, resolve_generation)
+
+    print(f"\n{'─' * 60}")
+    print(f"  Artist Tag System Test")
+    print(f"{'─' * 60}")
+
+    pool = ArtistPool(artists=[
+        ArtistTag(tag=None, weight=2.0),
+        ArtistTag(tag="@shanguier", weight=1.0),
+        ArtistTag(tag="@anima \\(togashi\\)", weight=0.5),
+    ])
+    pcfg = PromptConfig(
+        default_prefix="masterpiece, best quality, ",
+        default_negative="worst quality, ",
+        prefix_variants=["masterpiece, best quality, ", "best quality, masterwork, "],
+        negative_variants=["worst quality, ", "low quality, "],
+        prompts=[PromptEntry(text="1girl, silver hair, portrait")],
+    )
+    sampler = GenerationPromptSampler(pcfg, pool, {"seed": 42, "max_tags": 1})
+    entry = pcfg.prompts[0]
+
+    # 1) Determinism: the same generation key always yields the same draw
+    def _sig(k):
+        return (k[0], k[1], tuple(k[2]))
+
+    first = _sig(resolve_generation(sampler, entry, 0, 34635345, 30, 512, 512))
+    for _ in range(5):
+        assert _sig(resolve_generation(sampler, entry, 0, 34635345, 30, 512, 512)) == first
+    print("  [1/4] determinism:        OK  (same key → same prompt)")
+
+    # 2) Variation: different generation keys produce different prompts
+    seen = set()
+    for pi in range(3):
+        for seed in (1, 2):
+            for steps in (20, 30):
+                for w, h in ((512, 512), (1024, 1024)):
+                    seen.add(_sig(resolve_generation(sampler, entry, pi, seed, steps, w, h)))
+    assert len(seen) >= 8, f"only {len(seen)} distinct draws over 24 keys"
+    print(f"  [2/4] variation:          OK  ({len(seen)} distinct draws / 24 keys)")
+
+    # 3) Weighted distribution: nothing ≈ 2/3.5 ≈ 57%; @shanguier ≈ 2x @anima
+    counts = {}
+    rng = random.Random(7)
+    n = 20000
+    for _ in range(n):
+        tags = select_artists(pool, rng, 1)
+        counts[None] = counts.get(None, 0) + (1 if not tags else 0)
+        for t in tags:
+            counts[t] = counts.get(t, 0) + 1
+    nothing_share = counts[None] / n
+    shan = counts.get("@shanguier", 0)
+    anima = counts.get("@anima \\(togashi\\)", 0)
+    assert 0.53 <= nothing_share <= 0.62, f"nothing share {nothing_share:.4f}"
+    assert 0.6 <= shan / max(anima, 1) <= 3.5, f"weight ratio {shan}/{anima} off"
+    print(f"  [3/4] distribution:       OK  (nothing={nothing_share:.1%}, "
+          f"@shanguier={shan} ≈ 2× @anima={anima})")
+
+    # 4) Rendering: artist block sits between prefix and text, escapes verbatim
+    full, neg, artists = resolve_generation(sampler, entry, 3, 42, 30, 1024, 512)
+    assert full.startswith("masterpiece") or full.startswith("best quality")
+    assert full.endswith("portrait")
+    if artists:
+        tag = artists[0]
+        assert tag in full
+        assert full.index(tag) < full.index(entry.text[:4])
+    block = render_artist_block(["@a", "@b \\(c\\)"])
+    assert block == "@a, @b \\(c\\), "
+    print("  [4/4] rendering:          OK  (verbatim tags, prefix→artists→text)")
+
+    print(f"  Artist system: all checks passed.\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description="TeaCache Anima Smoke Test")
     parser.add_argument("--comfy-dir", required=True,
@@ -543,6 +625,7 @@ def main():
     parser.add_argument("--steps", type=int, default=30,
                         help="Number of sampling steps (default: 30)")
     args = parser.parse_args()
+    _run_artist_system_test()
     success = run_smoke_test(args.comfy_dir, args.steps)
     sys.exit(0 if success else 1)
 

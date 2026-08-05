@@ -35,7 +35,8 @@ from .utils import (
     print_metrics_legend, print_schedule_estimate, print_speed_summary,
 )
 from .forward import teacache_anima_forward
-from .prompt_loader import load_prompt_config, select_prompts, resolve_prompt
+from .prompt_loader import load_prompt_config, select_prompts, GenerationPromptSampler, resolve_generation
+from .artist_tags import load_pool_for_config
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -116,11 +117,15 @@ def precompute_baselines(
     resolutions: List[Tuple[int, int]],
     step_counts: List[int],
     tcfg: TuningConfig,
+    sampler: GenerationPromptSampler,
 ) -> Dict[tuple, dict]:
     """Generate baselines once per (resolution, steps, prompt, seed) combo.
 
     Returns dict keyed by (width, height, steps, prompt_idx, seed), each
-    value being {"image": PIL.Image, "time": float}.
+    value being {"image": PIL.Image, "time": float, "prompt": str,
+    "negative": str, "artists": list}. The prompt for each key is drawn
+    deterministically (per-generation variants + artist tags), so the
+    teacache run under the same key uses the identical prompt.
     """
     baselines: Dict[tuple, dict] = {}
     total = len(resolutions) * len(step_counts) * len(prompts) * len(seeds)
@@ -133,22 +138,30 @@ def precompute_baselines(
             for pi, pdata in enumerate(prompts):
                 for seed in seeds:
                     key = (w, h, steps, pi, seed)
+                    full_prompt, neg_prompt, artists = resolve_generation(
+                        sampler, pdata["entry"], pi, seed, steps, w, h,
+                    )
                     torch.cuda.empty_cache()
                     t0 = time.time()
                     img = sample(
-                        unet, clip, vae, pdata["prompt"],
+                        unet, clip, vae, full_prompt,
                         seed=seed, steps=steps,
                         cfg=tcfg.sampling["cfg"],
                         sampler_name=tcfg.sampling["sampler"],
                         scheduler=tcfg.sampling["scheduler"],
                         width=w, height=h,
-                        negative=pdata["negative"],
+                        negative=neg_prompt,
                     )
                     dt = time.time() - t0
-                    baselines[key] = {"image": img, "time": dt}
+                    baselines[key] = {
+                        "image": img, "time": dt,
+                        "prompt": full_prompt, "negative": neg_prompt,
+                        "artists": artists,
+                    }
                     done += 1
+                    artist_short = artists[0][:20] if artists else "none"
                     print(f"  [{done:>3d}/{total}] {w}x{h} s={steps:>2d} "
-                          f"p={pi} seed={seed}  {dt:.1f}s")
+                          f"p={pi} seed={seed} art={artist_short}  {dt:.1f}s")
 
     return baselines
 
@@ -161,11 +174,16 @@ def load_validation_prompts(
     tcfg: TuningConfig,
     num_prompts: int = None,
     num_seeds: int = None,
-) -> Tuple[list, list]:
-    """Load and resolve prompts for validation.
+) -> Tuple[list, list, GenerationPromptSampler]:
+    """Load selected prompt entries for validation.
 
-    Returns (prompts_list, seeds_list) where prompts_list contains dicts
-    with 'prompt', 'negative', and 'entry' keys.
+    Prefix/negative variants and artist tags are NOT resolved here — they are
+    drawn deterministically per generation (keyed by prompt/seed/steps/
+    resolution), so every baseline and its teacache run share the same prompt
+    string for the same key.
+
+    Returns (prompts_list, seeds_list, sampler) where prompts_list contains
+    dicts with an 'entry' key.
     """
     cfg = tcfg.validation
     prompt_config = load_prompt_config(
@@ -178,20 +196,15 @@ def load_validation_prompts(
         count=count,
         tag_filter=cfg.get("prompt_tag_filter"),
     )
-    resolved = []
-    for i, entry in enumerate(entries):
-        full, neg = resolve_prompt(
-            prompt_config, entry,
-            prefix_variant_idx=i % max(len(prompt_config.prefix_variants), 1),
-            negative_variant_idx=i % max(len(prompt_config.negative_variants), 1),
-        )
-        resolved.append({"prompt": full, "negative": neg, "entry": entry})
+    prompts = [{"entry": e} for e in entries]
 
     seeds = list(cfg.get("seeds", [34635345]))
     if num_seeds is not None:
         seeds = seeds[:num_seeds]
 
-    return resolved, seeds
+    artist_pool = load_pool_for_config(tcfg)
+    sampler = GenerationPromptSampler(prompt_config, artist_pool, tcfg.artist_tags)
+    return prompts, seeds, sampler
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -298,13 +311,16 @@ def validate_config(
     width: int,
     height: int,
     steps: int,
+    prompt_sampler: GenerationPromptSampler,
     quiet: bool = False,
 ) -> ValidationResult:
     """End-to-end validation of one configuration at a specific
     resolution and step count.
 
     Uses precomputed baselines keyed by
-    (width, height, steps, prompt_idx, seed).
+    (width, height, steps, prompt_idx, seed). The prompt for each key is
+    re-drawn via the sampler, which must match the draw used when the
+    baseline was generated.
     """
     metric_names = qm.metric_names()
     all_scores: Dict[str, List[float]] = {k: [] for k in metric_names}
@@ -323,12 +339,15 @@ def validate_config(
                 print(f"  WARNING missing baseline for key={key}, skipping")
                 continue
 
+            full_prompt, neg_prompt, _ = resolve_generation(
+                prompt_sampler, pdata["entry"], pi, seed, steps, width, height,
+            )
             img_base = bl["image"]
             t_base = bl["time"]
 
             img_tc, t_tc, total_diag_steps, cached_diag_steps = run_single_teacache(
                 unet, clip, vae,
-                pdata["prompt"], pdata["negative"],
+                full_prompt, neg_prompt,
                 cfg,
                 seed=seed, steps=steps,
                 sampler=sampler, scheduler=scheduler,
@@ -398,6 +417,7 @@ def sweep_thresholds(
     width: int,
     height: int,
     steps: int,
+    prompt_sampler: GenerationPromptSampler,
 ) -> List[ValidationResult]:
     """Sweep threshold values for one base config at one resolution/steps."""
     results = []
@@ -407,7 +427,7 @@ def sweep_thresholds(
         print(f"\n  Threshold sweep: thresh={thresh}  ({width}x{height} @ {steps}s)")
         result = validate_config(
             cfg, unet, clip, vae, prompts, seeds, tcfg, qm,
-            baselines, width, height, steps,
+            baselines, width, height, steps, prompt_sampler,
         )
         results.append(result)
     return results
@@ -623,8 +643,16 @@ def main():
     )
 
     # ── Load prompts ───────────────────────────────────────────────────
-    prompts, seeds = load_validation_prompts(tcfg, num_prompts, num_seeds)
-    print(f"[prompts] {len(prompts)} prompts x {len(seeds)} seeds\n")
+    prompts, seeds, prompt_sampler = load_validation_prompts(tcfg, num_prompts, num_seeds)
+    if prompt_sampler.artist_pool is not None:
+        acfg = tcfg.artist_tags
+        print(f"[prompts] {len(prompts)} prompts x {len(seeds)} seeds "
+              f"(artist tags ON: {len(prompt_sampler.artist_pool.artists)} tags, "
+              f"mode={acfg.get('weight_mode', 'relative')}, "
+              f"max_tags={acfg.get('max_tags', 1)})\n")
+    else:
+        print(f"[prompts] {len(prompts)} prompts x {len(seeds)} seeds "
+              f"(artist tags OFF)\n")
 
     # ── Precompute baselines ───────────────────────────────────────────
     total_per_combo = len(prompts) * len(seeds)
@@ -655,6 +683,7 @@ def main():
     bsl_start = time.time()
     baselines = precompute_baselines(
         unet, clip, vae, prompts, seeds, resolutions, step_counts, tcfg,
+        prompt_sampler,
     )
     bsl_elapsed = time.time() - bsl_start
 
@@ -696,7 +725,7 @@ def main():
 
                 result = validate_config(
                     cfg, unet, clip, vae, prompts, seeds, tcfg, qm,
-                    baselines, w, h, steps,
+                    baselines, w, h, steps, prompt_sampler,
                 )
                 all_results.append((result, w, h, steps))
 
@@ -727,7 +756,7 @@ def main():
                 nearest.config, unet, clip, vae,
                 prompts, seeds, tcfg, qm,
                 sweep_threshes,
-                baselines, sw, sh, ssteps,
+                baselines, sw, sh, ssteps, prompt_sampler,
             )
             for r in sweep_results:
                 all_results.append((r, sw, sh, ssteps))

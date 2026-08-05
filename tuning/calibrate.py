@@ -35,11 +35,18 @@ from .config_types import CalibrationEntry, TuningConfig
 from .utils import load_models, sample, get_diffusion_model, detect_gpu, print_schedule_estimate, print_speed_summary
 from .recorder import make_calibration_forward, make_refiner_forward
 from . import refiner_data
-from .prompt_loader import load_prompt_config, select_prompts, resolve_prompt
+from .prompt_loader import load_prompt_config, select_prompts, GenerationPromptSampler, resolve_generation
+from .artist_tags import load_pool_for_config, print_artist_frequencies
 
 
 def load_calibration_prompts(tcfg: TuningConfig):
-    """Load and resolve prompts for calibration based on config settings."""
+    """Load and select prompts for calibration based on config settings.
+
+    Prefix/negative variants and artist tags are NOT resolved here — they are
+    drawn deterministically per generation (see GenerationPromptSampler), so
+    each (prompt, seed, steps, resolution) gets its own variation.
+    Returns (prompt_config, entries) where entries are {"entry": PromptEntry}.
+    """
     cfg = tcfg.calibration
     prompt_config = load_prompt_config(
         str(Path(__file__).parent / cfg["prompts_file"])
@@ -50,16 +57,7 @@ def load_calibration_prompts(tcfg: TuningConfig):
         count=cfg["num_prompts"],
         tag_filter=cfg.get("prompt_tag_filter"),
     )
-    # Resolve with cycling prefix/negative variants
-    resolved = []
-    for i, entry in enumerate(entries):
-        full, neg = resolve_prompt(
-            prompt_config, entry,
-            prefix_variant_idx=i % max(len(prompt_config.prefix_variants), 1),
-            negative_variant_idx=i % max(len(prompt_config.negative_variants), 1),
-        )
-        resolved.append({"prompt": full, "negative": neg, "entry": entry})
-    return resolved
+    return prompt_config, [{"entry": e} for e in entries]
 
 
 def patch_for_calibration(unet, steps: int, prompt_id: int, seed: int,
@@ -287,6 +285,9 @@ def run_calibration(comfy_dir: str, config_path: str = None, overrides: dict = N
     step_variants = tcfg.sampling["step_variants"]
     step_weights = tcfg.sampling["step_weights"]
 
+    # Artist-tag pool + per-generation prompt sampler
+    artist_pool = load_pool_for_config(tcfg)
+
     print("=" * 60)
     print("  TeaCache Calibration — Phase 1")
     print("=" * 60)
@@ -299,6 +300,13 @@ def run_calibration(comfy_dir: str, config_path: str = None, overrides: dict = N
     print(f"  Resolution:     {tcfg.sampling['width']}×{tcfg.sampling['height']}")
     print(f"  Prompts:        {tcfg.calibration['num_prompts']}")
     print(f"  Seeds:          {tcfg.calibration['seeds']}")
+    if artist_pool is not None:
+        acfg = tcfg.artist_tags
+        print(f"  Artist tags:    ON  ({len(artist_pool.artists)} tags, "
+              f"mode={acfg.get('weight_mode', 'relative')}, "
+              f"max_tags={acfg.get('max_tags', 1)}, seed={acfg.get('seed', 0)})")
+    else:
+        print(f"  Artist tags:    OFF")
     record_blocks = bool(tcfg.calibration.get("record_block_data", False))
     print(f"  Block data:     {'ON  (per-block deltas recorded)' if record_blocks else 'OFF'}")
     print(f"  Refiner data:   {refiner_mode}"
@@ -313,7 +321,8 @@ def run_calibration(comfy_dir: str, config_path: str = None, overrides: dict = N
         tcfg.comfy_dir, tcfg.model_name,
         tcfg.clip_name, tcfg.clip_type, tcfg.vae_name,
     )
-    prompts = load_calibration_prompts(tcfg)
+    prompt_config, prompts = load_calibration_prompts(tcfg)
+    prompt_sampler = GenerationPromptSampler(prompt_config, artist_pool, tcfg.artist_tags)
     seeds = tcfg.calibration["seeds"]
     sampler_variants = tcfg.sampling.get("sampler_variants", [tcfg.sampling["sampler"]])
     scheduler_variants = tcfg.sampling.get("scheduler_variants", [tcfg.sampling["scheduler"]])
@@ -326,8 +335,9 @@ def run_calibration(comfy_dir: str, config_path: str = None, overrides: dict = N
     for i, pdata in enumerate(prompts):
         sampler = sampler_variants[i % len(sampler_variants)]
         cfg_val = cfg_variants[i % len(cfg_variants)]
-        tags = [t for t in pdata["entry"].tags[:4]] if "entry" in pdata else []
-        short = pdata["prompt"][:80].replace("\n", " ")
+        entry = pdata["entry"]
+        tags = [t for t in entry.tags[:4]]
+        short = entry.text[:80].replace("\n", " ")
         print(f"    {i:>2}: [{sampler} cfg={cfg_val}]  [{', '.join(tags)}]  {short}...")
 
     total_runs = len(prompts) * len(seeds) * len(step_variants)
@@ -374,6 +384,7 @@ def run_calibration(comfy_dir: str, config_path: str = None, overrides: dict = N
         return
 
     all_entries: list[CalibrationEntry] = []
+    artist_draws: list[list[str]] = []
     run_idx = 0
     total_iterations = 0
     wall_start = time.time()
@@ -425,6 +436,12 @@ def run_calibration(comfy_dir: str, config_path: str = None, overrides: dict = N
                 else:
                     width, height = w, h
 
+                # Per-generation prefix/negative variant + artist-tag draw
+                full_prompt, neg_prompt, artists = resolve_generation(
+                    prompt_sampler, pdata["entry"], pi, seed, steps, width, height,
+                )
+                artist_draws.append(artists)
+
                 torch.cuda.empty_cache()
                 torch.cuda.reset_peak_memory_stats()
 
@@ -444,14 +461,14 @@ def run_calibration(comfy_dir: str, config_path: str = None, overrides: dict = N
 
                 try:
                     img = sample(
-                        unet, clip, vae, pdata["prompt"],
+                        unet, clip, vae, full_prompt,
                         seed=seed, steps=steps,
                         cfg=cur_cfg,
                         sampler_name=cur_sampler,
                         scheduler=cur_scheduler,
                         width=width,
                         height=height,
-                        negative=pdata["negative"],
+                        negative=neg_prompt,
                     )
                 finally:
                     restore_model(dm, original_fwd, unet)
@@ -491,6 +508,9 @@ def run_calibration(comfy_dir: str, config_path: str = None, overrides: dict = N
                             "height": height,
                             "steps": steps,
                             "fps": None,
+                            "prompt": full_prompt,
+                            "negative": neg_prompt,
+                            "artists": artists,
                         },
                         refiner_cfg=refiner_cfg,
                         eval_prompt_ids=eval_prompt_ids,
@@ -500,11 +520,12 @@ def run_calibration(comfy_dir: str, config_path: str = None, overrides: dict = N
                 vram = torch.cuda.max_memory_allocated() / (1024 ** 3)
                 eta = (dt * (total_runs - run_idx)) / 60.0
 
+                artist_short = artists[0][:24] if artists else "none"
                 print(
                     f"[calib] {run_idx}/{total_runs}  "
                     f"p={pi} s={seed} steps={steps}  "
                     f"sampler={cur_sampler} cfg={cur_cfg}  "
-                    f"res={width}x{height}  "
+                    f"res={width}x{height}  art={artist_short}  "
                     f"took={dt:.1f}s  entries={len(run_entries)}  "
                     f"valid={len(valid)}  VRAM={vram:.1f}GB  ETA={eta:.0f}m"
                 )
@@ -519,6 +540,8 @@ def run_calibration(comfy_dir: str, config_path: str = None, overrides: dict = N
         total_iterations=total_iterations,
         wall_seconds=wall_elapsed,
     )
+    if artist_pool is not None and artist_draws:
+        print_artist_frequencies(artist_draws, artist_pool, len(artist_draws))
     print(f"  Total entries:   {len(all_entries)}")
     print(f"  Valid entries:   {len(valid_all)}  (with out_rel)")
     if record_blocks:

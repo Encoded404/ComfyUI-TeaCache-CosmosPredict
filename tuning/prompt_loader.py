@@ -35,7 +35,9 @@ import json
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
+
+from .artist_tags import ArtistPool, render_artist_block, select_artists
 
 
 # ── Tag definitions ──────────────────────────────────────────────────
@@ -146,8 +148,14 @@ def select_prompts(
 
 def resolve_prompt(prompt_config: PromptConfig, entry: PromptEntry,
                    prefix_variant_idx: int = 0,
-                   negative_variant_idx: int = 0) -> tuple[str, str]:
-    """Return (full_prompt, negative_prompt) with prefix/negative resolved."""
+                   negative_variant_idx: int = 0,
+                   artists: Optional[List[str]] = None) -> tuple[str, str]:
+    """Return (full_prompt, negative_prompt) with prefix/negative resolved.
+
+    `artists` is an optional list of artist tags (e.g. ["@artgerm"]) injected
+    verbatim BETWEEN the prefix and the prompt text. None/[] → unchanged
+    behavior (prefix + text).
+    """
     prefix = entry.prefix if entry.prefix is not None else prompt_config.default_prefix
     negative = entry.negative if entry.negative is not None else prompt_config.default_negative
 
@@ -157,7 +165,59 @@ def resolve_prompt(prompt_config: PromptConfig, entry: PromptEntry,
     if prompt_config.negative_variants and negative_variant_idx < len(prompt_config.negative_variants):
         negative = prompt_config.negative_variants[negative_variant_idx]
 
-    return prefix + entry.text, negative
+    artist_block = render_artist_block(artists) if artists else ""
+    return prefix + artist_block + entry.text, negative
+
+
+class GenerationPromptSampler:
+    """Per-generation prompt variant + artist-tag drawer.
+
+    Deterministically maps a generation identity (prompt_idx, seed, steps,
+    width, height) to one (prefix_variant_idx, negative_variant_idx,
+    artist_tags) draw. Every generation gets its own variation while staying
+    reproducible — and baseline/teacache pairs in validation always use the
+    same prompt string for the same key.
+    """
+
+    def __init__(self, prompt_config: PromptConfig,
+                 artist_pool: Optional[ArtistPool] = None,
+                 artist_cfg: Optional[dict] = None):
+        self.prompt_config = prompt_config
+        self.artist_pool = artist_pool
+        self.artist_cfg = artist_cfg or {}
+        self.max_tags = int(self.artist_cfg.get("max_tags", 1))
+
+    def _rng(self, pi: int, seed: int, steps: int, width: int, height: int) -> random.Random:
+        salt = self.artist_cfg.get("seed", 0)
+        return random.Random(f"gen:{salt}:{pi}:{seed}:{steps}:{width}x{height}")
+
+    def sample(self, pi: int, seed: int, steps: int, width: int, height: int
+               ) -> Tuple[int, int, List[str]]:
+        """Draw (prefix_variant_idx, negative_variant_idx, artist_tags)."""
+        rng = self._rng(pi, seed, steps, width, height)
+        pcfg = self.prompt_config
+        pidx = rng.randrange(max(len(pcfg.prefix_variants), 1))
+        nidx = rng.randrange(max(len(pcfg.negative_variants), 1))
+        artists = select_artists(self.artist_pool, rng, self.max_tags) \
+            if self.artist_pool is not None else []
+        return pidx, nidx, artists
+
+
+def resolve_generation(sampler: GenerationPromptSampler, entry: PromptEntry,
+                       pi: int, seed: int, steps: int, width: int, height: int
+                       ) -> Tuple[str, str, List[str]]:
+    """Resolve one generation's (full_prompt, negative, artist_tags).
+
+    Deterministic for a fixed generation identity; call this everywhere the
+    same generation is generated so all runs share the identical prompt.
+    """
+    pidx, nidx, artists = sampler.sample(pi, seed, steps, width, height)
+    full, neg = resolve_prompt(
+        sampler.prompt_config, entry,
+        prefix_variant_idx=pidx, negative_variant_idx=nidx,
+        artists=artists,
+    )
+    return full, neg, artists
 
 
 # ── Internal helpers ─────────────────────────────────────────────────
