@@ -14,6 +14,10 @@ sentence-transformers>=3.0
 # (gracefully degrades to pure-Python fallback when not installed)
 numba>=0.60
 
+# Lossless compression for refiner latent data (plan Task 2b).
+# The recording pipeline falls back to raw bf16 storage when missing.
+blosc2>=2.0
+
 # Core numerical dependencies (already in ComfyUI, listed for completeness)
 numpy>=1.26
 torch>=2.4

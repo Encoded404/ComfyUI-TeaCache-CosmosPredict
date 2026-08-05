@@ -8,9 +8,14 @@ plus ground truth output changes at every step.
 The recorded JSONL file enables the offline optimizer (optimize.py) to simulate
 thousands of TeaCache configurations without touching the GPU.
 
+With refiner recording enabled (--refiner-data both|only, plan Task 2), the same
+runs additionally capture per-step latent tensors (x_t, v_t, prompt embeddings)
+into outputs/<timestamp>/refiner_data/ for the latent-space refiner.
+
 Usage:
     cd /path/to/ComfyUI-TeaCache-CosmosPredict
     python -m tuning.calibrate --comfy-dir /path/to/ComfyUI [--prompts 12 --seeds 0,7,42]
+    python -m tuning.calibrate --comfy-dir /path/to/ComfyUI --refiner-data both
 
 Runtime estimate (A100-40GB):
     24 prompts × 4 seeds × 5 step variants = 480 generations
@@ -19,6 +24,7 @@ Runtime estimate (A100-40GB):
 
 import argparse
 import json
+import random
 import sys
 import time
 from pathlib import Path
@@ -27,7 +33,8 @@ import torch
 
 from .config_types import CalibrationEntry, TuningConfig
 from .utils import load_models, sample, get_diffusion_model, detect_gpu, print_schedule_estimate, print_speed_summary
-from .recorder import make_calibration_forward
+from .recorder import make_calibration_forward, make_refiner_forward
+from . import refiner_data
 from .prompt_loader import load_prompt_config, select_prompts, resolve_prompt
 
 
@@ -118,6 +125,93 @@ def patch_for_calibration(unet, steps: int, prompt_id: int, seed: int,
     return diffusion_model, original_fwd
 
 
+def patch_for_refiner(unet, steps: int, prompt_id: int, seed: int,
+                      track_per_block: bool = False,
+                      refiner_dir=None, refiner_cfg: dict = None):
+    """Patch the model with the refiner recorder (calibration stats + latents).
+
+    Mirrors patch_for_calibration (plan Task 2a): same transformer_options
+    metadata injection + step-tracking wrapper, plus the latent capture state
+    (_refiner_buf) and the record_slots/dtype settings from the refiner config.
+    The wrapper additionally records the sigma/timestep per call.
+    """
+    diffusion_model = get_diffusion_model(unet)
+
+    refiner_fwd = make_refiner_forward()
+    original_fwd = diffusion_model._forward
+    diffusion_model._forward = refiner_fwd.__get__(
+        diffusion_model, diffusion_model.__class__
+    )
+
+    # Reset calibration + refiner state (per generation)
+    for attr in ("_calib_state", "_calib_block_prevs", "_calib_block_currs",
+                 "_calib_block_deltas", "_refiner_buf"):
+        if hasattr(diffusion_model, attr):
+            delattr(diffusion_model, attr)
+    diffusion_model.calibration_log = []
+    diffusion_model._refiner_buf = {}
+
+    # Inject metadata into transformer_options
+    to = unet.model_options.setdefault("transformer_options", {})
+    to["calibration_step"] = 0
+    to["calibration_total_steps"] = steps
+    to["calibration_prompt_id"] = prompt_id
+    to["calibration_seed"] = seed
+
+    diffusion_model._calib_track_per_block = track_per_block
+    diffusion_model._refiner_dir = refiner_dir
+
+    rc = refiner_cfg or {}
+    record_slots = rc.get("record_slots", "both")
+    if record_slots not in ("both", "cond"):
+        print(f"  [refiner] ⚠ invalid record_slots {record_slots!r} — using 'both'")
+        record_slots = "both"
+    diffusion_model._refiner_record_slots = record_slots
+
+    dtype_name = rc.get("dtype", "bfloat16")
+    dtype = {"bfloat16": torch.bfloat16,
+             "float16": torch.float16,
+             "float32": torch.float32}.get(dtype_name)
+    if dtype is None:
+        print(f"  [refiner] ⚠ invalid dtype {dtype_name!r} — using bfloat16")
+        dtype = torch.bfloat16
+    diffusion_model._refiner_dtype = dtype
+
+    # Add a wrapper to update step index + timestep
+    def wrapper(model_function, kwargs):
+        c = kwargs["c"]
+        timestep = kwargs["timestep"]
+        c_to = c.setdefault("transformer_options", {})
+        sigmas = c_to.get("sample_sigmas")
+
+        if sigmas is not None:
+            matched = (sigmas == timestep[0]).nonzero()
+            if len(matched) > 0:
+                step_idx = matched[0].item()
+            else:
+                step_idx = 0
+                for i in range(len(sigmas) - 1):
+                    if (sigmas[i] - timestep[0]) * (sigmas[i + 1] - timestep[0]) <= 0:
+                        step_idx = i
+                        break
+            c_to["calibration_step"] = step_idx
+
+        try:
+            t = timestep
+            if isinstance(t, torch.Tensor):
+                t = t.detach().float().cpu()
+                t = float(t.reshape(-1)[0].item()) if t.numel() else 0.0
+            c_to["calibration_timestep"] = float(t)
+        except Exception:
+            c_to["calibration_timestep"] = 0.0
+
+        return model_function(kwargs["input"], timestep, **c)
+
+    unet.set_model_unet_function_wrapper(wrapper)
+
+    return diffusion_model, original_fwd
+
+
 def restore_model(diffusion_model, original_fwd, unet):
     """Restore original _forward and remove calibration metadata."""
     diffusion_model._forward = original_fwd
@@ -128,11 +222,58 @@ def restore_model(diffusion_model, original_fwd, unet):
             del to[k]
 
 
-def run_calibration(comfy_dir: str, config_path: str = None):
+# Seeded RNG for the deterministic resolution-mix assignment (Task 1):
+# per generation index, the same draw happens on every run.
+_RESOLUTION_RNG_SEED = 0
+
+
+def _draw_resolution(rng, mix: dict):
+    """Draw a resolution key ('WxH') by cumulative shares."""
+    keys = list(mix.keys())
+    shares = [mix[k] for k in keys]
+    total = sum(shares)
+    r = rng.random() * total
+    acc = 0.0
+    for k, s in zip(keys, shares):
+        acc += s
+        if r < acc:
+            return k
+    return keys[-1]
+
+
+def run_calibration(comfy_dir: str, config_path: str = None, overrides: dict = None):
     # Load config
     if config_path is None:
         config_path = str(Path(__file__).parent / "config.json")
     tcfg = TuningConfig.load(config_path)
+
+    # CLI/API overrides (num_prompts, seeds, refiner)
+    overrides = overrides or {}
+    if "num_prompts" in overrides:
+        tcfg.calibration["num_prompts"] = overrides["num_prompts"]
+    if "seeds" in overrides:
+        tcfg.calibration["seeds"] = overrides["seeds"]
+    refiner_cfg = dict(getattr(tcfg, "refiner", {}) or {})
+    refiner_cfg.update(overrides.get("refiner", {}) or {})
+
+    # Resolve refiner mode: CLI wins; else config `enabled` (plan Task 1/2d)
+    refiner_mode = refiner_cfg.get("mode", "")
+    if refiner_mode not in ("both", "off", "only"):
+        if "mode" in refiner_cfg:
+            print(f"  ⚠ invalid refiner mode {refiner_mode!r} — falling back to config enabled flag")
+        refiner_mode = "both" if refiner_cfg.get("enabled", False) else "off"
+    refiner_cfg["mode"] = refiner_mode
+
+    if refiner_mode != "off":
+        mix = refiner_cfg.get("resolution_mix") or {}
+        try:
+            refiner_cfg["resolution_mix"] = refiner_data.parse_resolution_mix(mix)
+        except ValueError as e:
+            raise SystemExit(f"[refiner] invalid resolution_mix: {e}") from e
+        record_slots = refiner_cfg.get("record_slots", "both")
+        if record_slots not in ("both", "cond"):
+            print(f"  ⚠ invalid refiner record_slots {record_slots!r} — using 'both'")
+            refiner_cfg["record_slots"] = "both"
 
     # Setup output
     out_dir = Path(tcfg.output_dir) / time.strftime("%Y%m%d-%H%M%S")
@@ -160,6 +301,10 @@ def run_calibration(comfy_dir: str, config_path: str = None):
     print(f"  Seeds:          {tcfg.calibration['seeds']}")
     record_blocks = bool(tcfg.calibration.get("record_block_data", False))
     print(f"  Block data:     {'ON  (per-block deltas recorded)' if record_blocks else 'OFF'}")
+    print(f"  Refiner data:   {refiner_mode}"
+          + (f"  (slots={refiner_cfg.get('record_slots', 'both')}, "
+             f"mix={refiner_cfg.get('resolution_mix')}, "
+             f"top_n={refiner_cfg.get('top_n', -1)})" if refiner_mode != "off" else ""))
     print(f"  Output:         {out_dir}")
     print("=" * 60)
 
@@ -198,18 +343,28 @@ def run_calibration(comfy_dir: str, config_path: str = None):
     h = tcfg.sampling["height"]
     permutation = f"{len(prompts)} prompts \u00d7 {len(seeds)} seeds \u00d7 {len(step_variants)} step variants = {total_runs} total generations"
 
+    extra_lines = [
+        f"Permutation:   {permutation}",
+        f"Est. entries: ~{est_entries} ({int(est_entries/1000)}k) calibration data points",
+        f"Est. disk:    ~{est_entries * 300 // 1000}k kB  (JSONL)",
+        f"Output dir:   {out_dir}",
+    ]
+    if refiner_mode != "off":
+        refiner_disk = refiner_data.estimate_refiner_disk_bytes(
+            total_runs, avg_steps, refiner_cfg["resolution_mix"],
+            refiner_cfg.get("record_slots", "both"),
+        )
+        extra_lines.append(
+            f"Refiner disk: ~{refiner_disk/1e6:.0f} MB  lossless "
+            f"({refiner_cfg.get('record_slots', 'both')} slots, mix-averaged)"
+        )
     print_schedule_estimate(
         "Calibration run schedule",
         total_generations=total_runs,
         avg_steps=avg_steps,
         width=w,
         height=h,
-        extra_lines=[
-            f"Permutation:   {permutation}",
-            f"Est. entries: ~{est_entries} ({int(est_entries/1000)}k) calibration data points",
-            f"Est. disk:    ~{est_entries * 300 // 1000}k kB  (JSONL)",
-            f"Output dir:   {out_dir}",
-        ],
+        extra_lines=extra_lines,
     )
     print(f"  Press Ctrl+C to abort, or wait 3 seconds...")
     try:
@@ -225,6 +380,29 @@ def run_calibration(comfy_dir: str, config_path: str = None):
 
     data_file = out_dir / "calibration_data.jsonl"
 
+    # ── Refiner recording setup (Task 2d) ──
+    refiner_dir = out_dir / "refiner_data"
+    refiner_manifest = None
+    eval_prompt_ids = set()
+    res_assignments = []
+    if refiner_mode != "off":
+        refiner_dir.mkdir(parents=True, exist_ok=True)
+        refiner_manifest = refiner_data.init_manifest(refiner_cfg)
+        refiner_data.save_manifest(refiner_dir, refiner_manifest)
+        # Eval prompts: deterministically the LAST eval_prompts selected prompts;
+        # their recordings always persist (bypass ranking) and are excluded from
+        # training pairs (plan Task 1).
+        eval_n = int(refiner_cfg.get("eval_prompts", 6))
+        eval_prompt_ids = set(range(max(len(prompts) - eval_n, 0), len(prompts)))
+        rng = random.Random(_RESOLUTION_RNG_SEED)
+        res_assignments = [_draw_resolution(rng, refiner_cfg["resolution_mix"])
+                           for _ in range(total_runs)]
+        print(f"  [refiner] recording to {refiner_dir}")
+        print(f"  [refiner] eval prompts: {sorted(eval_prompt_ids)} "
+              f"(recorded, excluded from training pairs)")
+        print(f"  [refiner] resolutions: "
+              f"{ {k: res_assignments.count(k) for k in refiner_cfg['resolution_mix']} }")
+
     for pi, pdata in enumerate(prompts):
         # Cycle sampler / scheduler / cfg per prompt for variety
         cur_sampler  = sampler_variants[pi % len(sampler_variants)]
@@ -239,13 +417,30 @@ def run_calibration(comfy_dir: str, config_path: str = None):
                 run_idx += 1
                 t0 = time.time()
 
+                # Refiner resolution mix: deterministic per generation index
+                # (plan Task 1); scalar-only runs stay at the config resolution.
+                if refiner_mode != "off":
+                    res_key = res_assignments[run_idx - 1]
+                    width, height = refiner_data.parse_resolution(res_key)
+                else:
+                    width, height = w, h
+
                 torch.cuda.empty_cache()
                 torch.cuda.reset_peak_memory_stats()
 
-                dm, original_fwd = patch_for_calibration(
-                    unet, steps, prompt_id=pi, seed=seed,
-                    track_per_block=record_blocks,
-                )
+                track_blocks = record_blocks and refiner_mode != "only"
+                if refiner_mode == "off":
+                    dm, original_fwd = patch_for_calibration(
+                        unet, steps, prompt_id=pi, seed=seed,
+                        track_per_block=track_blocks,
+                    )
+                else:
+                    dm, original_fwd = patch_for_refiner(
+                        unet, steps, prompt_id=pi, seed=seed,
+                        track_per_block=track_blocks,
+                        refiner_dir=refiner_dir,
+                        refiner_cfg=refiner_cfg,
+                    )
 
                 try:
                     img = sample(
@@ -254,8 +449,8 @@ def run_calibration(comfy_dir: str, config_path: str = None):
                         cfg=cur_cfg,
                         sampler_name=cur_sampler,
                         scheduler=cur_scheduler,
-                        width=tcfg.sampling["width"],
-                        height=tcfg.sampling["height"],
+                        width=width,
+                        height=height,
                         negative=pdata["negative"],
                     )
                 finally:
@@ -274,10 +469,32 @@ def run_calibration(comfy_dir: str, config_path: str = None):
 
                 all_entries.extend(run_entries)
 
-                # Save incrementally
-                with data_file.open("a") as f:
-                    for e in run_entries:
-                        f.write(json.dumps(e.to_dict()) + "\n")
+                # Save incrementally (skipped in refiner-only mode)
+                if refiner_mode != "only":
+                    with data_file.open("a") as f:
+                        for e in run_entries:
+                            f.write(json.dumps(e.to_dict()) + "\n")
+
+                # Refiner generation-end flow: volatility score, top_n eviction,
+                # write .bin + .prompt.bin, update manifest (plan 2a/2c)
+                if refiner_mode != "off":
+                    refiner_data.finalize_refiner_generation(
+                        dm, refiner_dir, refiner_manifest,
+                        run_meta={
+                            "name": f"gen_{run_idx - 1:04d}_p{pi:02d}_s{seed}",
+                            "prompt_id": pi,
+                            "seed": seed,
+                            "sampler": cur_sampler,
+                            "scheduler": cur_scheduler,
+                            "cfg": cur_cfg,
+                            "width": width,
+                            "height": height,
+                            "steps": steps,
+                            "fps": None,
+                        },
+                        refiner_cfg=refiner_cfg,
+                        eval_prompt_ids=eval_prompt_ids,
+                    )
 
                 valid = [e for e in run_entries if e.out_rel > 0]
                 vram = torch.cuda.max_memory_allocated() / (1024 ** 3)
@@ -287,6 +504,7 @@ def run_calibration(comfy_dir: str, config_path: str = None):
                     f"[calib] {run_idx}/{total_runs}  "
                     f"p={pi} s={seed} steps={steps}  "
                     f"sampler={cur_sampler} cfg={cur_cfg}  "
+                    f"res={width}x{height}  "
                     f"took={dt:.1f}s  entries={len(run_entries)}  "
                     f"valid={len(valid)}  VRAM={vram:.1f}GB  ETA={eta:.0f}m"
                 )
@@ -306,7 +524,13 @@ def run_calibration(comfy_dir: str, config_path: str = None):
     if record_blocks:
         block_entries = sum(1 for e in all_entries if e.block_cos_sims is not None)
         print(f"  Block entries:   {block_entries}  (per-block cos_sim data)")
-    print(f"  Data saved to:   {data_file}")
+    if refiner_mode != "only":
+        print(f"  Data saved to:   {data_file}")
+    else:
+        print(f"  JSONL:           skipped (refiner-only mode)")
+    if refiner_mode != "off":
+        n_gens = len(refiner_data.iter_generations(refiner_dir))
+        print(f"  Refiner data:    {n_gens} generations → {refiner_dir}")
     print(f"{'=' * 60}")
 
     return str(data_file)
@@ -322,19 +546,40 @@ def main():
                         help="Override number of calibration prompts")
     parser.add_argument("--seeds", default=None,
                         help="Override seeds (comma-separated)")
+    parser.add_argument("--refiner-data", choices=["both", "off", "only"], default=None,
+                        help="Refiner latent recording mode (default: config "
+                             "refiner.enabled → 'both' / 'off')")
+    parser.add_argument("--refiner-top-n", type=int, default=None,
+                        help="Keep at most N most-volatile generations per "
+                             "resolution (default: config; -1 = keep all)")
+    parser.add_argument("--refiner-resolutions", default=None,
+                        help="Override resolution mix, e.g. "
+                             "'512x512:0.8,1024x1024:0.2' (plain 'WxH' entries "
+                             "get equal shares)")
     args = parser.parse_args()
 
     # Overrides
     if args.config is None:
         args.config = str(Path(__file__).parent / "config.json")
 
-    tcfg = TuningConfig.load(args.config)
+    overrides = {}
     if args.prompts is not None:
-        tcfg.calibration["num_prompts"] = args.prompts
+        overrides["num_prompts"] = args.prompts
     if args.seeds is not None:
-        tcfg.calibration["seeds"] = [int(s) for s in args.seeds.split(",")]
+        overrides["seeds"] = [int(s) for s in args.seeds.split(",")]
 
-    data_file = run_calibration(args.comfy_dir, args.config)
+    refiner_overrides = {}
+    if args.refiner_data is not None:
+        refiner_overrides["mode"] = args.refiner_data
+    if args.refiner_top_n is not None:
+        refiner_overrides["top_n"] = args.refiner_top_n
+        refiner_overrides["keep_all"] = args.refiner_top_n < 0
+    if args.refiner_resolutions is not None:
+        refiner_overrides["resolution_mix"] = args.refiner_resolutions
+    if refiner_overrides:
+        overrides["refiner"] = refiner_overrides
+
+    data_file = run_calibration(args.comfy_dir, args.config, overrides=overrides)
     print(f"\nNext step: python -m tuning.optimize --data {data_file}")
 
 

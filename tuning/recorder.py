@@ -3,6 +3,10 @@
 The recorded data captures delta statistics for ALL source signals simultaneously
 plus ground truth output changes. This enables the offline optimizer (optimize.py)
 to simulate any combination of knobs without touching the GPU.
+
+The refiner variant (make_refiner_forward) is a superset: it emits the same scalar
+CalibrationEntry stats AND records the latent tensors (x_t, v_t per step per slot,
+plus prompt embeddings) for the latent-space refiner (plan Task 2a).
 """
 
 from __future__ import annotations
@@ -31,13 +35,89 @@ def _make_delta_stats(delta: torch.Tensor, denom: torch.Tensor) -> DeltaStats:
     )
 
 
+def _capture_refiner_step(self, x_orig, result, crossattn_emb,
+                          cond_or_uncond, b, orig_shape, to):
+    """Append the current step's latent tensors to self._refiner_buf.
+
+    Records, per step per recorded CFG slot:
+      - x_t: the raw pre-pad latent argument, cropped to orig_shape
+             (recorder.py:55/64 pattern — what the sampler feeds the model)
+      - v_t: the post-unpatchify result the sampler consumes
+             (recorder.py:243-245 pattern)
+      - prompt embeddings: captured once per generation (guarded by a flag —
+        the context is identical every step)
+      - sigma/timestep, step, step_fraction: wrapper metadata
+
+    Tensors are moved to CPU immediately at the configured dtype
+    (self._refiner_dtype, bf16 by default; the model may run fp16).
+    """
+    if not hasattr(self, "_refiner_buf"):
+        self._refiner_buf = {
+            "x": {}, "v": {}, "prompt": {}, "prompt_captured": set(),
+            "timesteps": {}, "steps": {}, "step_fractions": {},
+        }
+    buf = self._refiner_buf
+    record_slots = getattr(self, "_refiner_record_slots", "both")
+    dtype = getattr(self, "_refiner_dtype", torch.bfloat16)
+
+    step = int(to.get("calibration_step", 0))
+    total_steps = int(to.get("calibration_total_steps", 30))
+    step_fraction = step / max(total_steps - 1, 1)
+    timestep = float(to.get("calibration_timestep", 0.0))
+
+    for i, k in enumerate(cond_or_uncond):
+        k = int(k)
+        if record_slots == "cond" and k != 1:
+            continue
+
+        x_slot = x_orig[i * b : (i + 1) * b,
+                        :, : orig_shape[-3], : orig_shape[-2], : orig_shape[-1]][0]
+        if x_slot.shape[1] == 1:  # T == 1 → (C, H, W)
+            x_slot = x_slot[:, 0]
+        v_slot = result[i * b : (i + 1) * b][0]
+        if v_slot.shape[1] == 1:  # T == 1 → (C, H, W)
+            v_slot = v_slot[:, 0]
+
+        buf["x"].setdefault(k, []).append(x_slot.detach().to("cpu", dtype=dtype))
+        buf["v"].setdefault(k, []).append(v_slot.detach().to("cpu", dtype=dtype))
+        buf["timesteps"].setdefault(k, []).append(timestep)
+        buf["steps"].setdefault(k, []).append(step)
+        buf["step_fractions"].setdefault(k, []).append(step_fraction)
+
+        if k not in buf["prompt_captured"]:
+            buf["prompt_captured"].add(k)
+            if crossattn_emb is not None:
+                emb = crossattn_emb[i * b : (i + 1) * b]
+                if emb.shape[0] == 1:
+                    emb = emb[0]  # single sample per slot → (N, D)
+                buf["prompt"][k] = emb.detach().to("cpu", dtype=dtype)
+            else:
+                buf["prompt"][k] = None
+
+
 def make_calibration_forward(source_hint: str = "all"):
+    """Create a calibration-patched _forward() that records stats without caching."""
+    return _make_forward(record_refiner=False)
+
+
+def make_refiner_forward(source_hint: str = "all"):
+    """Create a refiner-patched _forward() — calibration stats + latent tensors.
+
+    Superset of make_calibration_forward (plan Task 2a): same scalar
+    CalibrationEntry stats AND per-step per-slot x_t/v_t/prompt capture into
+    self._refiner_buf. Runs the full model (no skipping).
+    """
+    return _make_forward(record_refiner=True)
+
+
+def _make_forward(record_refiner: bool = False):
     """Create a calibration-patched _forward() that records stats without caching.
 
     This forward ALWAYS runs all blocks but records:
       - Delta stats for t_emb, first_block_shift, and pooled_latent sources
       - Ground truth output change (out_rel) at each step
       - Residual change (res_rel) for validation
+      - (refiner mode) per-step latent tensors x_t / v_t / prompt per slot
 
     Data is appended to self.calibration_log as CalibrationEntry dicts.
     """
@@ -53,6 +133,7 @@ def make_calibration_forward(source_hint: str = "all"):
     ):
         # ── Preamble (same as MiniTrainDIT._forward) ──
         orig_shape = list(x.shape)
+        x_orig = x  # raw pre-pad latent (refiner capture target)
 
         ref_latents = kwargs.get("ref_latents", None)
         if ref_latents is not None:
@@ -246,6 +327,12 @@ def make_calibration_forward(source_hint: str = "all"):
 
         if ref_latents is not None:
             result = result[:, :, : orig_shape[-3], :, :]
+
+        if record_refiner:
+            _capture_refiner_step(
+                self, x_orig, result, crossattn_emb,
+                cond_or_uncond, b, orig_shape, to,
+            )
 
         return result
 

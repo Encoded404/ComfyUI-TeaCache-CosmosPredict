@@ -336,7 +336,8 @@ class TuningConfig:
     calibration: dict
     optimization: dict
     validation: dict
-    output_dir: str
+    refiner: dict = field(default_factory=dict)
+    output_dir: str = "outputs"
 
     @classmethod
     def load(cls, path: str) -> "TuningConfig":
@@ -352,5 +353,6 @@ class TuningConfig:
             calibration=d["calibration"],
             optimization=d["optimization"],
             validation=d["validation"],
+            refiner=d.get("refiner", {}),
             output_dir=d.get("output_dir", "outputs"),
         )

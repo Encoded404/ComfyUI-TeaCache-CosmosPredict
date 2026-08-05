@@ -98,5 +98,15 @@
         "extra_threshold_sweep_errors": [0.01, 0.03, 0.05, 0.10]
     },
 
+    "refiner": {
+        "enabled": true,
+        "top_n": -1,
+        "record_slots": "both",
+        "dtype": "bfloat16",
+        "keep_all": true,
+        "eval_prompts": 6,
+        "resolution_mix": {"512x512": 0.8, "1024x1024": 0.2}
+    },
+
     "output_dir": "outputs"
 }
