@@ -26,7 +26,7 @@ from pathlib import Path
 import torch
 
 from .config_types import CalibrationEntry, TuningConfig
-from .utils import load_models, sample, get_diffusion_model, detect_gpu, print_schedule_estimate, print_speed_summary, derive_step_anchors
+from .utils import load_models, sample, get_diffusion_model, detect_gpu, print_schedule_estimate, print_speed_summary
 from .recorder import make_calibration_forward
 from .prompt_loader import load_prompt_config, select_prompts, resolve_prompt
 
@@ -141,21 +141,10 @@ def run_calibration(comfy_dir: str, config_path: str = None):
         json.dumps(tcfg.__dict__ if hasattr(tcfg, '__dict__') else {}, indent=2, default=str)
     )
 
-    # Step-count variants: configured variants ∪ derived step-mult anchors.
-    # New variants get equal weight unless the config already specifies one.
-    base_steps = int(tcfg.sampling.get("default_steps", 30))
-    step_variants_raw = list(tcfg.sampling["step_variants"])
-    step_weights_raw = list(tcfg.sampling["step_weights"])
-    step_anchors = derive_step_anchors(
-        tcfg.optimization.get("step_count_variants", []), base_steps,
-    )
-    step_variants = sorted(set(step_variants_raw) | set(step_anchors))
-    if len(step_weights_raw) == len(step_variants_raw):
-        weight_map = dict(zip(step_variants_raw, step_weights_raw))
-    else:
-        weight_map = {}
-    default_weight = 1.0 / len(step_variants) if step_variants else 1.0
-    step_weights = [weight_map.get(s, default_weight) for s in step_variants]
+    # Calibration runs exactly the step counts in the sampling section;
+    # optimization.step_count_variants never drives calibration runs.
+    step_variants = tcfg.sampling["step_variants"]
+    step_weights = tcfg.sampling["step_weights"]
 
     print("=" * 60)
     print("  TeaCache Calibration — Phase 1")
@@ -164,8 +153,8 @@ def run_calibration(comfy_dir: str, config_path: str = None):
     print(f"  GPU:            {gpu_display}  (×{gpu_speed:.1f} vs V100)")
     print(f"  ComfyUI:        {tcfg.comfy_dir}")
     print(f"  Model:          {tcfg.model_name}")
-    print(f"  Steps:          {step_variants}")
-    print(f"  Weights:        {step_weights}")
+    print(f"  Steps:          {tcfg.sampling['step_variants']}")
+    print(f"  Weights:        {tcfg.sampling['step_weights']}")
     print(f"  Resolution:     {tcfg.sampling['width']}×{tcfg.sampling['height']}")
     print(f"  Prompts:        {tcfg.calibration['num_prompts']}")
     print(f"  Seeds:          {tcfg.calibration['seeds']}")

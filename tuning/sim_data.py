@@ -144,10 +144,83 @@ class SimData:
         kept = tuple(g for g in self.groups if g.total_steps == n)
         return SimData(groups=kept, n_entries=sum(g.n_steps for g in kept))
 
+    def resample_to_step_count(self, n: int) -> "SimData":
+        """Estimate data for *n* total steps by resampling recorded groups.
+
+        Groups recorded at exactly n steps pass through unchanged.  Groups
+        recorded at S > n steps are resampled down to n steps: keep the
+        entries nearest the n-step fractions j/(n-1) and scale their per-step
+        deltas and output changes by ``(S-1)/(n-1)`` — the step-spacing ratio,
+        first-order exact for a smooth trajectory.  Per-block cosine
+        similarities are scale-invariant and only column-selected.
+
+        Returns an empty SimData when *n* exceeds every recorded step count
+        (or n < 2) — the caller then omits that anchor.
+        """
+        if n < 2:
+            return SimData(groups=(), n_entries=0)
+        new_groups: List[GroupData] = []
+        total = 0
+        for g in self.groups:
+            if g.total_steps == n:
+                new_groups.append(g)
+                total += g.n_steps
+            elif g.total_steps > n:
+                rg = _resample_group(g, n)
+                if rg is not None:
+                    new_groups.append(rg)
+                    total += rg.n_steps
+        return SimData(groups=tuple(new_groups), n_entries=total)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Internal helpers
 # ═══════════════════════════════════════════════════════════════════════════
+
+def _resample_group(g: GroupData, n: int) -> Optional[GroupData]:
+    """Resample one group recorded at S > n total steps down to *n* steps.
+
+    Selects the recorded entries whose fractions are closest to the n-step
+    grid j/(n-1) and scales their per-step deltas / output changes by
+    ``(S-1)/(n-1)`` (the step-spacing ratio), re-tagging fractions to the
+    n-step grid so schedule multipliers replay correctly.
+    """
+    s = g.total_steps
+    target_fracs = np.arange(1, n, dtype=np.float64) / (n - 1)
+    idx = np.argmin(np.abs(g.step_fraction[:, None] - target_fracs[None, :]), axis=0)
+    k = (s - 1) / (n - 1)
+
+    def _scale_stats(stats: Optional[Dict[str, np.ndarray]]) -> Optional[Dict[str, np.ndarray]]:
+        if stats is None:
+            return None
+        out = {}
+        for field in _STAT_FIELDS:
+            arr = stats[field][idx]
+            if field != "denom":
+                arr = arr * k
+            out[field] = arr
+        return out
+
+    step_frac = target_fracs
+    block_cos_sim = g.block_cos_sim[:, idx] if g.block_cos_sim is not None else None
+
+    return GroupData(
+        n_steps=n - 1,
+        total_steps=n,
+        prompt_id=g.prompt_id,
+        seed=g.seed,
+        cond=g.cond,
+        step_fraction=step_frac,
+        out_rel=g.out_rel[idx] * k,
+        res_rel=g.res_rel[idx] * k,
+        t_emb_stats=_scale_stats(g.t_emb_stats),
+        shift_stats=_scale_stats(g.shift_stats),
+        latent_stats=_scale_stats(g.latent_stats),
+        block_cos_sim=block_cos_sim,
+        n_blocks=g.n_blocks,
+        step_mult=_compute_schedule_mults(step_frac),
+    )
+
 
 def _extract_stats(
     entries: List[CalibrationEntry], attr: str

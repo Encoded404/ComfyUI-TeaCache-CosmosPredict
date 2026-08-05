@@ -1518,8 +1518,12 @@ def optimize(configs: List[TeacacheConfig],
     # ── 9. Step-count threshold multiplier tables ──────────────────────
     # For each Pareto entry, measure how the threshold that reproduces its
     # anchored accumulated error E scales with step count: ratios T_N / T_base
-    # simulated at every derived anchor step count.  Anchors with no
-    # calibration data are omitted; the runtime interpolates over the rest.
+    # at every derived anchor step count.  Anchors are measured directly when
+    # calibration data exists at that step count; otherwise they are estimated
+    # by resampling recorded groups to the anchor step count (trajectory
+    # resampling + step-spacing amplitude correction).  Anchors beyond the
+    # largest recorded step count are omitted — the runtime clamps to the
+    # remaining table endpoints and never extrapolates.
     base_steps = int(tcfg.sampling.get("default_steps", 30))
     anchors = derive_step_anchors(opt.get("step_count_variants", []), base_steps)
     base_sd = sim_data.filter_by_step_count(base_steps)
@@ -1529,7 +1533,8 @@ def optimize(configs: List[TeacacheConfig],
     else:
         t_mult_start = time_mod.time()
         n_tables = 0
-        n_anchors_used = 0
+        n_measured = 0
+        n_estimated = 0
         for i, r in enumerate(pareto):
             _best, base_curve = _sweep_threshold_curve(
                 base_sd, r.config, sweep_values, scoring_config,
@@ -1541,6 +1546,10 @@ def optimize(configs: List[TeacacheConfig],
                 if n == base_steps:
                     continue
                 sub = sim_data.filter_by_step_count(n)
+                estimated = False
+                if sub.n_entries == 0:
+                    sub = sim_data.resample_to_step_count(n)
+                    estimated = True
                 if sub.n_entries == 0:
                     continue
                 _sub_best, curve = _sweep_threshold_curve(
@@ -1548,14 +1557,17 @@ def optimize(configs: List[TeacacheConfig],
                 )
                 ratio = _find_closest_on_curve(curve, E)[0] / T_base
                 points.append([n, ratio])
+                if estimated:
+                    n_estimated += 1
+                else:
+                    n_measured += 1
             r.step_mults = {"base": base_steps, "points": sorted(points)}
             n_tables += 1
-            n_anchors_used += len(points) - 1
             if (i + 1) % 10 == 0 or (i + 1) == len(pareto):
-                print(f"\r  [step_mults] {i+1}/{len(pareto)} tables  "
-                      f"({n_anchors_used} anchors)", end="", flush=True)
+                print(f"\r  [step_mults] {i+1}/{len(pareto)} tables", end="", flush=True)
         print()
         print(f"  [step_mults] {n_tables} tables over anchors {anchors} "
+              f"({n_measured} measured, {n_estimated} estimated) "
               f"in {time_mod.time() - t_mult_start:.1f}s")
 
     # Re-sort — Pareto sweep mutates scores in-place on shared objects
