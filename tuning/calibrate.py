@@ -147,7 +147,10 @@ def patch_for_refiner(unet, steps: int, prompt_id: int, seed: int,
         if hasattr(diffusion_model, attr):
             delattr(diffusion_model, attr)
     diffusion_model.calibration_log = []
-    diffusion_model._refiner_buf = {}
+    diffusion_model._refiner_buf = {
+        "x": {}, "v": {}, "prompt": {}, "prompt_captured": set(),
+        "timesteps": {}, "steps": {}, "step_fractions": {},
+    }
 
     # Inject metadata into transformer_options
     to = unet.model_options.setdefault("transformer_options", {})
