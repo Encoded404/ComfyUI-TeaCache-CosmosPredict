@@ -52,11 +52,10 @@ from . import refiner_data
 from .corrector import (CorrectorConfig, CorrectorUNet2D, FULL_STEP_FLOP_512,
                         estimate_corrector_flops, save_corrector)
 from .corrector_dataset import (CorrectorBatchSampler, CorrectorDataset,
-                                augment_batch, collate_corrector)
+                                augment_batch, collect_fit_maps, collate_corrector)
 from .utils import MetricsLog, TrainTimer, format_duration
 from .utils import (affine_oob_eval, affine_oob_json, affine_shape_area,
-                    affine_shape_label, collect_affine_maps,
-                    split_affine_per_pair)
+                    affine_shape_label, split_affine_per_pair)
 from .utils import (delta_distribution, per_channel_affine_ceiling,
                     pooled_feature_ceiling, step_correlations, staleness_curve,
                     svd_rank_95)
@@ -904,18 +903,11 @@ def main(argv=None):
                                  pin_memory=cfg["num_workers"] > 0)
     except ValueError as e:
         print(f"  ⚠ no eval generations — eval loop and gates skipped ({e})")
-    # Fit loader for the OOD affine recovery row: a short capped pass over the
-    # TRAIN pairs (never the eval set), restricted to the strata the eval set
-    # actually uses, so the affine faces the same distribution contract as the
-    # corrector (fit=train, scored=eval).
-    fit_loader = None
+    # Fit maps for the OOD affine recovery row: drawn from the TRAIN pairs
+    # only (never the eval set), balanced per stratum across every generation
+    # (see collect_fit_maps), so the affine faces the same distribution
+    # contract as the corrector (fit=train, scored=eval).
     eval_shapes = set(eval_ds.pair_shapes()) if eval_ds is not None else set()
-    if eval_shapes:
-        fit_loader = DataLoader(ds, batch_sampler=CorrectorBatchSampler(
-            ds, batch_size=16, seed=cfg["seed"] + 6,
-            include_areas=sorted(h * w for h, w in eval_shapes)),
-            collate_fn=collate_corrector, num_workers=cfg["num_workers"],
-            pin_memory=cfg["num_workers"] > 0)
     lags = sorted(set(lag for _, _, _, lag in ds.pairs))
     if 0 not in lags:
         lags = [0] + lags
@@ -1151,11 +1143,10 @@ def main(argv=None):
             k1_pairs = [r["rel_mse"] for (kk, _), r in results.items() if kk == 1]
             k1 = sum(k1_pairs) / max(len(k1_pairs), 1) if k1_pairs else None
             affine = None
-            if affine_fit_maps is None and fit_loader is not None:
-                affine_fit_maps = collect_affine_maps(
-                    fit_loader,
-                    cap_batches_per_shape=int(cfg.get("recovery_fit_batches", 128)),
-                    known_shapes=eval_shapes)
+            if affine_fit_maps is None and eval_shapes:
+                affine_fit_maps = collect_fit_maps(
+                    ds, eval_shapes, seed=cfg["seed"] + 6,
+                    cap_batches_per_shape=int(cfg.get("recovery_fit_batches", 128)))
             if affine_fit_maps and eval_maps:
                 aff = affine_oob_eval(affine_fit_maps, eval_maps)
                 lad, anc = split_affine_per_pair(aff, eval_maps)

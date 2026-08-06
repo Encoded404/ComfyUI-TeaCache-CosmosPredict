@@ -390,3 +390,66 @@ class CorrectorBatchSampler(Sampler):
         # the dataset's generation LRU hits; the generation-order shuffle
         # (rng.shuffle(runs)) already provides epoch-to-epoch randomness.
         yield from epoch_batches
+
+
+def collect_fit_maps(ds, shapes, batch_size: int = 16, seed: int = 0,
+                     cap_batches_per_shape: int = 128) -> dict:
+    """Per-stratum (v_ma, v_true) fit maps for the OOD affine recovery row.
+
+    Drawn as a **seeded thin sample spread across every generation** of each
+    stratum, so the affine fit sees the stratum's true distribution. The
+    first-come loader walk this replaces hugged a bucket's first generations
+    (consecutive batches come from one generation) and could starve later
+    strata entirely when one bucket dominated the visited-batch budget — the
+    observed failure mode was a 128×128-only fit whose gains collapsed
+    (|a−1| ≈ 1) and "no train fit pairs" rows for the other strata.
+
+    Memory mirrors :class:`CorrectorBatchSampler` bucketing: budget pairs per
+    stratum = ``cap_batches_per_shape`` batches at the bucket batch size
+    (16 @ ≤64×64, ÷4 above), i.e. ≈ 8 MB per stored batch like the training
+    loader. Returns the :func:`~tuning.utils.affine_oob_eval`-compatible
+    ``{shape: {"vm": [batched], "vt": [batched]}}`` dict (CPU float32).
+    """
+    shape_set = set(tuple(s) for s in shapes)
+    # Pair indices per stratum, grouped into per-generation runs (the pairs
+    # list is generation-contiguous and each generation has one shape).
+    runs: Dict[Tuple[int, int], List[List[int]]] = {}
+    prev = None
+    for i in range(len(ds.pairs)):
+        s = ds.pair_shape[i]
+        if s not in shape_set:
+            continue
+        key = (s, ds.pairs[i][0])
+        if key == prev:
+            runs[s][-1].append(i)
+        else:
+            runs.setdefault(s, []).append([i])
+        prev = key
+    rng = random.Random(seed)
+    out = {}
+    for s, s_runs in runs.items():
+        h, w = s
+        bs = max(1, batch_size // 4) if h * w > 64 * 64 else batch_size
+        budget = cap_batches_per_shape * bs
+        rng.shuffle(s_runs)
+        quota = max(1, budget // max(len(s_runs), 1))
+        picked: List[int] = []
+        for run in s_runs:
+            if len(picked) >= budget:
+                break
+            sub = list(run)
+            rng.shuffle(sub)
+            picked.extend(sub[:min(quota, len(sub))])
+        vms, vts = [], []
+        for i in picked[:budget]:
+            try:
+                _, vm, vt, _ = ds._load_pair(i)   # KeyError: ring-availability drift
+            except KeyError:
+                continue
+            vms.append(vm.float().cpu())
+            vts.append(vt.float().cpu())
+        if not vms:
+            continue
+        out[s] = {"vm": [torch.stack(vms[k:k + bs]) for k in range(0, len(vms), bs)],
+                  "vt": [torch.stack(vts[k:k + bs]) for k in range(0, len(vts), bs)]}
+    return out

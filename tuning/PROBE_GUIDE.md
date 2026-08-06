@@ -536,7 +536,11 @@ The recovery-row map collections are bounded and configurable via
 (default 128) caps the batch tensors held per stratum for the affine *fit*
 (train pairs) and `recovery_eval_batches` (default 64) caps the scored eval
 maps — keeping tensors unbounded is what can stall the probe (a silent
-full-corpus pass) and blow past RAM on 1024²-heavy corpora.
+full-corpus pass) and blow past RAM on 1024²-heavy corpora. The fit maps are
+drawn by `collect_fit_maps` (`corrector_dataset.py`) as a seeded thin sample
+spread across **every generation** of each stratum — the earlier first-come
+loader walk hugged a bucket's first generations, collapsed the fit
+(|a−1| ≈ 1) and left other strata with "no train fit pairs" rows.
 
 Step-level scalars stream to `probe_metrics.jsonl` (`tail -f` friendly):
 per-50-step Day-1 losses, phase timings, eval verdict.
@@ -578,6 +582,7 @@ python -m tuning.probe_refiner --data outputs/<ts>/refiner_data
 | Lag-readability | `probe_refiner.py` (`_lag_readability`) |
 | Corrector model ("tiny" = 1.83 M) | `corrector.py:542` (`CorrectorUNet2D`), size solver `corrector.py:64` |
 | Dataset (d=0 anchor synthesis, pairs) | `refiner_data.py:648` (`iter_pairs`), `corrector_dataset.py` |
+| Balanced per-stratum fit maps (OOD affine) | `corrector_dataset.py` (`collect_fit_maps`) |
 | Recovery table (trainer K rows + affine row) | `train_corrector.py` (`recovery_rows`, `recovery_table_lines`, `eval_model`) |
 | Ceiling consumer (did-it-learn gate) | `train_corrector.py` (`load_linear_ceiling`) |
 | Target model | Anima = Cosmos-Predict2-2B-Text2Image (DiT, 2B, 16-ch 8× latent; gated NVIDIA Open Model License) — `tuning/forward.py`, `README.md:59` |

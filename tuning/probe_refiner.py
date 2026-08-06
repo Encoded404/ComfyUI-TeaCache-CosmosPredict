@@ -46,13 +46,13 @@ from .corrector import CorrectorConfig, CorrectorUNet2D
 from . import refiner_data
 from .refiner_data import (CODEC_BLOSC2, CODEC_RAW, CODEC_ZFPY, _compress,
                            _decompress)
-from .corrector_dataset import CorrectorDataset, CorrectorBatchSampler, collate_corrector
+from .corrector_dataset import (CorrectorBatchSampler, CorrectorDataset,
+                                collect_fit_maps, collate_corrector)
 from .prompt_loader import load_prompt_config, select_prompts, GenerationPromptSampler, resolve_generation
 from .utils import MetricsLog, TrainTimer, format_duration
 from .utils import load_models, sample
 from .utils import (affine_oob_eval, affine_oob_json, affine_shape_area,
-                    affine_shape_label, collect_affine_maps,
-                    split_affine_per_pair)
+                    affine_shape_label, split_affine_per_pair)
 from .utils import (delta_distribution, per_channel_affine_ceiling,
                     pooled_feature_ceiling, step_correlations, staleness_curve,
                     svd_rank_95)
@@ -698,17 +698,13 @@ def day1_unet(data_dir: Path, device, max_steps: int = 600, batch_size: int = 8,
     t_e0 = time.time()
     ev = None
     if eval_ds is not None:
-        # Fit maps only for the strata the eval set actually uses, so the
-        # fit loader is a short pass (per-shape cap + visited-batch cap).
+        # Fit maps only for the strata the eval set uses, drawn as a seeded
+        # thin sample across every generation of each stratum (the first-come
+        # loader walk hugged a bucket's first generations and left other
+        # strata without fit pairs).
         eval_shapes = set(eval_ds.pair_shapes())
-        fit_sampler = CorrectorBatchSampler(
-            train_ds, 16, seed + 5,
-            include_areas=sorted(h * w for h, w in eval_shapes))
-        fit_loader = DataLoader(train_ds, batch_sampler=fit_sampler,
-                                collate_fn=collate_corrector, num_workers=0)
-        fit_maps = collect_affine_maps(fit_loader,
-                                       cap_batches_per_shape=recovery_fit_batches,
-                                       known_shapes=eval_shapes)
+        fit_maps = collect_fit_maps(train_ds, eval_shapes, seed=seed + 5,
+                                    cap_batches_per_shape=recovery_fit_batches)
         ev = eval_pairs(eval_ds, fit_maps, recovery_eval_batches)
         del fit_maps
     day1_eval = ev["rel_mse"] if ev is not None else None
