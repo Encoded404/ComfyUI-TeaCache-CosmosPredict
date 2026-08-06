@@ -33,6 +33,7 @@ from .utils import (
     load_models, sample, get_diffusion_model,
     compute_quality_metrics, img_to_tensor, QualityMetrics,
     print_metrics_legend, print_schedule_estimate, print_speed_summary,
+    RunSpec,
 )
 from .forward import teacache_anima_forward
 from .prompt_loader import load_prompt_config, select_prompts, GenerationPromptSampler, resolve_generation
@@ -659,25 +660,36 @@ def main():
     total_baseline_images = len(resolutions) * len(step_counts) * total_per_combo
 
     total_bsl_iterations = 0
-    total_bsl_pixel_steps = 0.0
     for w, h in resolutions:
         for s in step_counts:
             total_bsl_iterations += s * total_per_combo
-            total_bsl_pixel_steps += (w * h) * s * total_per_combo
-    avg_bsl_steps = total_bsl_iterations / total_baseline_images if total_baseline_images > 0 else 1.0
-    est_res = int((total_bsl_pixel_steps / max(total_bsl_iterations, 1)) ** 0.5)
+
+    # Exact schedules (deterministic run order) for the pre-run estimates.
+    baseline_schedule = [
+        RunSpec(width=w, height=h, steps=s,
+                sampler=tcfg.sampling["sampler"],
+                scheduler=tcfg.sampling["scheduler"],
+                cfg=tcfg.sampling["cfg"])
+        for w, h in resolutions for s in step_counts for _ in range(total_per_combo)
+    ]
+    val_schedule = [
+        RunSpec(width=w, height=h, steps=s,
+                sampler=tcfg.sampling["sampler"],
+                scheduler=tcfg.sampling["scheduler"],
+                cfg=tcfg.sampling["cfg"])
+        for _cfg in selected_cfgs for w, h in resolutions for s in step_counts
+        for _ in range(total_per_combo)
+    ]
 
     print_schedule_estimate(
         label="Baseline generation schedule",
         total_generations=total_baseline_images,
-        avg_steps=avg_bsl_steps,
-        width=est_res,
-        height=est_res,
         extra_lines=[
             f"Resolutions:    {resolutions}",
             f"Step counts:    {step_counts}",
             f"Prompts x seeds: {len(prompts)} x {len(seeds)} = {total_per_combo}",
         ],
+        schedule=baseline_schedule,
     )
 
     bsl_start = time.time()
@@ -701,15 +713,13 @@ def main():
     print_schedule_estimate(
         label="Validation schedule",
         total_generations=total_val_images,
-        avg_steps=avg_bsl_steps,
-        width=est_res,
-        height=est_res,
         extra_lines=[
             f"Configs:        {len(selected_cfgs)}",
             f"Resolutions:    {resolutions}",
             f"Step counts:    {step_counts}",
             f"Prompts x seeds: {len(prompts)} x {len(seeds)} = {total_per_combo}",
         ],
+        schedule=val_schedule,
     )
 
     val_start = time.time()

@@ -35,7 +35,9 @@ from pathlib import Path
 import torch
 
 from .config_types import CalibrationEntry, TuningConfig
-from .utils import load_models, sample, get_diffusion_model, detect_gpu, print_schedule_estimate, print_speed_summary
+from .utils import (load_models, sample, get_diffusion_model, detect_gpu,
+                    print_schedule_estimate, print_speed_summary,
+                    RunSpec, ScheduleEstimator, format_duration)
 from .recorder import make_calibration_forward, make_refiner_forward, _new_refiner_buf
 from . import refiner_data
 from .prompt_loader import load_prompt_config, select_prompts, GenerationPromptSampler, resolve_generation
@@ -321,7 +323,7 @@ def run_calibration(comfy_dir: str, config_path: str = None, overrides: dict = N
     print("=" * 60)
     print("  TeaCache Calibration — Phase 1")
     print("=" * 60)
-    gpu_display, gpu_speed = detect_gpu()
+    gpu_display, gpu_speed, _ = detect_gpu()
     print(f"  GPU:            {gpu_display}  (×{gpu_speed:.1f} vs V100)")
     print(f"  ComfyUI:        {tcfg.comfy_dir}")
     print(f"  Model:          {tcfg.model_name}")
@@ -373,12 +375,38 @@ def run_calibration(comfy_dir: str, config_path: str = None, overrides: dict = N
         print(f"    {i:>2}: [{sampler} cfg={cfg_val}]  [{', '.join(tags)}]  {short}...")
 
     total_runs = len(prompts) * len(seeds) * len(step_variants)
-    # Estimate entries: each run produces ~ (steps - 1) × 2 cond slots
-    if step_weights and len(step_weights) == len(step_variants):
-        ws = step_weights
-    else:
-        ws = [1.0 / len(step_variants)] * len(step_variants)
-    avg_steps = sum(s * w for s, w in zip(step_variants, ws)) / sum(ws)
+
+    # Deterministic resolution assignments: seeded RNG, one draw per run
+    # index, independent of prompt/seed/step selection (plan Task 1).
+    res_assignments = []
+    if res_mix is not None:
+        rng = random.Random(_RESOLUTION_RNG_SEED)
+        res_assignments = [_draw_resolution(rng, res_mix) for _ in range(total_runs)]
+        print(f"  [calibrate] resolutions: "
+              f"{ {k: res_assignments.count(k) for k in res_mix} }")
+
+    # Exact run schedule: ordering mirrors the execution loops below
+    # (prompts → seeds → step variants), so schedule[run_idx - 1] is the
+    # spec of the run with that 1-based run index.  Sampler/scheduler/cfg
+    # cycle per prompt index, exactly as in the run loop.
+    schedule: list[RunSpec] = []
+    for pi, _pdata in enumerate(prompts):
+        cur_sampler   = sampler_variants[pi % len(sampler_variants)]
+        cur_scheduler = scheduler_variants[pi % len(scheduler_variants)]
+        cur_cfg       = cfg_variants[pi % len(cfg_variants)]
+        for _seed in seeds:
+            for st in step_variants:
+                if res_assignments:
+                    width, height = refiner_data.parse_resolution(
+                        res_assignments[len(schedule)]
+                    )
+                else:
+                    width, height = w, h
+                schedule.append(RunSpec(width=width, height=height, steps=int(st),
+                                        sampler=cur_sampler, scheduler=cur_scheduler,
+                                        cfg=cur_cfg))
+
+    avg_steps = sum(s.steps for s in schedule) / max(total_runs, 1)
     est_entries = int(total_runs * (avg_steps - 1) * 2)
 
     w = tcfg.sampling["width"]
@@ -391,14 +419,15 @@ def run_calibration(comfy_dir: str, config_path: str = None, overrides: dict = N
         f"Est. disk:    ~{est_entries * 300 // 1000}k kB  (JSONL)",
         f"Output dir:   {out_dir}",
     ]
+    refiner_disk_bytes = 0.0
     if refiner_mode != "off":
-        refiner_disk = refiner_data.estimate_refiner_disk_bytes(
+        refiner_disk_bytes = refiner_data.estimate_refiner_disk_bytes(
             total_runs, avg_steps, res_mix or {f"{w}x{h}": 1.0},
             refiner_cfg.get("record_slots", "both"),
             lags=refiner_cfg.get("record_lags"),
         )
         extra_lines.append(
-            f"Refiner disk: ~{refiner_disk/1e6:.0f} MB  lossless "
+            f"Refiner disk: ~{refiner_disk_bytes/1e6:.0f} MB  lossless "
             f"({refiner_cfg.get('record_slots', 'both')} slots, "
             f"lags={refiner_cfg.get('record_lags')}, mix-averaged)"
         )
@@ -409,6 +438,8 @@ def run_calibration(comfy_dir: str, config_path: str = None, overrides: dict = N
         width=w,
         height=h,
         extra_lines=extra_lines,
+        schedule=schedule,
+        refiner_disk_bytes=refiner_disk_bytes,
     )
     print(f"  Press Ctrl+C to abort, or wait 3 seconds...")
     try:
@@ -423,21 +454,18 @@ def run_calibration(comfy_dir: str, config_path: str = None, overrides: dict = N
     total_iterations = 0
     wall_start = time.time()
 
+    # Live ETA tracker: hardware model until measured, then blended per
+    # (resolution, steps) bucket means + sampler/scheduler/cfg factors.
+    estimator = ScheduleEstimator(schedule, gpu_name=gpu_display,
+                                  gpu_factor=gpu_speed)
+    report_interval = max(1, min(25, total_runs // 10))
+
     data_file = out_dir / "calibration_data.jsonl"
 
     # ── Refiner recording setup (Task 2d) ──
     refiner_dir = out_dir / "refiner_data"
     refiner_manifest = None
     eval_prompt_ids = set()
-    # Resolution assignments: deterministic per generation index (plan Task 1);
-    # applies to all calibration generations whenever sampling.resolution_mix
-    # is set, independent of refiner mode.
-    res_assignments = []
-    if res_mix is not None:
-        rng = random.Random(_RESOLUTION_RNG_SEED)
-        res_assignments = [_draw_resolution(rng, res_mix) for _ in range(total_runs)]
-        print(f"  [calibrate] resolutions: "
-              f"{ {k: res_assignments.count(k) for k in res_mix} }")
     if refiner_mode != "off":
         refiner_dir.mkdir(parents=True, exist_ok=True)
         refiner_manifest = refiner_data.init_manifest(refiner_cfg)
@@ -465,13 +493,10 @@ def run_calibration(comfy_dir: str, config_path: str = None, overrides: dict = N
                 run_idx += 1
                 t0 = time.time()
 
-                # Resolution mix: deterministic per generation index (plan
-                # Task 1, lives in sampling config); absent → base resolution.
-                if res_assignments:
-                    res_key = res_assignments[run_idx - 1]
-                    width, height = refiner_data.parse_resolution(res_key)
-                else:
-                    width, height = w, h
+                # Resolution/sampler/cfg dims come from the prebuilt
+                # schedule (deterministic; matches loop ordering).
+                spec = schedule[run_idx - 1]
+                width, height = spec.width, spec.height
 
                 # Per-generation prefix/negative variant + artist-tag draw
                 full_prompt, neg_prompt, artists = resolve_generation(
@@ -510,7 +535,6 @@ def run_calibration(comfy_dir: str, config_path: str = None, overrides: dict = N
                 finally:
                     restore_model(dm, original_fwd, unet)
 
-                dt = time.time() - t0
                 total_iterations += steps
                 run_entries = list(dm.calibration_log)
 
@@ -553,19 +577,32 @@ def run_calibration(comfy_dir: str, config_path: str = None, overrides: dict = N
                         eval_prompt_ids=eval_prompt_ids,
                     )
 
+                # Full-iteration wall time: covers the generation plus the
+                # JSONL append and refiner finalize, so the ETA includes
+                # the post-generation overheads.
+                dt = time.time() - t0
+                estimator.record(spec, dt)
                 valid = [e for e in run_entries if e.out_rel > 0]
                 vram = torch.cuda.max_memory_allocated() / (1024 ** 3)
-                eta = (dt * (total_runs - run_idx)) / 60.0
+                elapsed = time.time() - wall_start
+                eta = estimator.eta_seconds(run_idx)
 
                 artist_short = artists[0][:24] if artists else "none"
                 print(
                     f"[calib] {run_idx}/{total_runs}  "
+                    f"{run_idx / total_runs * 100:4.1f}%  "
                     f"p={pi} s={seed} steps={steps}  "
                     f"sampler={cur_sampler} cfg={cur_cfg}  "
                     f"res={width}x{height}  art={artist_short}  "
                     f"took={dt:.1f}s  entries={len(run_entries)}  "
-                    f"valid={len(valid)}  VRAM={vram:.1f}GB  ETA={eta:.0f}m"
+                    f"valid={len(valid)}  VRAM={vram:.1f}GB  "
+                    f"elapsed={format_duration(elapsed)}  "
+                    f"remaining=~{format_duration(eta)}"
                 )
+
+                if run_idx == total_runs or run_idx % report_interval == 0:
+                    for line in estimator.summary_lines(run_idx, elapsed):
+                        print(line)
 
     # Summary
     wall_elapsed = time.time() - wall_start

@@ -618,6 +618,66 @@ def _run_artist_system_test():
     print(f"  Artist system: all checks passed.\n")
 
 
+def _run_estimator_test():
+    """Pure-logic test of ScheduleEstimator / format_duration (no GPU).
+
+    Covers: duration formatting, exact remaining-bucket counts on a
+    deterministic schedule, hardware-fallback → measured-mean blending, and
+    the sampler/scheduler/cfg dimension factors.
+    """
+    from .utils import RunSpec, ScheduleEstimator, format_duration
+
+    print(f"\n{'─' * 60}")
+    print(f"  Schedule Estimator Test")
+    print(f"{'─' * 60}")
+
+    # 1) Duration formatting
+    assert format_duration(45) == "45s"
+    assert format_duration(65) == "1m 05s"
+    assert format_duration(3725) == "1h 02m"
+    print("  [1/4] format_duration:     OK  (45s / 1m 05s / 1h 02m)")
+
+    # 2) Exact remaining-bucket counts on a deterministic schedule
+    sched = [
+        RunSpec(512, 512, 30), RunSpec(512, 512, 30), RunSpec(512, 512, 30),
+        RunSpec(1024, 1024, 30), RunSpec(1024, 1024, 30), RunSpec(1024, 1024, 30),
+    ]
+    est = ScheduleEstimator(sched, gpu_name="V100", gpu_factor=1.0)
+    assert est.total_runs == 6
+    assert est.total_pixel_steps == 3 * 512 * 512 * 30 + 3 * 1024 * 1024 * 30
+    assert est.remaining_bucket_counts(3) == {(1024, 1024, 30): 3}
+    assert est.remaining_bucket_counts(6) == {}
+    print("  [2/4] remaining counts:    OK  (exact per-bucket)")
+
+    # 3) Hardware fallback before measurements → measured means after
+    hw_total = est.eta_seconds(0)
+    assert abs(hw_total - (3 * 12.3 + 3 * 44.7)) < 1e-6, f"hw total {hw_total}"
+    for i in range(3):
+        est.record(sched[i], 4.0)
+    for i in range(3, 6):
+        est.record(sched[i], 16.0)
+    assert est.eta_seconds(6) == 0.0
+    assert abs(est.eta_seconds(3) - 3 * 16.0) < 1e-9
+    assert abs(est.eta_seconds(0) - (3 * 4.0 + 3 * 16.0)) < 1e-9
+    print("  [3/4] measured blending:   OK  (hw fallback → exact means)")
+
+    # 4) Dimension factors: same bucket, alternating sampler costs
+    sched2 = [
+        RunSpec(512, 512, 30, sampler="slow" if i % 2 else "fast")
+        for i in range(10)
+    ] + [RunSpec(512, 512, 30, sampler="fast")]
+    est2 = ScheduleEstimator(sched2, gpu_name="V100", gpu_factor=1.0)
+    for i, s in enumerate(sched2[:-1]):
+        est2.record(s, 8.0 if s.sampler == "slow" else 4.0)
+    eta_fast = est2.eta_seconds(10)   # one unrecorded "fast" run remains
+    assert 3.9 < eta_fast < 4.1, f"fast-run ETA {eta_fast:.3f}"
+    lines = est2.summary_lines(10, 100.0)
+    assert len(lines) >= 4
+    print(f"  [4/4] dim factors:         OK  (fast ×{4/6:.3f} → {eta_fast:.1f}s)")
+
+    print(f"  Estimator test: all checks passed.\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description="TeaCache Anima Smoke Test")
     parser.add_argument("--comfy-dir", required=True,
@@ -625,6 +685,7 @@ def main():
     parser.add_argument("--steps", type=int, default=30,
                         help="Number of sampling steps (default: 30)")
     args = parser.parse_args()
+    _run_estimator_test()
     _run_artist_system_test()
     success = run_smoke_test(args.comfy_dir, args.steps)
     sys.exit(0 if success else 1)
