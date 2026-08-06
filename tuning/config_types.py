@@ -337,6 +337,7 @@ class TuningConfig:
     optimization: dict
     validation: dict
     refiner: dict = field(default_factory=dict)
+    refiner_training: dict = field(default_factory=dict)
     artist_tags: dict = field(default_factory=dict)
     output_dir: str = "outputs"
 
@@ -355,6 +356,7 @@ class TuningConfig:
             optimization=d["optimization"],
             validation=d["validation"],
             refiner=d.get("refiner", {}),
+            refiner_training=d.get("refiner_training", {}),
             artist_tags=d.get("artist_tags", {}),
             output_dir=d.get("output_dir", "outputs"),
         )

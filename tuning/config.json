@@ -105,7 +105,27 @@
         "record_slots": "both",
         "dtype": "bfloat16",
         "keep_all": true,
-        "eval_prompts": 6
+        "eval_prompts": 6,
+        "record_lags": [1, 2, 4, 8, 16],
+        "implicit_d0": true
+    },
+
+    "refiner_training": {
+        "multipass": true,
+        "refine_passes_max": 3,
+        "k_curriculum": true,
+        "stop_grad": true,
+        "model_size": "20m",
+        "loss": "rel_mse",
+        "optimizer": "sophia",
+        "lr": 4e-4,
+        "batch_size": 16,
+        "max_steps": 60000,
+        "eval_every": 500,
+        "ema_decay": 0.9999,
+        "normalization": "none",
+        "lag_weights": [1, 1, 1, 1, 1],
+        "seed": 42
     },
 
     "output_dir": "outputs",

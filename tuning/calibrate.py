@@ -9,13 +9,16 @@ The recorded JSONL file enables the offline optimizer (optimize.py) to simulate
 thousands of TeaCache configurations without touching the GPU.
 
 With refiner recording enabled (--refiner-data both|only, plan Task 2), the same
-runs additionally capture per-step latent tensors (x_t, v_t, prompt embeddings)
-into outputs/<timestamp>/refiner_data/ for the latent-space refiner.
+runs additionally capture per-step latent tensors (x_t, the v_MA lag-ladder skip
+reconstructions, v_true, prompt embeddings) into outputs/<timestamp>/refiner_data/
+for the latent-space refiner (plan v3 ring-buffer ladder).
 
 Usage:
     cd /path/to/ComfyUI-TeaCache-CosmosPredict
     python -m tuning.calibrate --comfy-dir /path/to/ComfyUI [--prompts 12 --seeds 0,7,42]
     python -m tuning.calibrate --comfy-dir /path/to/ComfyUI --refiner-data both
+    python -m tuning.calibrate --comfy-dir /path/to/ComfyUI \
+        --refiner-data only --refiner-lags "1,2,4,8,16" --prompts 1 --seeds 34635345
 
 Runtime estimate (A100-40GB):
     24 prompts × 4 seeds × 5 step variants = 480 generations
@@ -33,7 +36,7 @@ import torch
 
 from .config_types import CalibrationEntry, TuningConfig
 from .utils import load_models, sample, get_diffusion_model, detect_gpu, print_schedule_estimate, print_speed_summary
-from .recorder import make_calibration_forward, make_refiner_forward
+from .recorder import make_calibration_forward, make_refiner_forward, _new_refiner_buf
 from . import refiner_data
 from .prompt_loader import load_prompt_config, select_prompts, GenerationPromptSampler, resolve_generation
 from .artist_tags import load_pool_for_config, print_artist_frequencies
@@ -130,8 +133,9 @@ def patch_for_refiner(unet, steps: int, prompt_id: int, seed: int,
 
     Mirrors patch_for_calibration (plan Task 2a): same transformer_options
     metadata injection + step-tracking wrapper, plus the latent capture state
-    (_refiner_buf) and the record_slots/dtype settings from the refiner config.
-    The wrapper additionally records the sigma/timestep per call.
+    (_refiner_buf — v3 ring-buffer ladder: x/v_true/v_ma per slot, per-slot
+    residual ring deques) and the record_slots/dtype/lags settings from the
+    refiner config. The wrapper additionally records the sigma/timestep per call.
     """
     diffusion_model = get_diffusion_model(unet)
 
@@ -147,10 +151,7 @@ def patch_for_refiner(unet, steps: int, prompt_id: int, seed: int,
         if hasattr(diffusion_model, attr):
             delattr(diffusion_model, attr)
     diffusion_model.calibration_log = []
-    diffusion_model._refiner_buf = {
-        "x": {}, "v": {}, "prompt": {}, "prompt_captured": set(),
-        "timesteps": {}, "steps": {}, "step_fractions": {},
-    }
+    diffusion_model._refiner_buf = _new_refiner_buf(None)
 
     # Inject metadata into transformer_options
     to = unet.model_options.setdefault("transformer_options", {})
@@ -168,6 +169,15 @@ def patch_for_refiner(unet, steps: int, prompt_id: int, seed: int,
         print(f"  [refiner] ⚠ invalid record_slots {record_slots!r} — using 'both'")
         record_slots = "both"
     diffusion_model._refiner_record_slots = record_slots
+
+    lags = None
+    try:
+        lags = refiner_data.parse_lags(rc.get("record_lags"))
+    except ValueError as e:
+        print(f"  [refiner] ⚠ invalid record_lags ({e}) — using default {refiner_data.DEFAULT_LAGS}")
+        lags = refiner_data.parse_lags(None)
+    diffusion_model._refiner_lags = lags
+    diffusion_model._refiner_buf = _new_refiner_buf(lags)
 
     dtype_name = rc.get("dtype", "bfloat16")
     dtype = {"bfloat16": torch.bfloat16,
@@ -272,6 +282,12 @@ def run_calibration(comfy_dir: str, config_path: str = None, overrides: dict = N
         if record_slots not in ("both", "cond"):
             print(f"  ⚠ invalid refiner record_slots {record_slots!r} — using 'both'")
             refiner_cfg["record_slots"] = "both"
+        try:
+            refiner_cfg["record_lags"] = refiner_data.parse_lags(
+                refiner_cfg.get("record_lags")
+            )
+        except ValueError as e:
+            raise SystemExit(f"[calibrate] invalid refiner.record_lags: {e}") from e
 
     # Resolution mix lives in the base sampling config (plan Task 1, revised):
     # it is a sampling property, not a refiner-recording one, so it applies to
@@ -325,6 +341,7 @@ def run_calibration(comfy_dir: str, config_path: str = None, overrides: dict = N
     print(f"  Block data:     {'ON  (per-block deltas recorded)' if record_blocks else 'OFF'}")
     print(f"  Refiner data:   {refiner_mode}"
           + (f"  (slots={refiner_cfg.get('record_slots', 'both')}, "
+             f"lags={refiner_cfg.get('record_lags')}, "
              f"top_n={refiner_cfg.get('top_n', -1)})" if refiner_mode != "off" else ""))
     res_display = res_mix or f"{tcfg.sampling['width']}x{tcfg.sampling['height']} (fixed)"
     print(f"  Resolutions:    {res_display}")
@@ -378,10 +395,12 @@ def run_calibration(comfy_dir: str, config_path: str = None, overrides: dict = N
         refiner_disk = refiner_data.estimate_refiner_disk_bytes(
             total_runs, avg_steps, res_mix or {f"{w}x{h}": 1.0},
             refiner_cfg.get("record_slots", "both"),
+            lags=refiner_cfg.get("record_lags"),
         )
         extra_lines.append(
             f"Refiner disk: ~{refiner_disk/1e6:.0f} MB  lossless "
-            f"({refiner_cfg.get('record_slots', 'both')} slots, mix-averaged)"
+            f"({refiner_cfg.get('record_slots', 'both')} slots, "
+            f"lags={refiner_cfg.get('record_lags')}, mix-averaged)"
         )
     print_schedule_estimate(
         "Calibration run schedule",
@@ -597,6 +616,9 @@ def main():
                         help="Override sampling.resolution_mix, e.g. "
                              "'512x512:0.8,1024x1024:0.2' (plain 'WxH' entries "
                              "get equal shares)")
+    parser.add_argument("--refiner-lags", default=None,
+                        help="Override refiner record_lags (staleness ladder), "
+                             "e.g. '1,2,4,8,16' (default: config)")
     args = parser.parse_args()
 
     # Overrides
@@ -617,6 +639,8 @@ def main():
     if args.refiner_top_n is not None:
         refiner_overrides["top_n"] = args.refiner_top_n
         refiner_overrides["keep_all"] = args.refiner_top_n < 0
+    if args.refiner_lags is not None:
+        refiner_overrides["record_lags"] = args.refiner_lags
     if refiner_overrides:
         overrides["refiner"] = refiner_overrides
 

@@ -1,23 +1,32 @@
-"""Refiner latent-data storage (storage v1) — binary format, codecs, manifest.
+"""Refiner latent-data storage (storage v2, plan v3 ladder) — binary format, codecs, manifest.
 
 The refiner recording pipeline captures, per generation, per step, per recorded
-CFG slot, the 16-channel image latents ``x_t`` (pre-pad model input) and ``v_t``
-(the post-unpatchify full-model output the sampler consumes), plus prompt
-embeddings (once per generation). ``v_t`` is stored directly (no anchor+delta
-chain) so reconstruction is exact by definition.
+CFG slot: the 16-channel image latent ``x_t`` (pre-pad model input), the
+**Mode-A skip reconstruction** ``v_MA_d`` for every lag ``d`` in the configured
+ladder ``record_lags`` (constructed from the ring-buffer residual ladder:
+``v_MA(d) = unpatchify(final_layer(ori_x + Δr_{t−d}, t))`` — the exact
+deployment skip construction), and the true velocity ``v_true`` (the
+post-unpatchify full-model output the sampler consumes). ``v_true`` is stored
+once per step and serves all lags; ``Δ_MA = v_true − v_MA_d`` is derived at
+load (exact, no accumulation chains). The d=0 anchor (``v_MA(0) = v_true``)
+is synthesized at load from ``implicit_d0`` — zero storage.
 
 Layout (per calibration run):
     outputs/<timestamp>/refiner_data/
     ├── manifest.json
-    ├── gen_0000_p03_s34635345.bin          # per-step x_t/v_t per slot
+    ├── gen_0000_p03_s34635345.bin          # per-step x_t / v_MA ladder / v_true per slot
     ├── gen_0000_p03_s34635345.prompt.bin   # per-slot prompt embeddings
     └── ...
 
 ``.bin`` format (little-endian, struct-packed):
     header:   magic "TCREF" | format_version u8 | codec_id u8 | dtype_id u8
-              | num_slots u8 | C u32 | H u32 | W u32 | num_steps u32 | metadata_len u32
+              | num_slots u8 | C u32 | H u32 | W u32 | num_steps u32
+              | num_lags u8 | metadata_len u32
+    lags:     num_lags × u8 (the shared ladder, ascending)
     metadata: JSON bytes (per-generation metadata + per-slot step/timestep arrays)
-    offsets:  num_steps × num_slots × 2 × u64  (x_t blob, then v_t blob, per step/slot)
+    offsets:  num_steps × num_slots × (num_lags + 2) × u64
+              per (step, slot): x_t, v_MA per lag in ladder order (empty blob
+              when the step's ring was too short for that lag), v_true
     body:     compressed blobs, one per offset-table entry
 
 ``.prompt.bin`` format:
@@ -25,6 +34,7 @@ Layout (per calibration run):
               | D u32 | num_slots u8 | metadata_len u32
     metadata: JSON bytes (slot order, per-slot token counts)
     body:     per slot: N u32 | blob_len u64 | compressed (N, D) embedding blob
+              (the uncond 0-token form is stored as N=0 + empty blob)
 
 Codecs: 0 = raw bf16 (fallback), 1 = blosc2 bitshuffle+zstd level 9 on
 bf16-as-int16 views (v1 default), 2 = zfpy reversible (bf16→fp32 upcast;
@@ -46,7 +56,8 @@ import torch
 
 MAGIC_BIN = b"TCREF"
 MAGIC_PROMPT = b"TCPRT"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
+DEFAULT_LAGS = [1, 2, 4, 8, 16]
 
 CODEC_RAW = 0
 CODEC_BLOSC2 = 1
@@ -61,10 +72,45 @@ _DTYPE_IDS = {"bfloat16": 0, "float16": 1, "float32": 2}
 _DTYPE_NAMES = {v: k for k, v in _DTYPE_IDS.items()}
 _TORCH_DTYPES = {0: torch.bfloat16, 1: torch.float16, 2: torch.float32}
 
-_HDR_BIN = struct.Struct("<5sBBBBIIIII")
+_HDR_BIN = struct.Struct("<5sBBBBIIIIBI")
 _HDR_PROMPT = struct.Struct("<5sBBBIBI")
 _ENTRY_HEAD = struct.Struct("<IQ")
 _OFF = struct.Struct("<Q")
+
+# Lossless ratio assumptions for the disk estimate (plan §4 / Task 2d):
+#   x_t  128 KB @512² / 1.2 ≈ 107 KB   (sampler noise is incompressible)
+#   v_MA / v_true 128 KB @512² / 2.5 ≈ 51 KB
+_XT_LOSSLESS = 128 * 1024 / 1.2
+_V_LOSSLESS = 128 * 1024 / 2.5
+_PROMPT_BYTES = 1.3 * 1024 * 1024
+
+
+def parse_lags(spec) -> List[int]:
+    """Normalize a record_lags spec to a sorted, deduped list of positive ints.
+
+    Accepts a list (e.g. [1, 2, 4, 8, 16]) or a string (e.g. "1,2,4,8,16").
+    Raises ValueError on malformed input.
+    """
+    if spec is None:
+        return list(DEFAULT_LAGS)
+    if isinstance(spec, str):
+        parts = [p.strip() for p in spec.split(",") if p.strip()]
+        if not parts:
+            raise ValueError(f"empty record_lags string: {spec!r}")
+        items = [int(p) for p in parts]
+    elif isinstance(spec, (list, tuple)):
+        items = [int(p) for p in spec]
+    else:
+        raise ValueError(
+            f"record_lags must be a list or string, got {type(spec).__name__}"
+        )
+    if not items:
+        raise ValueError("record_lags is empty (need at least one lag)")
+    if any(i <= 0 for i in items):
+        raise ValueError(f"record_lags must be positive integers, got {items}")
+    if any(i > 255 for i in items):
+        raise ValueError(f"record_lags entries must be <= 255, got {items}")
+    return sorted(set(items))
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -195,13 +241,17 @@ def _decompress(data: bytes, codec_id: int, dtype_id: int,
 class RefinerRecording:
     """One generation's recorded tensors (mirrors the recorder's _refiner_buf).
 
-    ``x``/``v`` are dicts of slot -> per-step tensors (C, H, W) in sampling
-    order (step 0 = first denoising call). ``prompt`` is slot -> (N, D) bf16,
-    captured once per generation. ``metadata`` carries prompt_id, seed, sampler,
-    scheduler, cfg, width, height, steps, fps, eval, volatility.
+    ``x``/``v_true`` are dicts of slot -> per-step tensors (C, H, W) in sampling
+    order (step 0 = first denoising call). ``v_ma`` is slot -> per-step dicts of
+    {lag: tensor} — only lags whose ring history existed at that step (step t
+    has lags 1..min(t, max_lag)); the d=0 anchor is never stored (synthesized
+    at load). ``prompt`` is slot -> (N, D) bf16, captured once per generation.
+    ``metadata`` carries prompt_id, seed, sampler, scheduler, cfg, width,
+    height, steps, fps, eval, volatility.
     """
     x: Dict[int, List[torch.Tensor]]
-    v: Dict[int, List[torch.Tensor]]
+    v_true: Dict[int, List[torch.Tensor]]
+    v_ma: Dict[int, List[Dict[int, torch.Tensor]]]
     prompt: Dict[int, Optional[torch.Tensor]]
     timesteps: Dict[int, List[float]]
     steps: Dict[int, List[int]]
@@ -215,7 +265,8 @@ class RefinerGeneration:
     name: str
     metadata: dict
     x: Dict[int, List[torch.Tensor]]
-    v: Dict[int, List[torch.Tensor]]
+    v_true: Dict[int, List[torch.Tensor]]
+    v_ma: Dict[int, List[Dict[int, torch.Tensor]]]
     prompt: Dict[int, Optional[torch.Tensor]]
     timesteps: Dict[int, List[float]]
     steps: Dict[int, List[int]]
@@ -223,6 +274,7 @@ class RefinerGeneration:
     num_steps: int
     recorded_slots: List[int]
     prompt_id: int
+    lags: List[int]
     codec_id: int
     dtype_id: int
     shape: Tuple[int, int, int]
@@ -250,8 +302,22 @@ def write_generation(refiner_dir: Union[str, Path], recording: RefinerRecording,
         raise ValueError(f"write_generation: no recorded slots for {name}")
     num_steps = len(recording.x[slots[0]])
     for s in slots:
-        if len(recording.x[s]) != num_steps or len(recording.v[s]) != num_steps:
+        if (len(recording.x[s]) != num_steps
+                or len(recording.v_true[s]) != num_steps
+                or len(recording.v_ma[s]) != num_steps):
             raise ValueError(f"write_generation: inconsistent step counts in {name}")
+
+    # Ladder: from the recorded v_ma dicts (union of all present lags), sorted.
+    seen: set = set()
+    for s in slots:
+        for step_ma in recording.v_ma[s]:
+            seen.update(step_ma.keys())
+    lags = sorted(seen)
+    if not lags:
+        raise ValueError(
+            f"write_generation: no v_MA lags recorded for {name} "
+            f"(record_lags ladder produced no states)"
+        )
 
     first = recording.x[slots[0]][0]
     dtype_name = str(first.dtype).replace("torch.", "")
@@ -261,6 +327,7 @@ def write_generation(refiner_dir: Union[str, Path], recording: RefinerRecording,
     meta = dict(recording.metadata)
     meta.update({
         "slots": slots,
+        "lags": lags,
         "steps_per_slot": {str(s): recording.steps.get(s, []) for s in slots},
         "step_fractions_per_slot": {str(s): recording.step_fractions.get(s, []) for s in slots},
         "timesteps_per_slot": {str(s): recording.timesteps.get(s, []) for s in slots},
@@ -275,15 +342,20 @@ def write_generation(refiner_dir: Union[str, Path], recording: RefinerRecording,
         for t in range(num_steps):
             for s in slots:
                 blobs.append(blob(recording.x[s][t]))
-                blobs.append(blob(recording.v[s][t]))
+                step_ma = recording.v_ma[s][t]
+                for d in lags:
+                    vma_d = step_ma.get(d)
+                    blobs.append(blob(vma_d) if vma_d is not None else b"")
+                blobs.append(blob(recording.v_true[s][t]))
         return blobs
 
     blobs = build_blobs()
 
+    n_tensors = num_steps * len(slots) * (len(lags) + 2)
     header = _HDR_BIN.pack(MAGIC_BIN, FORMAT_VERSION, codec_id, dtype_id,
-                           len(slots), c, h, w, num_steps, len(meta_bytes))
-    off_count = num_steps * len(slots) * 2
-    cursor = len(header) + len(meta_bytes) + off_count * _OFF.size
+                           len(slots), c, h, w, num_steps, len(lags),
+                           len(meta_bytes))
+    cursor = len(header) + len(lags) + len(meta_bytes) + n_tensors * _OFF.size
     offsets = []
     for b in blobs:
         offsets.append(cursor)
@@ -292,6 +364,7 @@ def write_generation(refiner_dir: Union[str, Path], recording: RefinerRecording,
     bin_path = refiner_dir / f"{name}.bin"
     with bin_path.open("wb") as f:
         f.write(header)
+        f.write(bytes(lags))
         f.write(meta_bytes)
         for o in offsets:
             f.write(_OFF.pack(o))
@@ -333,6 +406,7 @@ def write_generation(refiner_dir: Union[str, Path], recording: RefinerRecording,
         "dtype": _DTYPE_NAMES[dtype_id],
         "shape": [c, h, w],
         "slots": slots,
+        "lags": lags,
         "num_steps": num_steps,
         "bytes": bin_path.stat().st_size,
         "prompt_bytes": prompt_path.stat().st_size,
@@ -352,32 +426,42 @@ def load_generation(bin_path: Union[str, Path]) -> RefinerGeneration:
     bin_path = Path(bin_path)
     data = bin_path.read_bytes()
     (magic, version, codec_id, dtype_id, num_slots,
-     c, h, w, num_steps, meta_len) = _HDR_BIN.unpack_from(data, 0)
+     c, h, w, num_steps, num_lags, meta_len) = _HDR_BIN.unpack_from(data, 0)
     if magic != MAGIC_BIN:
         raise ValueError(f"not a refiner .bin file: {bin_path}")
     if version != FORMAT_VERSION:
         raise ValueError(f"unsupported refiner format version {version} in {bin_path}")
 
-    meta = json.loads(data[_HDR_BIN.size:_HDR_BIN.size + meta_len].decode("utf-8"))
+    lag_bytes = data[_HDR_BIN.size:_HDR_BIN.size + num_lags]
+    lags = list(lag_bytes)
+    meta = json.loads(data[_HDR_BIN.size + num_lags:
+                            _HDR_BIN.size + num_lags + meta_len].decode("utf-8"))
     slots = [int(s) for s in meta.get("slots", [])]
     if len(slots) != num_slots:
         raise ValueError(f"slot count mismatch in {bin_path}: header {num_slots} vs metadata {len(slots)}")
 
-    off_start = _HDR_BIN.size + meta_len
-    off_count = num_steps * num_slots * 2
-    offsets = [_OFF.unpack_from(data, off_start + 8 * i)[0] for i in range(off_count)]
+    off_start = _HDR_BIN.size + num_lags + meta_len
+    n_tensors = num_steps * num_slots * (num_lags + 2)
+    offsets = [_OFF.unpack_from(data, off_start + 8 * i)[0] for i in range(n_tensors)]
     end = len(data)
-    blobs = [data[offsets[i]: (offsets[i + 1] if i + 1 < off_count else end)]
-             for i in range(off_count)]
+    blobs = [data[offsets[i]: (offsets[i + 1] if i + 1 < n_tensors else end)]
+             for i in range(n_tensors)]
 
     shape = (c, h, w)
-    x, v = {}, {}
+    x, v_true, v_ma = {}, {}, {}
     idx = 0
     for t in range(num_steps):
         for s in slots:
             x.setdefault(s, []).append(_decompress(blobs[idx], codec_id, dtype_id, shape))
-            v.setdefault(s, []).append(_decompress(blobs[idx + 1], codec_id, dtype_id, shape))
-            idx += 2
+            idx += 1
+            step_ma = {}
+            for d in lags:
+                if blobs[idx]:
+                    step_ma[d] = _decompress(blobs[idx], codec_id, dtype_id, shape)
+                idx += 1
+            v_ma.setdefault(s, []).append(step_ma)
+            v_true.setdefault(s, []).append(_decompress(blobs[idx], codec_id, dtype_id, shape))
+            idx += 1
 
     steps = {s: meta.get("steps_per_slot", {}).get(str(s), list(range(num_steps)))
              for s in slots}
@@ -389,11 +473,12 @@ def load_generation(bin_path: Union[str, Path]) -> RefinerGeneration:
     return RefinerGeneration(
         name=bin_path.stem,
         metadata=meta,
-        x=x, v=v, prompt=prompt,
+        x=x, v_true=v_true, v_ma=v_ma, prompt=prompt,
         timesteps=timesteps, steps=steps, step_fractions=step_fractions,
         num_steps=num_steps,
         recorded_slots=slots,
         prompt_id=int(meta.get("prompt_id", -1)),
+        lags=lags,
         codec_id=codec_id, dtype_id=dtype_id,
         shape=shape,
     )
@@ -413,7 +498,6 @@ def load_prompt_file(path: Union[str, Path]) -> Dict[int, Optional[torch.Tensor]
         raise ValueError(f"unsupported refiner format version {version} in {path}")
     meta = json.loads(data[_HDR_PROMPT.size:_HDR_PROMPT.size + meta_len].decode("utf-8"))
     slots = [int(s) for s in meta.get("slots", [])]
-    prompt_n = {int(k): int(v) for k, v in meta.get("prompt_n", {}).items()}
     out: Dict[int, Optional[torch.Tensor]] = {}
     cursor = _HDR_PROMPT.size + meta_len
     for s in slots:
@@ -460,29 +544,56 @@ def iter_generations(refiner_dir: Union[str, Path]) -> List[dict]:
     return load_manifest(refiner_dir).get("generations", [])
 
 
-def iter_pairs(refiner_dir: Union[str, Path], include_eval: bool = False) -> Iterator[dict]:
-    """Yield training pairs (x_t, v_prev, v_t, prompt, t_frac, slot) per step.
+def iter_pairs(refiner_dir: Union[str, Path], include_eval: bool = False,
+               implicit_d0: Optional[bool] = None) -> Iterator[dict]:
+    """Yield training pairs (x_t, v_MA, Δ_MA, v_true, t_frac, lag, slot) per step.
 
-    Consecutive-step pairs per slot; eval-prompt generations are excluded by
-    default (their recordings exist but are held out from training, plan 6e).
+    One pair per (generation, slot, step, stored lag) plus, when
+    ``implicit_d0`` (default: the recording run's refiner config; plan Task 1),
+    a synthesized d=0 pair per (generation, slot, step) with ``v_MA = v_true``
+    and ``Δ_MA = 0``. ``Δ_MA = v_true − v_MA`` is derived at load (exact in the
+    stored dtype). Eval-prompt generations are excluded by default (their
+    recordings exist but are held out from training, plan 6e).
     """
+    manifest = load_manifest(refiner_dir)
+    if implicit_d0 is None:
+        implicit_d0 = bool((manifest.get("refiner_config") or {}).get("implicit_d0", True))
     for entry in iter_generations(refiner_dir):
         if entry.get("eval") and not include_eval:
             continue
         gen = load_generation(Path(refiner_dir) / entry["bin"])
         for slot in gen.recorded_slots:
-            xs, vs = gen.x[slot], gen.v[slot]
-            fracs = gen.step_fractions.get(slot) or [0.0] * len(vs)
-            for t in range(1, len(vs)):
-                yield {
-                    "x_t": xs[t],
-                    "v_prev": vs[t - 1],
-                    "v_t": vs[t],
-                    "prompt": gen.prompt.get(slot),
-                    "t_frac": fracs[t] if t < len(fracs) else 0.0,
-                    "slot": slot,
-                    "generation": gen,
-                }
+            xs, vts = gen.x[slot], gen.v_true[slot]
+            vmas = gen.v_ma[slot]
+            fracs = gen.step_fractions.get(slot) or [0.0] * len(vts)
+            for t in range(len(vts)):
+                frac = fracs[t] if t < len(fracs) else 0.0
+                for lag in sorted(vmas[t]):
+                    v_ma = vmas[t][lag]
+                    yield {
+                        "x_t": xs[t],
+                        "v_ma": v_ma,
+                        "delta_ma": vts[t] - v_ma,
+                        "v_true": vts[t],
+                        "t_frac": frac,
+                        "lag": lag,
+                        "slot": slot,
+                        "prompt": gen.prompt.get(slot),
+                        "generation": gen,
+                    }
+                if implicit_d0:
+                    v_true = vts[t]
+                    yield {
+                        "x_t": xs[t],
+                        "v_ma": v_true,
+                        "delta_ma": torch.zeros_like(v_true),
+                        "v_true": v_true,
+                        "t_frac": frac,
+                        "lag": 0,
+                        "slot": slot,
+                        "prompt": gen.prompt.get(slot),
+                        "generation": gen,
+                    }
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -490,21 +601,29 @@ def iter_pairs(refiner_dir: Union[str, Path], include_eval: bool = False) -> Ite
 # ══════════════════════════════════════════════════════════════════════════
 
 
-def compute_volatility(v_per_slot: Dict[int, List[torch.Tensor]]) -> float:
-    """score = mean over steps/slots of mean(|v_t − v_{t−1}|)."""
+def compute_volatility(v_true: Dict[int, List[torch.Tensor]],
+                       v_ma: Dict[int, List[Dict[int, torch.Tensor]]]) -> float:
+    """score = mean over steps/slots/lags of mean(|v_true − v_MA_d|).
+
+    The correction magnitude — how much the corrector must learn from this
+    generation (plan Task 2c). Only stored lags (d ≥ 1) count; the d=0 anchor
+    is zero by construction and adds nothing.
+    """
     scores = []
-    for vs in v_per_slot.values():
-        deltas = []
-        for a, b in zip(vs[:-1], vs[1:]):
-            deltas.append((b.float() - a.float()).abs().mean().item())
-        if deltas:
-            scores.append(float(np.mean(deltas)))
+    for slot in v_true:
+        vts = v_true[slot]
+        vmas = v_ma.get(slot, [])
+        for t, v_t in enumerate(vts):
+            step_ma = vmas[t] if t < len(vmas) else {}
+            for lag in step_ma:
+                d = v_t.float() - step_ma[lag].float()
+                scores.append(d.abs().mean().item())
     return float(np.mean(scores)) if scores else 0.0
 
 
 def evict_generations(manifest: dict, refiner_dir: Union[str, Path],
                       refiner_cfg: dict) -> int:
-    """Apply the top_n cap: evict lowest-volatility generations per resolution.
+    """Apply the top_n cap: evict lowest-scoring generations per resolution.
 
     Ranking happens within-run only, per resolution stratum first (scores are
     resolution-dependent); eval generations always bypass ranking. Returns the
@@ -549,16 +668,24 @@ def finalize_refiner_generation(dm, refiner_dir: Union[str, Path], manifest: dic
     if not buf or not buf.get("x"):
         print(f"  [refiner] no recorded steps for {run_meta.get('name', '?')} — skipping")
         return None
-    if not buf.get("v"):
-        print(f"  [refiner] no v_t recorded for {run_meta.get('name', '?')} — skipping")
+    if not buf.get("v_true"):
+        print(f"  [refiner] no v_true recorded for {run_meta.get('name', '?')} — skipping")
+        return None
+    if not buf.get("v_ma"):
+        print(f"  [refiner] no v_MA ladder recorded for {run_meta.get('name', '?')} — skipping")
+        return None
+    if not any(step_ma for slot in buf["v_ma"] for step_ma in buf["v_ma"][slot]):
+        print(f"  [refiner] v_MA ladder empty for {run_meta.get('name', '?')} "
+              f"(generation too short for record_lags) — skipping")
         return None
 
     metadata = dict(run_meta)
     metadata["eval"] = int(metadata.get("prompt_id", -1)) in set(eval_prompt_ids)
-    metadata["volatility"] = compute_volatility(buf["v"])
+    metadata["volatility"] = compute_volatility(buf["v_true"], buf["v_ma"])
 
     recording = RefinerRecording(
-        x=buf["x"], v=buf["v"], prompt=buf.get("prompt", {}),
+        x=buf["x"], v_true=buf["v_true"], v_ma=buf["v_ma"],
+        prompt=buf.get("prompt", {}),
         timesteps=buf.get("timesteps", {}), steps=buf.get("steps", {}),
         step_fractions=buf.get("step_fractions", {}),
         metadata=metadata,
@@ -642,18 +769,19 @@ def parse_resolution_mix(spec) -> Dict[str, float]:
 
 def estimate_refiner_disk_bytes(total_generations: int, avg_steps: float,
                                 resolution_mix: Optional[Dict[str, float]],
-                                record_slots: str) -> float:
+                                record_slots: str,
+                                lags: Optional[List[int]] = None) -> float:
     """Lossless disk estimate for the schedule summary (Task 2d).
 
-    Plan §4 figures @512², 30 steps: ~5.8 MB/gen cond-only, ~11.7 MB/gen both
-    slots: per step x_t 128KB/1.2 + v_t 128KB/3 (lossless), prompt ~1.3MB/slot.
-    Scales with resolution ratio and the actual step mix.
+    Plan §4 figures @512², 30 steps, 5 stored lags {1,2,4,8,16} + implicit d=0:
+    ~25 MB/gen both slots: per step per slot x_t 107KB + 5×v_MA 51KB + v_true
+    51KB (lossless), prompt ~1.3 MB/slot. Scales with the ladder length, the
+    resolution ratio and the actual step mix.
     """
     slots = 2 if record_slots == "both" else 1
-    x_bytes = 128 * 1024 / 1.2
-    v_bytes = 128 * 1024 / 3.0
-    prompt_bytes = 1.3 * 1024 * 1024
-    per_gen_512 = avg_steps * slots * (x_bytes + v_bytes) + slots * prompt_bytes
+    lags = parse_lags(lags) if lags is not None else DEFAULT_LAGS
+    per_step = _XT_LOSSLESS + len(lags) * _V_LOSSLESS + _V_LOSSLESS
+    per_gen_512 = avg_steps * slots * per_step + slots * _PROMPT_BYTES
     total = 0.0
     for key, share in (resolution_mix or {"512x512": 1.0}).items():
         w, h = parse_resolution(key)

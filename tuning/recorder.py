@@ -5,12 +5,17 @@ plus ground truth output changes. This enables the offline optimizer (optimize.p
 to simulate any combination of knobs without touching the GPU.
 
 The refiner variant (make_refiner_forward) is a superset: it emits the same scalar
-CalibrationEntry stats AND records the latent tensors (x_t, v_t per step per slot,
-plus prompt embeddings) for the latent-space refiner (plan Task 2a).
+CalibrationEntry stats AND records the latent tensors for the latent-space refiner
+(plan Task 2a, v3 ladder): per step per slot — x_t, the Mode-A skip reconstruction
+v_MA_d for every lag in the ring-buffer ladder (record_lags), and v_true — plus
+prompt embeddings. The v_MA construction is bit-for-bit the deployment skip
+construction: state = ori_x + ring[−d] in fp32, cast to the context dtype at the
+final-layer input, unpatchify, crop.
 """
 
 from __future__ import annotations
 
+from collections import deque
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -18,6 +23,8 @@ import torch
 import comfy.ldm.common_dit
 
 from .config_types import CalibrationEntry, DeltaStats, TeacacheConfig
+
+DEFAULT_RECORD_LAGS = [1, 2, 4, 8, 16]
 
 
 def _make_delta_stats(delta: torch.Tensor, denom: torch.Tensor) -> DeltaStats:
@@ -35,27 +42,44 @@ def _make_delta_stats(delta: torch.Tensor, denom: torch.Tensor) -> DeltaStats:
     )
 
 
-def _capture_refiner_step(self, x_orig, result, crossattn_emb,
-                          cond_or_uncond, b, orig_shape, to):
+def _new_refiner_buf(lags: Optional[List[int]] = None) -> dict:
+    """Fresh per-generation refiner capture state (plan 2a)."""
+    lags = list(lags or DEFAULT_RECORD_LAGS)
+    ring_maxlen = max(lags)
+    return {
+        "x": {}, "v_true": {}, "v_ma": {}, "ring": {}, "lags": lags,
+        "ring_maxlen": ring_maxlen,
+        "prompt": {}, "prompt_captured": set(),
+        "timesteps": {}, "steps": {}, "step_fractions": {},
+    }
+
+
+def _capture_refiner_step(self, x_orig, ori_x, residual, result, t_emb, adaln_lora,
+                          crossattn_emb, cond_or_uncond, b, orig_shape, to):
     """Append the current step's latent tensors to self._refiner_buf.
 
     Records, per step per recorded CFG slot:
       - x_t: the raw pre-pad latent argument, cropped to orig_shape
              (recorder.py:55/64 pattern — what the sampler feeds the model)
-      - v_t: the post-unpatchify result the sampler consumes
-             (recorder.py:243-245 pattern)
+      - v_true: the post-unpatchify full-model result the sampler consumes
+      - v_MA_d per lag d in the ladder: unpatchify(final_layer(ori_x + ring[−d],
+        t_emb)) — the exact Mode-A skip reconstruction for a residual from d
+        steps ago (plan §1/2a). Computed in ONE batched final_layer call for
+        all (slot, lag) states; only lags with ring history at this step
+        (d ≤ len(ring), i.e. step ≥ d) are produced.
       - prompt embeddings: captured once per generation (guarded by a flag —
         the context is identical every step)
       - sigma/timestep, step, step_fraction: wrapper metadata
 
+    The per-slot residual ring buffer lives in buf["ring"] (deques of maxlen
+    max(record_lags) on cache_device, fp32 — the deployment cache dtype).
     Tensors are moved to CPU immediately at the configured dtype
     (self._refiner_dtype, bf16 by default; the model may run fp16).
     """
     if not hasattr(self, "_refiner_buf"):
-        self._refiner_buf = {
-            "x": {}, "v": {}, "prompt": {}, "prompt_captured": set(),
-            "timesteps": {}, "steps": {}, "step_fractions": {},
-        }
+        self._refiner_buf = _new_refiner_buf(
+            getattr(self, "_refiner_lags", None)
+        )
     buf = self._refiner_buf
     record_slots = getattr(self, "_refiner_record_slots", "both")
     dtype = getattr(self, "_refiner_dtype", torch.bfloat16)
@@ -65,6 +89,49 @@ def _capture_refiner_step(self, x_orig, result, crossattn_emb,
     step_fraction = step / max(total_steps - 1, 1)
     timestep = float(to.get("calibration_timestep", 0.0))
 
+    # ── v_MA ladder: states = ori_x + ring[−d] (the Mode-A skip construction) ──
+    # Computed BEFORE the current residual is appended to the ring, so ring[−d]
+    # is the token-space delta from d steps ago — identical to a deployment
+    # skip step whose last full run was d steps back.
+    states, state_keys, t_rows, a_rows = [], [], [], []
+    for i, k in enumerate(cond_or_uncond):
+        k = int(k)
+        if record_slots == "cond" and k != 1:
+            continue
+        ring = buf["ring"].get(k)
+        if not ring:
+            continue
+        ori_slice = ori_x[i * b : (i + 1) * b]
+        t_slice = t_emb[i * b : (i + 1) * b]
+        for d in buf["lags"]:
+            if d > len(ring):
+                break  # lags ascending; ring has len(ring) entries total
+            states.append(ori_slice + ring[-d])
+            state_keys.append((k, d))
+            t_rows.append(t_slice)
+            if adaln_lora is not None:
+                a_rows.append(adaln_lora[i * b : (i + 1) * b])
+
+    vma_by_slot: Dict[int, Dict[int, torch.Tensor]] = {}
+    if states:
+        fwd_kwargs = {}
+        if a_rows:
+            fwd_kwargs["adaln_lora_B_T_3D"] = torch.cat(a_rows, dim=0)
+        x_out = self.final_layer(
+            torch.cat(states, dim=0).to(crossattn_emb.dtype),
+            torch.cat(t_rows, dim=0),
+            **fwd_kwargs,
+        )
+        vma_out = self.unpatchify(x_out)[
+            :, :, : orig_shape[-3], : orig_shape[-2], : orig_shape[-1]
+        ]
+        for j, (k, d) in enumerate(state_keys):
+            v_slot = vma_out[j : j + 1][0]
+            if v_slot.shape[1] == 1:  # T == 1 → (C, H, W)
+                v_slot = v_slot[:, 0]
+            vma_by_slot.setdefault(k, {})[d] = v_slot.detach().to("cpu", dtype=dtype)
+
+    # ── Per-slot bookkeeping: ring append + x_t / v_true / metadata ──
     for i, k in enumerate(cond_or_uncond):
         k = int(k)
         if record_slots == "cond" and k != 1:
@@ -79,7 +146,10 @@ def _capture_refiner_step(self, x_orig, result, crossattn_emb,
             v_slot = v_slot[:, 0]
 
         buf["x"].setdefault(k, []).append(x_slot.detach().to("cpu", dtype=dtype))
-        buf["v"].setdefault(k, []).append(v_slot.detach().to("cpu", dtype=dtype))
+        buf["v_true"].setdefault(k, []).append(v_slot.detach().to("cpu", dtype=dtype))
+        buf["v_ma"].setdefault(k, []).append(vma_by_slot.get(k, {}))
+        ring = buf["ring"].setdefault(k, deque(maxlen=buf["ring_maxlen"]))
+        ring.append(residual[i * b : (i + 1) * b].detach())
         buf["timesteps"].setdefault(k, []).append(timestep)
         buf["steps"].setdefault(k, []).append(step)
         buf["step_fractions"].setdefault(k, []).append(step_fraction)
@@ -103,9 +173,10 @@ def make_calibration_forward(source_hint: str = "all"):
 def make_refiner_forward(source_hint: str = "all"):
     """Create a refiner-patched _forward() — calibration stats + latent tensors.
 
-    Superset of make_calibration_forward (plan Task 2a): same scalar
-    CalibrationEntry stats AND per-step per-slot x_t/v_t/prompt capture into
-    self._refiner_buf. Runs the full model (no skipping).
+    Superset of make_calibration_forward (plan Task 2a, v3): same scalar
+    CalibrationEntry stats AND per-step per-slot x_t / v_MA ladder / v_true /
+    prompt capture into self._refiner_buf. Runs the full model (no skipping,
+    no TeaCache decisions) — recording is config-independent by design.
     """
     return _make_forward(record_refiner=True)
 
@@ -117,7 +188,8 @@ def _make_forward(record_refiner: bool = False):
       - Delta stats for t_emb, first_block_shift, and pooled_latent sources
       - Ground truth output change (out_rel) at each step
       - Residual change (res_rel) for validation
-      - (refiner mode) per-step latent tensors x_t / v_t / prompt per slot
+      - (refiner mode) per-step latent tensors x_t / v_MA ladder / v_true /
+        prompt per slot (v3 ring-buffer capture, plan Task 2a)
 
     Data is appended to self.calibration_log as CalibrationEntry dicts.
     """
@@ -330,8 +402,8 @@ def _make_forward(record_refiner: bool = False):
 
         if record_refiner:
             _capture_refiner_step(
-                self, x_orig, result, crossattn_emb,
-                cond_or_uncond, b, orig_shape, to,
+                self, x_orig, ori_x, residual, result, t_emb, adaln_lora,
+                crossattn_emb, cond_or_uncond, b, orig_shape, to,
             )
 
         return result
