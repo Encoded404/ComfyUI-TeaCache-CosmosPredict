@@ -863,16 +863,28 @@ def affine_rel_mse_per_pair(coefs, vm, vt) -> List[float]:
 
 
 def collect_affine_maps(loader, cap_batches_per_shape: int = 128,
-                        cap_batches_total: int = 512) -> dict:
+                        cap_batches_total: int = 512,
+                        known_shapes=None) -> dict:
     """Collect (v_ma, v_true) batch tensors per latent shape from a loader.
 
     Returns ``{shape: {"vm": [tensor...], "vt": [tensor...]}}`` — CPU float32,
-    batched (B, C, H, W); capped at ``cap_batches_per_shape`` batch tensors per
-    shape (first-come) and ``cap_batches_total`` overall (early exit).
+    batched (B, C, H, W). Time and memory are bounded: at most
+    ``cap_batches_per_shape`` batch tensors per shape (first-come) and at most
+    ``cap_batches_total`` batches *visited* overall — the iteration always
+    terminates, even when a single dominant shape fills the stream (which
+    previously caused a silent full-corpus pass).
+
+    ``known_shapes`` (iterable of (h, w) tuples) enables an early exit as soon
+    as every known shape has reached its per-shape cap — pass the dataset's
+    shapes when the loader is already restricted to those buckets
+    (``CorrectorBatchSampler(include_areas=...)``).
     """
     by_shape = {}
     total = 0
     for b in loader:
+        total += 1
+        if total > cap_batches_total:
+            break
         vm = b["v_ma"].float().cpu()
         vt = b["v_true"].float().cpu()
         shape = (int(vm.shape[-2]), int(vm.shape[-1]))
@@ -881,8 +893,9 @@ def collect_affine_maps(loader, cap_batches_per_shape: int = 128,
             continue
         entry["vm"].append(vm)
         entry["vt"].append(vt)
-        total += 1
-        if total >= cap_batches_total:
+        if known_shapes and all(
+                len(by_shape.get(s, {"vm": []})["vm"]) >= cap_batches_per_shape
+                for s in known_shapes):
             break
     return by_shape
 

@@ -530,6 +530,14 @@ diagnostics; the shared implementation lives in `utils.py`
 (`fit_affine_coefs` / `affine_oob_eval` / `collect_affine_maps` /
 `split_affine_per_pair`).
 
+The recovery-row map collections are bounded and configurable via
+`refiner_training` in `tuning/config.json` (CLI: `--recovery-fit-batches`,
+`--recovery-eval-batches` on `train_corrector.py`): `recovery_fit_batches`
+(default 128) caps the batch tensors held per stratum for the affine *fit*
+(train pairs) and `recovery_eval_batches` (default 64) caps the scored eval
+maps — keeping tensors unbounded is what can stall the probe (a silent
+full-corpus pass) and blow past RAM on 1024²-heavy corpora.
+
 Step-level scalars stream to `probe_metrics.jsonl` (`tail -f` friendly):
 per-50-step Day-1 losses, phase timings, eval verdict.
 

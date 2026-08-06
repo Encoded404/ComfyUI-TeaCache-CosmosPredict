@@ -266,6 +266,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--cache-size", type=int, default=None,
                         help="Decompressed-generation LRU cache size, in "
                              "generations (config: refiner_training.cache_size)")
+    parser.add_argument("--recovery-fit-batches", type=int, default=None,
+                        help="batch tensors per shape for the OOD affine fit "
+                             "(config: refiner_training.recovery_fit_batches, default 128)")
+    parser.add_argument("--recovery-eval-batches", type=int, default=None,
+                        help="batch tensors per shape for the OOD affine score "
+                             "(config: refiner_training.recovery_eval_batches, default 64)")
     parser.add_argument("--num-workers", type=int, default=None,
                         help="DataLoader worker processes (config: "
                              "refiner_training.num_workers)")
@@ -310,6 +316,8 @@ def resolve_config(args: argparse.Namespace) -> dict:
         "eval_every": ("eval_every", 500),
         "seed": ("seed", 42),
         "cache_size": ("cache_size", 64),
+        "recovery_fit_batches": ("recovery_fit_batches", 128),
+        "recovery_eval_batches": ("recovery_eval_batches", 64),
         "num_workers": ("num_workers", 0),
     }
     cfg = {}
@@ -416,14 +424,16 @@ def compute_train_loss(model, batch, Ks: torch.Tensor, loss_fn, eps: float,
 
 
 def eval_model(model, eval_loader, lags: List[int], ks: List[int],
-               device, eps: float, show_progress: bool = False) -> Tuple[Dict, Dict, Dict]:
+               device, eps: float, show_progress: bool = False,
+               eval_map_batches: int = 64) -> Tuple[Dict, Dict, Dict]:
     """Per-lag, per-K rel-MSE (‖v̂−v_true‖₂/‖v_true‖₂) and cosine, plus the
     same metrics grouped per spatial shape ((k, (h, w))) for the per-resolution
     eval report (resolution-independence check).
 
     Also collects the eval (v_ma, v_true) maps per latent shape (with per-pair
-    d=0-anchor masks) for the OOD affine recovery row — the affine is fit on
-    TRAIN pairs by the caller and scored here, never on its own eval slice.
+    d=0-anchor masks, capped at ``eval_map_batches`` batch tensors per shape)
+    for the OOD affine recovery row — the affine is fit on TRAIN pairs by the
+    caller and scored here, never on its own eval slice.
     """
     model.eval()
     acc = {(k, lag): [0.0, 0.0, 0] for k in ks for lag in lags}
@@ -443,11 +453,11 @@ def eval_model(model, eval_loader, lags: List[int], ks: List[int],
             t = batch["t_frac"].to(device)
             lags_b = batch["lag"].tolist()
             hw = (int(x.shape[-2]), int(x.shape[-1]))
-            vm = batch["v_ma"].float().cpu()
             em = eval_maps.setdefault(hw, {"vm": [], "vt": [], "anchor": []})
-            em["vm"].append(vm)
-            em["vt"].append(batch["v_true"].float().cpu())
-            em["anchor"].extend([lag == 0 for lag in lags_b])
+            if len(em["vm"]) < eval_map_batches:
+                em["vm"].append(batch["v_ma"].float().cpu())
+                em["vt"].append(batch["v_true"].float().cpu())
+                em["anchor"].extend([lag == 0 for lag in lags_b])
             for k in ks:
                 v = v0
                 for _ in range(k):
@@ -790,7 +800,8 @@ def save_full_state(path, model, ema, opt, scaler, scheduler, step, cfg, best,
 def config_drift(snapshot: dict, cfg: dict) -> List[str]:
     keys = ["model_size", "depth", "optimizer", "lr", "batch_size", "loss",
             "max_steps", "refine_passes_max", "multipass",
-            "resolution_curriculum", "accumulate_big_batches", "scale_aug"]
+            "resolution_curriculum", "accumulate_big_batches", "scale_aug",
+            "recovery_fit_batches", "recovery_eval_batches"]
     drift = []
     for k in keys:
         if snapshot.get(k) != cfg.get(k):
@@ -881,6 +892,7 @@ def main(argv=None):
     print(f"  Scale aug:      {cfg['scale_aug']} (0.75× round-trip)   "
           f"accumulate ÷4 buckets: {cfg['accumulate_big_batches']}")
     eval_loader = None
+    eval_ds = None
     try:
         eval_ds = CorrectorDataset(data_dir, only_eval=True, seed=cfg["seed"],
                                    normalization_samples=0, manifest=manifest)
@@ -892,11 +904,17 @@ def main(argv=None):
     except ValueError as e:
         print(f"  ⚠ no eval generations — eval loop and gates skipped ({e})")
     # Fit loader for the OOD affine recovery row: a short capped pass over the
-    # TRAIN pairs (never the eval set), so the affine faces the same
-    # distribution contract as the corrector (fit=train, scored=eval).
-    fit_loader = DataLoader(ds, batch_sampler=CorrectorBatchSampler(
-        ds, batch_size=16, seed=cfg["seed"] + 6), collate_fn=collate_corrector,
-        num_workers=cfg["num_workers"], pin_memory=cfg["num_workers"] > 0)
+    # TRAIN pairs (never the eval set), restricted to the strata the eval set
+    # actually uses, so the affine faces the same distribution contract as the
+    # corrector (fit=train, scored=eval).
+    fit_loader = None
+    eval_shapes = set(eval_ds.pair_shapes()) if eval_ds is not None else set()
+    if eval_shapes:
+        fit_loader = DataLoader(ds, batch_sampler=CorrectorBatchSampler(
+            ds, batch_size=16, seed=cfg["seed"] + 6,
+            include_areas=sorted(h * w for h, w in eval_shapes)),
+            collate_fn=collate_corrector, num_workers=cfg["num_workers"],
+            pin_memory=cfg["num_workers"] > 0)
     lags = sorted(set(lag for _, _, _, lag in ds.pairs))
     if 0 not in lags:
         lags = [0] + lags
@@ -1127,18 +1145,23 @@ def main(argv=None):
             t_e0 = time.time()
             results, by_shape, eval_maps = eval_model(
                 model, eval_loader, lags, ks_eval, device,
-                eps, show_progress=(pbar is not None))
+                eps, show_progress=(pbar is not None),
+                eval_map_batches=int(cfg.get("recovery_eval_batches", 64)))
             k1_pairs = [r["rel_mse"] for (kk, _), r in results.items() if kk == 1]
             k1 = sum(k1_pairs) / max(len(k1_pairs), 1) if k1_pairs else None
             affine = None
             if affine_fit_maps is None and fit_loader is not None:
-                affine_fit_maps = collect_affine_maps(fit_loader)
+                affine_fit_maps = collect_affine_maps(
+                    fit_loader,
+                    cap_batches_per_shape=int(cfg.get("recovery_fit_batches", 128)),
+                    known_shapes=eval_shapes)
             if affine_fit_maps and eval_maps:
                 aff = affine_oob_eval(affine_fit_maps, eval_maps)
                 lad, anc = split_affine_per_pair(aff, eval_maps)
                 aff["split"] = {"ladder": round(sum(lad) / len(lad), 5) if lad else None,
                                 "anchor": round(sum(anc) / len(anc), 5) if anc else None}
                 affine = aff
+                del eval_maps  # release the eval-map tensors before training resumes
             row = "  [eval] step %d  " % step
             for k in ks_eval:
                 avg = sum(r["rel_mse"] for (kk, _), r in results.items() if kk == k)

@@ -557,8 +557,14 @@ def day1_unet(data_dir: Path, device, max_steps: int = 600, batch_size: int = 8,
               metrics: Optional[MetricsLog] = None,
               timer: Optional[TrainTimer] = None,
               manifest: Optional[dict] = None,
-              cache_size: int = 64) -> dict:
+              cache_size: int = 64,
+              recovery_fit_batches: int = 128,
+              recovery_eval_batches: int = 64) -> dict:
     """Tiny 2D UNet on the real pairs (3d stage 2); eval vs the linear ceiling.
+
+    ``recovery_fit_batches`` / ``recovery_eval_batches`` cap how many batch
+    tensors per latent shape are held in RAM for the OOD affine recovery row
+    (fit side / scored eval side; config: ``refiner_training``).
 
     Live reporting mirrors ``train_corrector``: tqdm bar with EMA loss, it/s
     and remaining, per-50-step log lines, and per-step JSONL rows.
@@ -631,7 +637,7 @@ def day1_unet(data_dir: Path, device, max_steps: int = 600, batch_size: int = 8,
     if pbar is not None:
         pbar.close()
     # eval
-    def eval_pairs(ds, fit_maps):
+    def eval_pairs(ds, fit_maps, eval_map_batches):
         if ds is None:
             return None
         errs, base_errs = [], []
@@ -656,13 +662,17 @@ def day1_unet(data_dir: Path, device, max_steps: int = 600, batch_size: int = 8,
                 anchors = (b["lag"].cpu() == 0).tolist()
                 errs.extend(rel)
                 base_errs.extend(base_rel)
+                # Eval maps for the OOD affine row are capped per shape (the
+                # base/model per-pair stats above stay on ALL pairs — floats
+                # only). Keeping the tensors unbounded is what blew past RAM.
                 vm = b["v_ma"].float().cpu()
                 vt = b["v_true"].float().cpu()
                 shape = (int(vm.shape[-2]), int(vm.shape[-1]))
                 em = eval_maps.setdefault(shape, {"vm": [], "vt": [], "anchor": []})
-                em["vm"].append(vm)
-                em["vt"].append(vt)
-                em["anchor"].extend(anchors)
+                if len(em["vm"]) < eval_map_batches:
+                    em["vm"].append(vm)
+                    em["vt"].append(vt)
+                    em["anchor"].extend(anchors)
                 for r, br, is_a in zip(rel, base_rel, anchors):
                     (split["base"]["anchor"] if is_a else split["base"]["ladder"]).append(br)
                     (split["model"]["anchor"] if is_a else split["model"]["ladder"]).append(r)
@@ -687,13 +697,38 @@ def day1_unet(data_dir: Path, device, max_steps: int = 600, batch_size: int = 8,
     t_e0 = time.time()
     ev = None
     if eval_ds is not None:
-        fit_loader = DataLoader(train_ds, batch_sampler=CorrectorBatchSampler(
-            train_ds, 16, seed + 5), collate_fn=collate_corrector, num_workers=0)
-        fit_maps = collect_affine_maps(fit_loader)
-        ev = eval_pairs(eval_ds, fit_maps)
+        # Fit maps only for the strata the eval set actually uses, so the
+        # fit loader is a short pass (per-shape cap + visited-batch cap).
+        eval_shapes = set(eval_ds.pair_shapes())
+        fit_sampler = CorrectorBatchSampler(
+            train_ds, 16, seed + 5,
+            include_areas=sorted(h * w for h, w in eval_shapes))
+        fit_loader = DataLoader(train_ds, batch_sampler=fit_sampler,
+                                collate_fn=collate_corrector, num_workers=0)
+        fit_maps = collect_affine_maps(fit_loader,
+                                       cap_batches_per_shape=recovery_fit_batches,
+                                       known_shapes=eval_shapes)
+        ev = eval_pairs(eval_ds, fit_maps, recovery_eval_batches)
+        del fit_maps
     day1_eval = ev["rel_mse"] if ev is not None else None
     if timer is not None:
         timer.add("eval", time.time() - t_e0)
+
+    split_json = None
+    affine_json = None
+    base_rel_mse = None
+    n_pairs = 0
+    if ev is not None:
+        base_rel_mse = ev["base_rel_mse"]
+        n_pairs = ev["n_pairs"]
+        split_json = {"base": {k: round(float(np.mean(v)), 5) if v else None
+                               for k, v in ev["split"]["base"].items()},
+                      "model": {k: round(float(np.mean(v)), 5) if v else None
+                                for k, v in ev["split"]["model"].items()},
+                      "affine": {k: round(float(np.mean(v)), 5) if v else None
+                                 for k, v in ev["split"]["affine"].items()}}
+        affine_json = affine_oob_json(ev["affine"])
+        del ev  # release the eval-map tensors before the lag-readability pass
 
     # Lag-readability (plan 3d): Δ̂ vs lag for fixed (x_t, t) — smooth/monotone?
     t_l0 = time.time()
@@ -702,19 +737,11 @@ def day1_unet(data_dir: Path, device, max_steps: int = 600, batch_size: int = 8,
     if timer is not None:
         timer.add("lag", time.time() - t_l0)
 
-    split_json = None
-    if ev is not None:
-        split_json = {"base": {k: round(float(np.mean(v)), 5) if v else None
-                               for k, v in ev["split"]["base"].items()},
-                      "model": {k: round(float(np.mean(v)), 5) if v else None
-                                for k, v in ev["split"]["model"].items()},
-                      "affine": {k: round(float(np.mean(v)), 5) if v else None
-                                 for k, v in ev["split"]["affine"].items()}}
     return {"day1_unet_rel_mse": day1_eval,
-            "base_rel_mse": ev["base_rel_mse"] if ev is not None else None,
+            "base_rel_mse": base_rel_mse,
             "recovery_split": split_json,
-            "affine_oob": affine_oob_json(ev["affine"]) if ev is not None else None,
-            "eval_pairs": ev["n_pairs"] if ev is not None else 0,
+            "affine_oob": affine_json,
+            "eval_pairs": n_pairs,
             "lag_readability": lag_stats,
             "loss_final": round(final_loss, 6),
             "loss_min": round(min_loss, 6),
@@ -982,7 +1009,9 @@ def main(argv=None):
     day1 = day1_unet(data_dir, device, max_steps=args.day1_steps,
                      batch_size=args.day1_batch, show_progress=show_progress,
                      metrics=metrics, timer=timer, manifest=manifest,
-                     cache_size=day1_cache_size)
+                     cache_size=day1_cache_size,
+                     recovery_fit_batches=int((tcfg.refiner_training or {}).get("recovery_fit_batches", 128)),
+                     recovery_eval_batches=int((tcfg.refiner_training or {}).get("recovery_eval_batches", 64)))
     day1["mlp_pooled_mean_error"] = round(float(mlp_err), 5)
     day1["linear_ceiling"] = ceiling
     if day1["day1_unet_rel_mse"] is not None:
