@@ -107,6 +107,7 @@
         "keep_all": true,
         "eval_prompts": 6,
         "record_lags": [1, 2, 4, 8, 16],
+        "clevel": 9,
         "implicit_d0": true
     },
 

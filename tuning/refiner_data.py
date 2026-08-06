@@ -184,7 +184,8 @@ def _tensor_from_bytes(data: bytes, dtype_id: int,
     return torch.from_numpy(arr).view(dtype).reshape(shape)
 
 
-def _compress(t: torch.Tensor, codec_id: int, dtype_id: int) -> bytes:
+def _compress(t: torch.Tensor, codec_id: int, dtype_id: int,
+              clevel: int = 9) -> bytes:
     if t is None or t.numel() == 0:
         return b""
     raw = _tensor_to_bytes(t)
@@ -194,7 +195,7 @@ def _compress(t: torch.Tensor, codec_id: int, dtype_id: int) -> bytes:
         b2 = _blosc2()
         if b2 is not None:
             return b2.compress2(
-                raw, typesize=_typesize(dtype_id), clevel=9,
+                raw, typesize=_typesize(dtype_id), clevel=int(clevel),
                 filter=b2.Filter.BITSHUFFLE, codec=b2.Codec.ZSTD,
             )
     if codec_id == CODEC_ZFPY:
@@ -226,6 +227,7 @@ def _decompress(data: bytes, codec_id: int, dtype_id: int,
             raise RuntimeError(
                 "zfpy is required to read codec-2 refiner data; pip install zfpy"
             )
+        data = bytes(data)  # zfpy may not accept memoryview slices
         t = torch.from_numpy(z.decompress_numpy(data))
         t = t.to(_TORCH_DTYPES[dtype_id])
         return t.reshape(shape)
@@ -278,6 +280,7 @@ class RefinerGeneration:
     codec_id: int
     dtype_id: int
     shape: Tuple[int, int, int]
+    clevel: int = 9
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -286,16 +289,20 @@ class RefinerGeneration:
 
 
 def write_generation(refiner_dir: Union[str, Path], recording: RefinerRecording,
-                     name: str, codec_id: int = CODEC_BLOSC2
-                     ) -> Tuple[Path, Path, dict]:
+                     name: str, codec_id: int = CODEC_BLOSC2,
+                     clevel: int = 9) -> Tuple[Path, Path, dict]:
     """Write one generation's .bin + .prompt.bin.
 
     Compression happens once, in one batch at generation end (not per step
-    inside the sampling loop). Returns (bin_path, prompt_path, manifest_entry).
+    inside the sampling loop). ``clevel`` is the blosc2 compression level
+    (0-9; default 9 = the pre-configurable behaviour) and is stored in the
+    .bin metadata JSON + manifest entry, so old files without the key keep
+    reading as level 9. Returns (bin_path, prompt_path, manifest_entry).
     """
     refiner_dir = Path(refiner_dir)
     refiner_dir.mkdir(parents=True, exist_ok=True)
     codec_id = _resolve_codec(codec_id)
+    clevel = max(0, min(int(clevel), 9))
 
     slots = sorted(recording.x.keys())
     if not slots:
@@ -331,11 +338,12 @@ def write_generation(refiner_dir: Union[str, Path], recording: RefinerRecording,
         "steps_per_slot": {str(s): recording.steps.get(s, []) for s in slots},
         "step_fractions_per_slot": {str(s): recording.step_fractions.get(s, []) for s in slots},
         "timesteps_per_slot": {str(s): recording.timesteps.get(s, []) for s in slots},
+        "clevel": clevel,
     })
     meta_bytes = json.dumps(meta, default=str).encode("utf-8")
 
     def blob(t: torch.Tensor) -> bytes:
-        return _compress(t, codec_id, dtype_id)
+        return _compress(t, codec_id, dtype_id, clevel=clevel)
 
     def build_blobs() -> List[bytes]:
         blobs = []
@@ -410,6 +418,7 @@ def write_generation(refiner_dir: Union[str, Path], recording: RefinerRecording,
         "num_steps": num_steps,
         "bytes": bin_path.stat().st_size,
         "prompt_bytes": prompt_path.stat().st_size,
+        "clevel": clevel,
     }
     for k, v in recording.metadata.items():
         entry.setdefault(k, v)
@@ -421,8 +430,27 @@ def write_generation(refiner_dir: Union[str, Path], recording: RefinerRecording,
 # ══════════════════════════════════════════════════════════════════════════
 
 
-def load_generation(bin_path: Union[str, Path]) -> RefinerGeneration:
-    """Load one generation .bin (+ its .prompt.bin) — tensors as stored."""
+def load_generation(bin_path: Union[str, Path], max_steps: Optional[int] = None,
+                    decode_x_steps: Optional[int] = None,
+                    load_prompt: bool = True) -> RefinerGeneration:
+    """Load one generation .bin (+ its .prompt.bin) — tensors as stored.
+
+    Decode-scoping knobs for the probe's analysis walk (which needs every
+    step's v_true/v_ma for the t-gap cancellation stats, but only the first
+    8 steps' tensors for the learnability/codec statistics, and never uses
+    prompts):
+
+    - ``max_steps`` limits the decode to the first ``max_steps`` denoising
+      steps (used when the t-gap stats are served from the analysis cache);
+    - ``decode_x_steps`` decodes x_t only for steps below the threshold,
+      storing ``None`` beyond it (x_t past step 8 is never consumed);
+    - ``load_prompt=False`` skips the .prompt.bin read.
+
+    All other callers use the defaults and decode everything. Blob slices are
+    taken from a zero-copy memoryview; blosc2's threaded ``decompress()``
+    accepts memoryview buffers directly. The stored compression level is
+    exposed as ``clevel`` (defaults to 9 for pre-configurable files).
+    """
     bin_path = Path(bin_path)
     data = bin_path.read_bytes()
     (magic, version, codec_id, dtype_id, num_slots,
@@ -444,23 +472,31 @@ def load_generation(bin_path: Union[str, Path]) -> RefinerGeneration:
     n_tensors = num_steps * num_slots * (num_lags + 2)
     offsets = [_OFF.unpack_from(data, off_start + 8 * i)[0] for i in range(n_tensors)]
     end = len(data)
-    blobs = [data[offsets[i]: (offsets[i + 1] if i + 1 < n_tensors else end)]
-             for i in range(n_tensors)]
+    mv = memoryview(data)
+    if max_steps is not None:
+        num_steps = max(0, min(int(max_steps), num_steps))
+    decode_x = None if decode_x_steps is None else int(decode_x_steps)
+
+    def blob(i: int) -> memoryview:
+        return mv[offsets[i]:(offsets[i + 1] if i + 1 < n_tensors else end)]
 
     shape = (c, h, w)
     x, v_true, v_ma = {}, {}, {}
     idx = 0
     for t in range(num_steps):
         for s in slots:
-            x.setdefault(s, []).append(_decompress(blobs[idx], codec_id, dtype_id, shape))
+            if decode_x is None or t < decode_x:
+                x.setdefault(s, []).append(_decompress(blob(idx), codec_id, dtype_id, shape))
+            else:
+                x.setdefault(s, []).append(None)
             idx += 1
             step_ma = {}
             for d in lags:
-                if blobs[idx]:
-                    step_ma[d] = _decompress(blobs[idx], codec_id, dtype_id, shape)
+                if blob(idx):
+                    step_ma[d] = _decompress(blob(idx), codec_id, dtype_id, shape)
                 idx += 1
             v_ma.setdefault(s, []).append(step_ma)
-            v_true.setdefault(s, []).append(_decompress(blobs[idx], codec_id, dtype_id, shape))
+            v_true.setdefault(s, []).append(_decompress(blob(idx), codec_id, dtype_id, shape))
             idx += 1
 
     steps = {s: meta.get("steps_per_slot", {}).get(str(s), list(range(num_steps)))
@@ -468,7 +504,8 @@ def load_generation(bin_path: Union[str, Path]) -> RefinerGeneration:
     step_fractions = {s: meta.get("step_fractions_per_slot", {}).get(str(s), [])
                       for s in slots}
     timesteps = {s: meta.get("timesteps_per_slot", {}).get(str(s), []) for s in slots}
-    prompt = load_prompt_file(bin_path.with_name(bin_path.stem + ".prompt.bin"))
+    prompt = (load_prompt_file(bin_path.with_name(bin_path.stem + ".prompt.bin"))
+              if load_prompt else {})
 
     return RefinerGeneration(
         name=bin_path.stem,
@@ -481,6 +518,7 @@ def load_generation(bin_path: Union[str, Path]) -> RefinerGeneration:
         lags=lags,
         codec_id=codec_id, dtype_id=dtype_id,
         shape=shape,
+        clevel=int(meta.get("clevel", 9)),
     )
 
 
@@ -752,8 +790,10 @@ def finalize_refiner_generation(dm, refiner_dir: Union[str, Path], manifest: dic
         metadata=metadata,
     )
     codec_id = int(refiner_cfg.get("codec", CODEC_BLOSC2))
+    clevel = int(refiner_cfg.get("clevel", 9))
     bin_path, prompt_path, entry = write_generation(
         Path(refiner_dir), recording, run_meta["name"], codec_id=codec_id,
+        clevel=clevel,
     )
     manifest["generations"].append(entry)
     removed = evict_generations(manifest, Path(refiner_dir), refiner_cfg)

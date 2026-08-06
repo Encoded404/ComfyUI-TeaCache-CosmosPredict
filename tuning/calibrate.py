@@ -290,6 +290,11 @@ def run_calibration(comfy_dir: str, config_path: str = None, overrides: dict = N
             )
         except ValueError as e:
             raise SystemExit(f"[calibrate] invalid refiner.record_lags: {e}") from e
+        clevel = int(refiner_cfg.get("clevel", 9))
+        if not 0 <= clevel <= 9:
+            print(f"  ⚠ invalid refiner clevel {clevel!r} — using 9")
+            clevel = 9
+        refiner_cfg["clevel"] = clevel
 
     # Resolution mix lives in the base sampling config (plan Task 1, revised):
     # it is a sampling property, not a refiner-recording one, so it applies to
@@ -344,6 +349,7 @@ def run_calibration(comfy_dir: str, config_path: str = None, overrides: dict = N
     print(f"  Refiner data:   {refiner_mode}"
           + (f"  (slots={refiner_cfg.get('record_slots', 'both')}, "
              f"lags={refiner_cfg.get('record_lags')}, "
+             f"clevel={refiner_cfg.get('clevel', 9)}, "
              f"top_n={refiner_cfg.get('top_n', -1)})" if refiner_mode != "off" else ""))
     res_display = res_mix or f"{tcfg.sampling['width']}x{tcfg.sampling['height']} (fixed)"
     print(f"  Resolutions:    {res_display}")
@@ -656,6 +662,10 @@ def main():
     parser.add_argument("--refiner-lags", default=None,
                         help="Override refiner record_lags (staleness ladder), "
                              "e.g. '1,2,4,8,16' (default: config)")
+    parser.add_argument("--refiner-clevel", type=int, default=None,
+                        help="Override refiner compression level 0-9 "
+                             "(default: config refiner.clevel = 9); the level "
+                             "is stored in each .bin + manifest entry")
     args = parser.parse_args()
 
     # Overrides
@@ -678,6 +688,8 @@ def main():
         refiner_overrides["keep_all"] = args.refiner_top_n < 0
     if args.refiner_lags is not None:
         refiner_overrides["record_lags"] = args.refiner_lags
+    if args.refiner_clevel is not None:
+        refiner_overrides["clevel"] = args.refiner_clevel
     if refiner_overrides:
         overrides["refiner"] = refiner_overrides
 

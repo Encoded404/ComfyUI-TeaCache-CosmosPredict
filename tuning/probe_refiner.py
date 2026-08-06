@@ -134,7 +134,8 @@ def record_probe_generations(tcfg: TuningConfig, num_gens: int, seeds: List[int]
     scheduler = tcfg.sampling.get("scheduler", "normal")
     cfg_val = float(tcfg.sampling.get("cfg", 5.0))
 
-    rc = {"record_lags": lags, "record_slots": "both", "dtype": "bfloat16"}
+    rc = {"record_lags": lags, "record_slots": "both", "dtype": "bfloat16",
+          "clevel": int((tcfg.refiner or {}).get("clevel", 9))}
     pbar = _bar(show_progress, len(entries), "record", "gen")
     failures = 0
     for i, pdata in enumerate(entries):
@@ -398,9 +399,67 @@ def delta_distribution(delta_maps: List[torch.Tensor]) -> dict:
 # ═══════════════════════════════════════════════════════════════════════
 
 _ANALYSIS_CAPS = {"tensor_cap": 12, "shape_cap": 256}
+_ANALYSIS_CACHE_DIR = ".probe_cache"
+_ANALYSIS_X_STEPS = 8
 
 
-def _analyze_generation(entry: dict, data_dir: Path, caps: dict) -> dict:
+def _gap_cache_path(cache_dir: Path, name: str) -> Path:
+    return Path(cache_dir) / f"{name}.gaps.json"
+
+
+def _load_gap_cache(cache_dir: Optional[Path], data_dir: Path,
+                    entry: dict) -> Optional[dict]:
+    """Cached per-generation t-gap lists, valid iff the .bin is unchanged.
+
+    The t-gap cancellation stats (all steps × lags) are the only part of the
+    walk that needs a full-generation decode; they are pure functions of the
+    recorded tensors, so they can be cached per generation and the learnability
+    stats re-decoded from just the first ``_ANALYSIS_X_STEPS`` steps. The cache
+    is invalidated by the .bin size + mtime, so re-recorded generations are
+    recomputed automatically. Float JSON round-trips are exact.
+    """
+    if cache_dir is None:
+        return None
+    p = _gap_cache_path(cache_dir, entry["name"])
+    try:
+        j = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return None
+    binp = data_dir / entry["bin"]
+    try:
+        st = binp.stat()
+    except OSError:
+        return None
+    if j.get("size") != st.st_size or j.get("mtime") != st.st_mtime:
+        return None
+    gt, gd = j.get("gap_true"), j.get("gap_delta")
+    if not isinstance(gt, list) or not isinstance(gd, list):
+        return None
+    return {"gap_true": gt, "gap_delta": gd}
+
+
+def _save_gap_cache(cache_dir: Optional[Path], data_dir: Path,
+                    entry: dict, gaps: dict) -> None:
+    if cache_dir is None:
+        return
+    cache_dir = Path(cache_dir)
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    binp = data_dir / entry["bin"]
+    st = binp.stat()
+    j = {"size": st.st_size, "mtime": st.st_mtime,
+         "gap_true": gaps["gap_true"], "gap_delta": gaps["gap_delta"]}
+    p = _gap_cache_path(cache_dir, entry["name"])
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(j))
+    tmp.replace(p)
+
+
+def _analyze_generation(entry: dict, data_dir: Path, caps: dict,
+                        cache_dir: Optional[Path] = None,
+                        use_cache: bool = True) -> Tuple[dict, bool]:
     """Decompress one generation and compute its analysis contributions.
 
     Pure per-generation work with no shared state, so the walk can run over a
@@ -408,11 +467,42 @@ def _analyze_generation(entry: dict, data_dir: Path, caps: dict) -> dict:
     collections (codec tensors, per-shape samples) are capped per generation
     and truncated again at merge, keeping the same caps as the sequential
     single walk (which generation fills the caps may differ in parallel mode).
+
+    With the analysis cache enabled: on a cache hit the t-gap lists are read
+    from ``<data_dir>/.probe_cache`` and only the first 8 steps are decoded
+    (``load_generation(max_steps=8, load_prompt=False)`` — the learnability
+    stats need nothing else); on a miss the full generation is decoded,
+    the t-gap lists computed and cached. Returns (partial, cache_hit).
     """
-    gen = refiner_data.load_generation(data_dir / entry["bin"])
+    cached = None
+    if use_cache:
+        cached = _load_gap_cache(cache_dir, data_dir, entry)
+    if cached is not None:
+        gen = refiner_data.load_generation(data_dir / entry["bin"],
+                                           max_steps=_ANALYSIS_X_STEPS,
+                                           load_prompt=False)
+        gap_true, gap_delta = cached["gap_true"], cached["gap_delta"]
+    else:
+        gen = refiner_data.load_generation(data_dir / entry["bin"],
+                                           decode_x_steps=_ANALYSIS_X_STEPS,
+                                           load_prompt=False)
+        n_steps = max(int(entry.get("num_steps", 1)), 1)
+        gap_true, gap_delta = [], []
+        for slot in gen.recorded_slots:
+            vts = gen.v_true[slot]
+            # t-gap cancellation (all steps, all lags)
+            for t in range(1, len(vts)):
+                gap_true.append(
+                    (vts[t].float() - vts[t - 1].float()).abs().mean().item())
+                step_ma = gen.v_ma[slot][t]
+                for lag in step_ma:
+                    gap_delta.append(
+                        (vts[t].float() - step_ma[lag].float()).abs().mean().item())
+        _save_gap_cache(cache_dir, data_dir, entry,
+                        {"gap_true": gap_true, "gap_delta": gap_delta})
     n_steps = max(int(entry.get("num_steps", 1)), 1)
     p = {
-        "gap_true": [], "gap_delta": [],
+        "gap_true": gap_true, "gap_delta": gap_delta,
         "deltas_by_lag": {}, "deltas_by_lag_shape": {},
         "v_ma_by_shape": {}, "v_true_by_shape": {}, "x_t_by_shape": {},
         "v_true_corr_by_shape": {},
@@ -420,14 +510,6 @@ def _analyze_generation(entry: dict, data_dir: Path, caps: dict) -> dict:
     }
     for slot in gen.recorded_slots:
         vts = gen.v_true[slot]
-        # t-gap cancellation (all steps, all lags)
-        for t in range(1, len(vts)):
-            p["gap_true"].append(
-                (vts[t].float() - vts[t - 1].float()).abs().mean().item())
-            step_ma = gen.v_ma[slot][t]
-            for lag in step_ma:
-                p["gap_delta"].append(
-                    (vts[t].float() - step_ma[lag].float()).abs().mean().item())
         # learnability + codec tensor collection (first 8 steps)
         for t in range(min(len(vts), 8)):
             vt = vts[t]
@@ -452,7 +534,7 @@ def _analyze_generation(entry: dict, data_dir: Path, caps: dict) -> dict:
                     p["v_ma_by_shape"][shape].append(vm)
                     p["v_true_by_shape"].setdefault(shape, []).append(vt)
                     p["x_t_by_shape"].setdefault(shape, []).append(xt)
-    return p
+    return p, cached is not None
 
 
 def _merge_analysis(acc: dict, p: dict, caps: dict) -> None:
@@ -486,7 +568,9 @@ def _merge_analysis(acc: dict, p: dict, caps: dict) -> None:
 
 
 def run_analysis_walk(entries: List[dict], data_dir: Path, n_threads: int,
-                      show_progress: bool = False) -> dict:
+                      show_progress: bool = False,
+                      cache_dir: Optional[Path] = None,
+                      use_cache: bool = True) -> Tuple[dict, dict]:
     """Decompress + analyze all generations, sequentially or over a thread pool.
 
     In parallel mode torch's CPU intra-op threads are pinned to 1 so the
@@ -495,6 +579,10 @@ def run_analysis_walk(entries: List[dict], data_dir: Path, n_threads: int,
     from blosc2's own thread pool, which is unaffected. The same pinning
     applies to the sequential walk so report values are reproducible
     regardless of machine core count.
+
+    With ``cache_dir`` set, per-generation t-gap stats are cached (see
+    ``_analyze_generation``) and cache-hit generations only decode the first
+    ``_ANALYSIS_X_STEPS`` steps. Returns (accumulator, {"hits": n, "misses": m}).
     """
     caps = _ANALYSIS_CAPS
     acc = {
@@ -504,28 +592,34 @@ def run_analysis_walk(entries: List[dict], data_dir: Path, n_threads: int,
         "v_true_corr_by_shape": {},
         "tensors": {"x_t": [], "v_true": [], "v_ma": [], "delta": []},
     }
+    stats = {"hits": 0, "misses": 0}
     old_torch_threads = torch.get_num_threads()
     torch.set_num_threads(1)
     bar = _bar(show_progress, len(entries), "analysis", "gen")
     try:
         if n_threads <= 1:
             for entry in entries:
-                _merge_analysis(acc, _analyze_generation(entry, data_dir, caps), caps)
+                p, hit = _analyze_generation(entry, data_dir, caps, cache_dir, use_cache)
+                _merge_analysis(acc, p, caps)
+                stats["hits" if hit else "misses"] += 1
                 if bar is not None:
                     bar.update(1)
         else:
             with ThreadPoolExecutor(max_workers=n_threads) as ex:
-                futures = [ex.submit(_analyze_generation, entry, data_dir, caps)
+                futures = [ex.submit(_analyze_generation, entry, data_dir, caps,
+                                     cache_dir, use_cache)
                            for entry in entries]
                 for f in as_completed(futures):
-                    _merge_analysis(acc, f.result(), caps)
+                    p, hit = f.result()
+                    _merge_analysis(acc, p, caps)
+                    stats["hits" if hit else "misses"] += 1
                     if bar is not None:
                         bar.update(1)
     finally:
         torch.set_num_threads(old_torch_threads)
     if bar is not None:
         bar.close()
-    return acc
+    return acc, stats
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -765,6 +859,10 @@ def main(argv=None):
     parser.add_argument("--analysis-threads", type=int, default=None,
                         help="Threads for the generation analysis walk "
                              "(default: min(8, cpu count); 1 = sequential)")
+    parser.add_argument("--no-analysis-cache", type=int, default=None,
+                        help="Disable the per-generation t-gap analysis cache "
+                             "(default: enabled; re-runs decode only the "
+                             "first 8 steps per generation)")
     parser.add_argument("--no-progress", type=int, default=None,
                         help="Disable tqdm progress bars (default: auto TTY detect)")
     parser.add_argument("--metrics", default=None,
@@ -809,18 +907,36 @@ def main(argv=None):
 
     # ── Single walk: decode each generation once for codecs + t-gap + learnability ──
     # (parallel-capable: decode is threaded inside blosc2; the walk itself can
-    # run over a thread pool — default min(8, cpu count), --analysis-threads)
+    # run over a thread pool — default min(8, cpu count), --analysis-threads).
+    # Per-generation t-gap stats are cached in <data_dir>/.probe_cache so
+    # re-runs only decode the first 8 steps (--no-analysis-cache disables).
     if args.analysis_threads is None:
         analysis_threads = min(8, os.cpu_count() or 1)
     else:
         analysis_threads = max(1, int(args.analysis_threads))
+    cache_dir = None
+    use_cache = not bool(args.no_analysis_cache)
+    if use_cache:
+        cache_dir = data_dir / _ANALYSIS_CACHE_DIR
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            print(f"  [probe] ⚠ analysis cache unavailable: {e} — continuing "
+                  "without caching")
+            cache_dir = None
     print(f"  Loading generations and collecting tensors/stats "
           f"({analysis_threads} analysis thread(s))...")
     manifest = refiner_data.load_manifest(data_dir)
     entries = refiner_data.iter_generations(data_dir, manifest=manifest)
+    if entries:
+        e0 = entries[0]
+        legacy = "" if "clevel" in e0 else " (legacy default)"
+        print(f"  Codec/level:    {e0.get('codec')} / clevel "
+              f"{e0.get('clevel', 9)}{legacy}")
     t_an0 = time.time()
-    acc = run_analysis_walk(entries, data_dir, analysis_threads,
-                            show_progress=show_progress)
+    acc, walk_stats = run_analysis_walk(entries, data_dir, analysis_threads,
+                                        show_progress=show_progress,
+                                        cache_dir=cache_dir, use_cache=use_cache)
     tensors = acc["tensors"]
     gap_true, gap_delta = acc["gap_true"], acc["gap_delta"]
     deltas_by_lag: Dict[int, List[Tuple[int, torch.Tensor]]] = acc["deltas_by_lag"]
@@ -831,6 +947,9 @@ def main(argv=None):
     v_true_corr_by_shape: Dict[Tuple[int, int], List[torch.Tensor]] = acc["v_true_corr_by_shape"]
     timer.add("analysis", time.time() - t_an0)
     n_gens = len(entries)
+    if cache_dir is not None:
+        print(f"  Analysis cache: {walk_stats['hits']}/{n_gens} hit "
+              f"({walk_stats['misses']} decoded fully)")
     print(f"  Generations: {n_gens}  tensors: "
           f"{ {k: len(v) for k, v in tensors.items()} }")
     if not tensors["delta"]:
