@@ -134,6 +134,8 @@
         },
         "accumulate_big_batches": true,
         "scale_aug": true,
+        "cache_size": 64,
+        "num_workers": 0,
         "seed": 42
     },
 

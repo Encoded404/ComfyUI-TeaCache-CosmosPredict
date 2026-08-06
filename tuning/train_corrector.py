@@ -253,6 +253,12 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="torch.compile the corrector")
     parser.add_argument("--channels-last", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--cache-size", type=int, default=None,
+                        help="Decompressed-generation LRU cache size, in "
+                             "generations (config: refiner_training.cache_size)")
+    parser.add_argument("--num-workers", type=int, default=None,
+                        help="DataLoader worker processes (config: "
+                             "refiner_training.num_workers)")
     parser.add_argument("--resume", type=str, default=None,
                         help="Resume from a full-state .pt checkpoint")
     parser.add_argument("--out", type=str, default=None,
@@ -293,6 +299,8 @@ def resolve_config(args: argparse.Namespace) -> dict:
         "max_steps": ("max_steps", 60000),
         "eval_every": ("eval_every", 500),
         "seed": ("seed", 42),
+        "cache_size": ("cache_size", 64),
+        "num_workers": ("num_workers", 0),
     }
     cfg = {}
     for flag, (key, default) in mapping.items():
@@ -347,6 +355,8 @@ def resolve_config(args: argparse.Namespace) -> dict:
             w, h = refiner_data.parse_resolution(str(spec))
         stage1_areas.append(w * h)
     rc["stage1_areas"] = sorted(set(stage1_areas))
+    cfg["cache_size"] = max(1, int(cfg["cache_size"]))
+    cfg["num_workers"] = max(0, int(cfg["num_workers"]))
     cfg["out"] = args.out or str(Path(__file__).resolve().parent.parent / "models")
     cfg["data"] = args.data
     cfg["resume"] = args.resume
@@ -527,6 +537,8 @@ def main(argv=None):
           f"curriculum={cfg['k_curriculum']}, stop_grad={cfg['stop_grad']})")
     print(f"  Loss:           {cfg['loss']}   batch={cfg['batch_size']}  "
           f"max_steps={cfg['max_steps']}")
+    print(f"  Cache:          {cfg['cache_size']} generations   "
+          f"loader workers: {cfg['num_workers']}")
     print(f"  Device:         {device}")
 
     print("  Preparing dataset (pair index + normalization stats)...")
@@ -539,6 +551,7 @@ def main(argv=None):
         normalization_samples=cfg["normalization_samples"],
         show_progress=not cfg["no_progress"],
         manifest=manifest,
+        gen_cache_size=cfg["cache_size"],
     )
     if not len(ds):
         raise SystemExit("[train_corrector] no training pairs (all generations eval?)")
@@ -547,7 +560,8 @@ def main(argv=None):
 
     sampler = CorrectorBatchSampler(ds, batch_size=cfg["batch_size"], seed=cfg["seed"])
     loader = DataLoader(ds, batch_sampler=sampler, collate_fn=collate_corrector,
-                        num_workers=0)
+                        num_workers=cfg["num_workers"],
+                        pin_memory=cfg["num_workers"] > 0)
     steps_per_epoch = max(len(sampler), 1)
     print(f"  Batches/epoch:  {steps_per_epoch}   "
           f"(~{cfg['max_steps'] / steps_per_epoch:.1f} epochs over {cfg['max_steps']} steps)")
@@ -564,7 +578,9 @@ def main(argv=None):
             include_areas=curriculum["stage1_areas"])
         if s1_sampler.buckets:
             stage1_loader = DataLoader(ds, batch_sampler=s1_sampler,
-                                       collate_fn=collate_corrector, num_workers=0)
+                                       collate_fn=collate_corrector,
+                                       num_workers=cfg["num_workers"],
+                                       pin_memory=cfg["num_workers"] > 0)
             stage1_until = int(cfg["max_steps"] * curriculum["stage1_fraction"])
             print(f"  Curriculum:     stage 1 (steps ≤ {stage1_until}) → "
                   f"areas {curriculum['stage1_areas']}; then full mix")
@@ -579,7 +595,9 @@ def main(argv=None):
                                    normalization_samples=0, manifest=manifest)
         eval_sampler = CorrectorBatchSampler(eval_ds, batch_size=16, seed=cfg["seed"] + 1)
         eval_loader = DataLoader(eval_ds, batch_sampler=eval_sampler,
-                                 collate_fn=collate_corrector, num_workers=0)
+                                 collate_fn=collate_corrector,
+                                 num_workers=cfg["num_workers"],
+                                 pin_memory=cfg["num_workers"] > 0)
     except ValueError as e:
         print(f"  ⚠ no eval generations — eval loop and gates skipped ({e})")
     lags = sorted(set(lag for _, _, _, lag in ds.pairs))

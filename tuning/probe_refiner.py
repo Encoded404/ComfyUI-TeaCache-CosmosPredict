@@ -31,7 +31,9 @@ Usage:
 
 import argparse
 import json
+import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -392,6 +394,141 @@ def delta_distribution(delta_maps: List[torch.Tensor]) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  Analysis walk (parallel-capable, plan Task 3b)
+# ═══════════════════════════════════════════════════════════════════════
+
+_ANALYSIS_CAPS = {"tensor_cap": 12, "shape_cap": 256}
+
+
+def _analyze_generation(entry: dict, data_dir: Path, caps: dict) -> dict:
+    """Decompress one generation and compute its analysis contributions.
+
+    Pure per-generation work with no shared state, so the walk can run over a
+    thread pool (blosc2 and numpy release the GIL during decode). The capped
+    collections (codec tensors, per-shape samples) are capped per generation
+    and truncated again at merge, keeping the same caps as the sequential
+    single walk (which generation fills the caps may differ in parallel mode).
+    """
+    gen = refiner_data.load_generation(data_dir / entry["bin"])
+    n_steps = max(int(entry.get("num_steps", 1)), 1)
+    p = {
+        "gap_true": [], "gap_delta": [],
+        "deltas_by_lag": {}, "deltas_by_lag_shape": {},
+        "v_ma_by_shape": {}, "v_true_by_shape": {}, "x_t_by_shape": {},
+        "v_true_corr_by_shape": {},
+        "tensors": {"x_t": [], "v_true": [], "v_ma": [], "delta": []},
+    }
+    for slot in gen.recorded_slots:
+        vts = gen.v_true[slot]
+        # t-gap cancellation (all steps, all lags)
+        for t in range(1, len(vts)):
+            p["gap_true"].append(
+                (vts[t].float() - vts[t - 1].float()).abs().mean().item())
+            step_ma = gen.v_ma[slot][t]
+            for lag in step_ma:
+                p["gap_delta"].append(
+                    (vts[t].float() - step_ma[lag].float()).abs().mean().item())
+        # learnability + codec tensor collection (first 8 steps)
+        for t in range(min(len(vts), 8)):
+            vt = vts[t]
+            xt = gen.x[slot][t]
+            vshape = (int(vt.shape[-2]), int(vt.shape[-1]))
+            p["v_true_corr_by_shape"].setdefault(vshape, []).append(vt)
+            if len(p["tensors"]["x_t"]) < caps["tensor_cap"]:
+                p["tensors"]["x_t"].append(xt)
+                p["tensors"]["v_true"].append(vt)
+            region = min(2, 3 * t // n_steps)
+            for lag in sorted(gen.v_ma[slot][t]):
+                vm = gen.v_ma[slot][t][lag]
+                d = vt - vm
+                shape = (int(d.shape[-2]), int(d.shape[-1]))
+                p["deltas_by_lag"].setdefault(lag, []).append((region, d))
+                p["deltas_by_lag_shape"].setdefault(lag, {}).setdefault(
+                    shape, []).append((region, d))
+                if len(p["tensors"]["v_ma"]) < caps["tensor_cap"]:
+                    p["tensors"]["v_ma"].append(vm)
+                    p["tensors"]["delta"].append(d)
+                if len(p["v_ma_by_shape"].setdefault(shape, [])) < caps["shape_cap"]:
+                    p["v_ma_by_shape"][shape].append(vm)
+                    p["v_true_by_shape"].setdefault(shape, []).append(vt)
+                    p["x_t_by_shape"].setdefault(shape, []).append(xt)
+    return p
+
+
+def _merge_analysis(acc: dict, p: dict, caps: dict) -> None:
+    """Merge one generation's partial analysis into the accumulator."""
+    acc["gap_true"].extend(p["gap_true"])
+    acc["gap_delta"].extend(p["gap_delta"])
+    for lag, items in p["deltas_by_lag"].items():
+        acc["deltas_by_lag"].setdefault(lag, []).extend(items)
+    for lag, shapes in p["deltas_by_lag_shape"].items():
+        for shape, items in shapes.items():
+            acc["deltas_by_lag_shape"].setdefault(lag, {}).setdefault(
+                shape, []).extend(items)
+    for shape, items in p["v_true_corr_by_shape"].items():
+        acc["v_true_corr_by_shape"].setdefault(shape, []).extend(items)
+    for shape, items in p["v_ma_by_shape"].items():
+        acc["v_ma_by_shape"].setdefault(shape, []).extend(items)
+    for shape, items in p["v_true_by_shape"].items():
+        acc["v_true_by_shape"].setdefault(shape, []).extend(items)
+    for shape, items in p["x_t_by_shape"].items():
+        acc["x_t_by_shape"].setdefault(shape, []).extend(items)
+    for k in ("x_t", "v_true", "v_ma", "delta"):
+        acc["tensors"][k].extend(p["tensors"][k])
+    # Global caps at merge (parallel workers over-collect per generation);
+    # v_ma/v_true/x_t per-shape lists stay aligned (appended in lockstep).
+    for k in ("x_t", "v_true", "v_ma", "delta"):
+        acc["tensors"][k] = acc["tensors"][k][: caps["tensor_cap"]]
+    for shape in list(acc["v_ma_by_shape"]):
+        acc["v_ma_by_shape"][shape] = acc["v_ma_by_shape"][shape][: caps["shape_cap"]]
+        acc["v_true_by_shape"][shape] = acc["v_true_by_shape"][shape][: caps["shape_cap"]]
+        acc["x_t_by_shape"][shape] = acc["x_t_by_shape"][shape][: caps["shape_cap"]]
+
+
+def run_analysis_walk(entries: List[dict], data_dir: Path, n_threads: int,
+                      show_progress: bool = False) -> dict:
+    """Decompress + analyze all generations, sequentially or over a thread pool.
+
+    In parallel mode torch's CPU intra-op threads are pinned to 1 so the
+    per-generation reductions (mean/cos_sim on small tensors) are bit-exact
+    across runs and identical to the sequential walk; the decode speed comes
+    from blosc2's own thread pool, which is unaffected. The same pinning
+    applies to the sequential walk so report values are reproducible
+    regardless of machine core count.
+    """
+    caps = _ANALYSIS_CAPS
+    acc = {
+        "gap_true": [], "gap_delta": [],
+        "deltas_by_lag": {}, "deltas_by_lag_shape": {},
+        "v_ma_by_shape": {}, "v_true_by_shape": {}, "x_t_by_shape": {},
+        "v_true_corr_by_shape": {},
+        "tensors": {"x_t": [], "v_true": [], "v_ma": [], "delta": []},
+    }
+    old_torch_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    bar = _bar(show_progress, len(entries), "analysis", "gen")
+    try:
+        if n_threads <= 1:
+            for entry in entries:
+                _merge_analysis(acc, _analyze_generation(entry, data_dir, caps), caps)
+                if bar is not None:
+                    bar.update(1)
+        else:
+            with ThreadPoolExecutor(max_workers=n_threads) as ex:
+                futures = [ex.submit(_analyze_generation, entry, data_dir, caps)
+                           for entry in entries]
+                for f in as_completed(futures):
+                    _merge_analysis(acc, f.result(), caps)
+                    if bar is not None:
+                        bar.update(1)
+    finally:
+        torch.set_num_threads(old_torch_threads)
+    if bar is not None:
+        bar.close()
+    return acc
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  3d — Day-1 experiment
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -425,20 +562,26 @@ def day1_mlp(x_t_maps, v_ma_maps, v_true_maps, device, steps=400, lr=1e-3) -> fl
 def day1_unet(data_dir: Path, device, max_steps: int = 600, batch_size: int = 8,
               seed: int = 42, show_progress: bool = False,
               metrics: Optional[MetricsLog] = None,
-              timer: Optional[TrainTimer] = None) -> dict:
+              timer: Optional[TrainTimer] = None,
+              manifest: Optional[dict] = None,
+              cache_size: int = 64) -> dict:
     """Tiny 2D UNet on the real pairs (3d stage 2); eval vs the linear ceiling.
 
     Live reporting mirrors ``train_corrector``: tqdm bar with EMA loss, it/s
     and remaining, per-50-step log lines, and per-step JSONL rows.
     """
     torch.manual_seed(seed)
-    train_ds = CorrectorDataset(data_dir, seed=seed, show_progress=show_progress)
+    train_ds = CorrectorDataset(data_dir, seed=seed, show_progress=show_progress,
+                                normalization_samples=0, manifest=manifest,
+                                gen_cache_size=cache_size)
     train_loader = DataLoader(train_ds, batch_sampler=CorrectorBatchSampler(
         train_ds, batch_size=batch_size, seed=seed), collate_fn=collate_corrector,
         num_workers=0)
     try:
         eval_ds = CorrectorDataset(data_dir, only_eval=True, seed=seed,
-                                   show_progress=show_progress)
+                                   show_progress=show_progress,
+                                   normalization_samples=0, manifest=manifest,
+                                   gen_cache_size=cache_size)
     except ValueError:
         eval_ds = None
 
@@ -526,7 +669,8 @@ def day1_unet(data_dir: Path, device, max_steps: int = 600, batch_size: int = 8,
 
     # Lag-readability (plan 3d): Δ̂ vs lag for fixed (x_t, t) — smooth/monotone?
     t_l0 = time.time()
-    lag_stats = _lag_readability(model, device, data_dir, show_progress=show_progress)
+    lag_stats = _lag_readability(model, device, data_dir,
+                                 show_progress=show_progress, manifest=manifest)
     if timer is not None:
         timer.add("lag", time.time() - t_l0)
 
@@ -538,7 +682,8 @@ def day1_unet(data_dir: Path, device, max_steps: int = 600, batch_size: int = 8,
             "wall_s": round(time.time() - t_start, 1)}
 
 
-def _lag_readability(model, device, data_dir, show_progress: bool = False) -> dict:
+def _lag_readability(model, device, data_dir, show_progress: bool = False,
+                     manifest: Optional[dict] = None) -> dict:
     """For fixed (x_t, t) steps: Δ̂(lag) must vary smoothly (ideally monotonically).
 
     Uses the trained Day-1 UNet on steps where the full ladder exists: the
@@ -549,7 +694,7 @@ def _lag_readability(model, device, data_dir, show_progress: bool = False) -> di
     from scipy.stats import spearmanr
     mags_by_step, smoothness = [], []
     n = 0
-    entries = refiner_data.iter_generations(data_dir)
+    entries = refiner_data.iter_generations(data_dir, manifest=manifest)
     bar = _bar(show_progress, len(entries), "lag-readability", "gen")
     for entry in entries:
         gen = refiner_data.load_generation(data_dir / entry["bin"])
@@ -617,6 +762,9 @@ def main(argv=None):
     parser.add_argument("--record-lags", default="1,2,4,8,16")
     parser.add_argument("--day1-steps", type=int, default=600)
     parser.add_argument("--day1-batch", type=int, default=8)
+    parser.add_argument("--analysis-threads", type=int, default=None,
+                        help="Threads for the generation analysis walk "
+                             "(default: min(8, cpu count); 1 = sequential)")
     parser.add_argument("--no-progress", type=int, default=None,
                         help="Disable tqdm progress bars (default: auto TTY detect)")
     parser.add_argument("--metrics", default=None,
@@ -660,60 +808,27 @@ def main(argv=None):
     print(f"  Data: {data_dir}")
 
     # ── Single walk: decode each generation once for codecs + t-gap + learnability ──
-    print("  Loading generations and collecting tensors/stats...")
+    # (parallel-capable: decode is threaded inside blosc2; the walk itself can
+    # run over a thread pool — default min(8, cpu count), --analysis-threads)
+    if args.analysis_threads is None:
+        analysis_threads = min(8, os.cpu_count() or 1)
+    else:
+        analysis_threads = max(1, int(args.analysis_threads))
+    print(f"  Loading generations and collecting tensors/stats "
+          f"({analysis_threads} analysis thread(s))...")
     manifest = refiner_data.load_manifest(data_dir)
     entries = refiner_data.iter_generations(data_dir, manifest=manifest)
-    tensors = {"x_t": [], "v_ma": [], "v_true": [], "delta": []}
-    gap_true, gap_delta = [], []
-    deltas_by_lag: Dict[int, List[Tuple[int, torch.Tensor]]] = {}
-    deltas_by_lag_shape: Dict[int, Dict[Tuple[int, int], List[Tuple[int, torch.Tensor]]]] = {}
-    v_ma_by_shape: Dict[Tuple[int, int], List[torch.Tensor]] = {}
-    v_true_by_shape: Dict[Tuple[int, int], List[torch.Tensor]] = {}
-    x_t_by_shape: Dict[Tuple[int, int], List[torch.Tensor]] = {}
-    v_true_corr_by_shape: Dict[Tuple[int, int], List[torch.Tensor]] = {}
     t_an0 = time.time()
-    bar = _bar(show_progress, len(entries), "analysis", "gen")
-    for entry in entries:
-        gen = refiner_data.load_generation(data_dir / entry["bin"])
-        n_steps = max(int(entry.get("num_steps", 1)), 1)
-        for slot in gen.recorded_slots:
-            vts = gen.v_true[slot]
-            # t-gap cancellation (all steps, all lags)
-            for t in range(1, len(vts)):
-                gap_true.append((vts[t].float() - vts[t - 1].float()).abs().mean().item())
-                step_ma = gen.v_ma[slot][t]
-                for lag in step_ma:
-                    gap_delta.append((vts[t].float() - step_ma[lag].float()).abs().mean().item())
-            # learnability + codec tensor collection (first 8 steps)
-            for t in range(min(len(vts), 8)):
-                vt = vts[t]
-                xt = gen.x[slot][t]
-                vshape = (int(vt.shape[-2]), int(vt.shape[-1]))
-                # step-correlation pairs must be same-shape: consecutive v_true
-                # entries are compared, so group per shape (mixed-resolution
-                # corpora would otherwise concatenate 64² and 128² tensors)
-                v_true_corr_by_shape.setdefault(vshape, []).append(vt)
-                if len(tensors["x_t"]) < 12:
-                    tensors["x_t"].append(xt)
-                    tensors["v_true"].append(vt)
-                region = min(2, 3 * t // n_steps)
-                for lag in sorted(gen.v_ma[slot][t]):
-                    vm = gen.v_ma[slot][t][lag]
-                    d = vt - vm
-                    shape = (int(d.shape[-2]), int(d.shape[-1]))
-                    deltas_by_lag.setdefault(lag, []).append((region, d))
-                    deltas_by_lag_shape.setdefault(lag, {}).setdefault(shape, []).append((region, d))
-                    if len(tensors["v_ma"]) < 12:
-                        tensors["v_ma"].append(vm)
-                        tensors["delta"].append(d)
-                    if len(v_ma_by_shape.setdefault(shape, [])) < 256:
-                        v_ma_by_shape[shape].append(vm)
-                        v_true_by_shape.setdefault(shape, []).append(vt)
-                        x_t_by_shape.setdefault(shape, []).append(xt)
-        if bar is not None:
-            bar.update(1)
-    if bar is not None:
-        bar.close()
+    acc = run_analysis_walk(entries, data_dir, analysis_threads,
+                            show_progress=show_progress)
+    tensors = acc["tensors"]
+    gap_true, gap_delta = acc["gap_true"], acc["gap_delta"]
+    deltas_by_lag: Dict[int, List[Tuple[int, torch.Tensor]]] = acc["deltas_by_lag"]
+    deltas_by_lag_shape: Dict[int, Dict[Tuple[int, int], List[Tuple[int, torch.Tensor]]]] = acc["deltas_by_lag_shape"]
+    v_ma_by_shape: Dict[Tuple[int, int], List[torch.Tensor]] = acc["v_ma_by_shape"]
+    v_true_by_shape: Dict[Tuple[int, int], List[torch.Tensor]] = acc["v_true_by_shape"]
+    x_t_by_shape: Dict[Tuple[int, int], List[torch.Tensor]] = acc["x_t_by_shape"]
+    v_true_corr_by_shape: Dict[Tuple[int, int], List[torch.Tensor]] = acc["v_true_corr_by_shape"]
     timer.add("analysis", time.time() - t_an0)
     n_gens = len(entries)
     print(f"  Generations: {n_gens}  tensors: "
@@ -798,9 +913,11 @@ def main(argv=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     mlp_err = day1_mlp(pooled_x, pooled_ma, pooled_vt, device)
     print(f"  Day-1 MLP (pooled features) mean-Δ error: {mlp_err:.5f}")
+    day1_cache_size = int((tcfg.refiner_training or {}).get("cache_size", 64))
     day1 = day1_unet(data_dir, device, max_steps=args.day1_steps,
                      batch_size=args.day1_batch, show_progress=show_progress,
-                     metrics=metrics, timer=timer)
+                     metrics=metrics, timer=timer, manifest=manifest,
+                     cache_size=day1_cache_size)
     day1["mlp_pooled_mean_error"] = round(float(mlp_err), 5)
     day1["linear_ceiling"] = ceiling
     if day1["day1_unet_rel_mse"] is not None:

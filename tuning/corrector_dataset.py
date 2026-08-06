@@ -14,9 +14,12 @@ from the recorded generations:
   batches mixing prompt / 0-token uncond samples are handled inside the model
   via the mask (equivalent to the plan's two-group split, one compiled path).
 
-Generations are decompressed lazily and held in a small LRU cache (the .bin
+Generations are decompressed lazily and held in an LRU cache (the .bin
 format stores compressed blobs, so whole-generation decompression is the
-practical access pattern; ~60 MB per generation in RAM).
+practical access pattern; ~60 MB per generation in RAM). The cache size is
+configurable (``gen_cache_size``, default 64) and the batch sampler draws
+generation-contiguous batches so the cache actually hits under uniform
+per-lag weighting (plan Task 6e, deep-dive §7).
 """
 
 from __future__ import annotations
@@ -37,7 +40,7 @@ try:
 except ImportError:  # progress bars are optional (requirements: tqdm)
     tqdm = None
 
-MAX_CACHED_GENERATIONS = 8
+DEFAULT_GEN_CACHE_SIZE = 64
 
 
 def _lag_index(lag: int, lags: List[int]) -> int:
@@ -57,7 +60,8 @@ class CorrectorDataset(Dataset):
                  normalization_samples: int = 128,
                  compute_normalization: bool = False,
                  show_progress: bool = True,
-                 manifest: Optional[dict] = None):
+                 manifest: Optional[dict] = None,
+                 gen_cache_size: int = DEFAULT_GEN_CACHE_SIZE):
         data_dir = Path(data_dir)
         self.data_dir = data_dir
         self.seed = seed
@@ -65,6 +69,7 @@ class CorrectorDataset(Dataset):
         self.rel_mse_eps_scale = rel_mse_eps_scale
         self.rng = random.Random(seed)
         self._gen_cache: "OrderedDict[str, refiner_data.RefinerGeneration]" = OrderedDict()
+        self._gen_cache_max = max(1, int(gen_cache_size))
 
         self.entries = refiner_data.iter_generations(data_dir, manifest=manifest)
         if only_eval:
@@ -122,7 +127,7 @@ class CorrectorDataset(Dataset):
             return gen
         gen = refiner_data.load_generation(self.data_dir / self.entries[idx]["bin"])
         self._gen_cache[name] = gen
-        while len(self._gen_cache) > MAX_CACHED_GENERATIONS:
+        while len(self._gen_cache) > self._gen_cache_max:
             self._gen_cache.popitem(last=False)
         return gen
 
@@ -299,12 +304,17 @@ def augment_batch(batch: dict, rng: random.Random, scale_aug: bool = True) -> di
 
 
 class CorrectorBatchSampler(Sampler):
-    """Resolution-grouped, weighted, deterministic batch sampler.
+    """Resolution-grouped, weighted, deterministic, locality-aware batch sampler.
 
     - Pairs are bucketed by latent shape; 1024² batches use batch_size ÷ 4.
-    - Within a bucket, pairs are drawn by weight (lag resampling) without
-      replacement per epoch (``torch.multinomial``); buckets' batch lists are
-      interleaved and shuffled (seeded; epoch counter advances each iter).
+    - Within a bucket, pairs are grouped into **per-generation runs** (pair
+      indices are generation-contiguous in ``dataset.pairs``). Each epoch
+      shuffles the generation order, then weighted-draws pairs within each
+      generation (``torch.multinomial``, lag resampling) — so consecutive
+      batches come from the same generation and the dataset's generation LRU
+      cache hits instead of thrashing (deep-dive §7).
+    - Buckets' batch lists are interleaved and shuffled (seeded; epoch counter
+      advances each iter).
     """
 
     def __init__(self, dataset: CorrectorDataset, batch_size: int, seed: int = 42,
@@ -321,6 +331,23 @@ class CorrectorBatchSampler(Sampler):
         for i, (h, w) in enumerate(dataset.pair_shapes()):
             if self.include_areas is None or h * w in self.include_areas:
                 self.buckets.setdefault((h, w), []).append(i)
+
+        # Per-generation runs per bucket (pairs are generation-contiguous).
+        self.bucket_runs: Dict[Tuple[int, int], List[List[int]]] = {}
+        for shape, idxs in self.buckets.items():
+            runs: List[List[int]] = []
+            cur_gi, run = None, []
+            for i in idxs:
+                gi = dataset.pairs[i][0]
+                if cur_gi is None or gi != cur_gi:
+                    if run:
+                        runs.append(run)
+                    run, cur_gi = [i], gi
+                else:
+                    run.append(i)
+            if run:
+                runs.append(run)
+            self.bucket_runs[shape] = runs
 
     def __len__(self) -> int:
         total = 0
@@ -339,12 +366,24 @@ class CorrectorBatchSampler(Sampler):
         self._epoch += 1
         gen = torch.Generator().manual_seed(self.seed + epoch)
         epoch_batches = []
-        for idxs in self.buckets.values():
-            bs = self._bucket_batch_size(idxs)
-            w = self.dataset.weights[torch.tensor(idxs, dtype=torch.long)]
-            order = torch.multinomial(w, num_samples=len(idxs), replacement=False,
-                                      generator=gen).tolist()
-            order = [idxs[j] for j in order]
-            epoch_batches.extend(order[k:k + bs] for k in range(0, len(order), bs))
+        for shape, runs in self.bucket_runs.items():
+            if not runs:
+                continue
+            bs = self._bucket_batch_size(self.buckets[shape])
+            rng.shuffle(runs)
+            carry: List[int] = []
+            for run in runs:
+                w = self.dataset.weights[torch.tensor(run, dtype=torch.long)]
+                sub = torch.multinomial(w, num_samples=len(run), replacement=False,
+                                        generator=gen).tolist()
+                full = carry + [run[j] for j in sub]
+                k = 0
+                n = len(full)
+                while k + bs <= n:
+                    epoch_batches.append(full[k:k + bs])
+                    k += bs
+                carry = full[k:]
+            if carry:
+                epoch_batches.append(carry)
         rng.shuffle(epoch_batches)
         yield from epoch_batches
