@@ -6,12 +6,13 @@ See: run from ComfyUI root with python -m
     PYTHONPATH=".:custom_nodes/ComfyUI-TeaCache-CosmosPredict"
 """
 
+import json
 from collections import deque
 
 import sys
 import time
 from pathlib import Path
-from typing import NamedTuple, Tuple
+from typing import Dict, NamedTuple, Tuple
 
 import numpy as np
 import torch
@@ -675,6 +676,24 @@ class ScheduleEstimator:
                          f"(blend weight {w:.2f})")
         lines.append(f"  {'─' * W}")
         return lines
+
+
+class MetricsLog:
+    """JSONL sink for run scalars (step rows, eval rows, phase rows).
+
+    One JSON object per line, flushed per write — ``tail -f`` friendly.
+    """
+
+    def __init__(self, path: str):
+        self.path = Path(path)
+        self._f = open(self.path, "a")
+
+    def write(self, row: Dict) -> None:
+        self._f.write(json.dumps(row, default=str) + "\n")
+        self._f.flush()
+
+    def close(self) -> None:
+        self._f.close()
 
 
 def format_duration(seconds: float) -> str:

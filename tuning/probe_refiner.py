@@ -17,7 +17,12 @@ Records 3–5 generations with refiner latent capture (or analyzes an existing
   smooth/monotone).
 
 Writes ``refiner_probe_report.json`` next to the data dir (consumed by
-``train_corrector``'s did-it-learn gate) and prints a console table.
+``train_corrector``'s did-it-learn gate). The report is written progressively
+(atomic tmp+replace) so a crash keeps the results computed so far. Live
+reporting mirrors ``train_corrector``: tqdm bars for the recording, analysis
+and Day-1 phases (``--no-progress`` disables), per-50-step Day-1 log lines, a
+JSONL metrics stream (``probe_metrics.jsonl``; ``--metrics`` relocates), and a
+final summary with per-phase timings and VRAM peak.
 
 Usage:
     python -m tuning.probe_refiner --comfy-dir /path/to/ComfyUI   # record + analyze
@@ -41,6 +46,7 @@ from .refiner_data import (CODEC_BLOSC2, CODEC_RAW, CODEC_ZFPY, _compress,
                            _decompress)
 from .corrector_dataset import CorrectorDataset, CorrectorBatchSampler, collate_corrector
 from .prompt_loader import load_prompt_config, select_prompts, GenerationPromptSampler, resolve_generation
+from .utils import MetricsLog, TrainTimer, format_duration
 from .utils import load_models, sample
 
 from torch.utils.data import DataLoader
@@ -57,6 +63,36 @@ try:
 except ImportError:
     _HAS_FPZIP = False
 
+try:
+    from tqdm import tqdm
+except ImportError:  # progress bars are optional (requirements: tqdm)
+    tqdm = None
+
+
+def _bar(show_progress: bool, total: Optional[int], desc: str, unit: str = "it"):
+    """tqdm bar or None (tqdm missing or ``show_progress`` disabled)."""
+    if not show_progress or tqdm is None:
+        return None
+    return tqdm(total=total, desc=desc, unit=unit, leave=False,
+                dynamic_ncols=True, mininterval=0.5)
+
+
+def emit(bar, line: str) -> None:
+    """Print a log line above the active progress bar (bar-safe)."""
+    if bar is not None:
+        bar.write(line)
+    else:
+        print(line)
+
+
+def _write_report(report: dict, data_dir: Path) -> Path:
+    """Atomic (tmp+replace) write of the report — crash-safe, progressive."""
+    report_path = Path(data_dir).parent / "refiner_probe_report.json"
+    tmp = report_path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(report, indent=2, default=str))
+    tmp.replace(report_path)
+    return report_path
+
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Recording (3–5 generations, plan Task 3)
@@ -64,9 +100,14 @@ except ImportError:
 
 
 def record_probe_generations(tcfg: TuningConfig, num_gens: int, seeds: List[int],
-                             lags: List[int], out_dir: Path) -> Path:
-    """Run *num_gens* generations with refiner capture into out_dir/refiner_data."""
-    from .calibrate import patch_for_refiner
+                             lags: List[int], out_dir: Path,
+                             show_progress: bool = False) -> Path:
+    """Run *num_gens* generations with refiner capture into out_dir/refiner_data.
+
+    A failed generation is logged and skipped (the manifest keeps the ones
+    that succeeded); the run aborts only if every generation fails.
+    """
+    from .calibrate import patch_for_refiner, restore_model
     from .prompt_loader import GenerationPromptSampler  # noqa: F811
 
     refiner_dir = out_dir / "refiner_data"
@@ -92,6 +133,8 @@ def record_probe_generations(tcfg: TuningConfig, num_gens: int, seeds: List[int]
     cfg_val = float(tcfg.sampling.get("cfg", 5.0))
 
     rc = {"record_lags": lags, "record_slots": "both", "dtype": "bfloat16"}
+    pbar = _bar(show_progress, len(entries), "record", "gen")
+    failures = 0
     for i, pdata in enumerate(entries):
         seed = seeds[i % len(seeds)]
         full_prompt, neg_prompt, _ = resolve_generation(
@@ -101,13 +144,23 @@ def record_probe_generations(tcfg: TuningConfig, num_gens: int, seeds: List[int]
             unet, steps, prompt_id=i, seed=seed, track_per_block=False,
             refiner_dir=str(refiner_dir), refiner_cfg=rc,
         )
+        t_gen = time.time()
+        ok = True
         try:
             sample(unet, clip, vae, full_prompt, seed=seed, steps=steps, cfg=cfg_val,
                    sampler_name=sampler_name, scheduler=scheduler,
                    width=width, height=height, negative=neg_prompt)
+        except Exception as e:
+            ok = False
+            failures += 1
+            emit(pbar, f"  ⚠ [probe] generation {i + 1}/{len(entries)} failed: "
+                       f"{type(e).__name__}: {e}")
         finally:
-            from .calibrate import restore_model
             restore_model(dm, original_fwd, unet)
+        if not ok:
+            if pbar is not None:
+                pbar.update(1)
+            continue
         refiner_data.finalize_refiner_generation(
             dm, refiner_dir, manifest,
             run_meta={"name": f"gen_{i:04d}_p{i:02d}_s{seed}",
@@ -118,35 +171,20 @@ def record_probe_generations(tcfg: TuningConfig, num_gens: int, seeds: List[int]
             refiner_cfg=rc,
             eval_prompt_ids={len(entries) - 1},  # last gen = deterministic holdout
         )
-        print(f"  [probe] recorded generation {i + 1}/{len(entries)}")
+        emit(pbar, f"  [probe] recorded generation {i + 1}/{len(entries)} "
+                   f"({format_duration(time.time() - t_gen)} on GPU)")
+        if pbar is not None:
+            pbar.set_postfix(prompt=i, seed=seed, refresh=False)
+            pbar.update(1)
+    if failures == len(entries):
+        raise RuntimeError(f"[probe] all {len(entries)} generations failed to record")
     refiner_data.save_manifest(refiner_dir, manifest)
+    if pbar is not None:
+        pbar.close()
+    if failures:
+        print(f"  [probe] {failures}/{len(entries)} generations failed — "
+              f"continuing with the recorded data")
     return refiner_dir
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  Tensor sampling helpers
-# ═══════════════════════════════════════════════════════════════════════
-
-def _collect_tensors(data_dir: Path, max_per_type: int = 12) -> dict:
-    """Collect up to max_per_type tensors of each kind from the recorded gens."""
-    out = {"x_t": [], "v_ma": [], "v_true": [], "delta": []}
-    for entry in refiner_data.iter_generations(data_dir):
-        gen = refiner_data.load_generation(data_dir / entry["bin"])
-        for slot in gen.recorded_slots:
-            for t in range(min(len(gen.v_true[slot]), 8)):
-                if len(out["x_t"]) >= max_per_type:
-                    return out
-                x = gen.x[slot][t]
-                vt = gen.v_true[slot][t]
-                out["x_t"].append(x)
-                out["v_true"].append(vt)
-                step_ma = gen.v_ma[slot][t]
-                for lag in sorted(step_ma):
-                    if len(out["v_ma"]) >= max_per_type:
-                        break
-                    out["v_ma"].append(step_ma[lag])
-                    out["delta"].append(vt - step_ma[lag])
-    return out
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -385,15 +423,22 @@ def day1_mlp(x_t_maps, v_ma_maps, v_true_maps, device, steps=400, lr=1e-3) -> fl
 
 
 def day1_unet(data_dir: Path, device, max_steps: int = 600, batch_size: int = 8,
-              seed: int = 42) -> dict:
-    """Tiny 2D UNet on the real pairs (3d stage 2); eval vs the linear ceiling."""
+              seed: int = 42, show_progress: bool = False,
+              metrics: Optional[MetricsLog] = None,
+              timer: Optional[TrainTimer] = None) -> dict:
+    """Tiny 2D UNet on the real pairs (3d stage 2); eval vs the linear ceiling.
+
+    Live reporting mirrors ``train_corrector``: tqdm bar with EMA loss, it/s
+    and remaining, per-50-step log lines, and per-step JSONL rows.
+    """
     torch.manual_seed(seed)
-    train_ds = CorrectorDataset(data_dir, seed=seed)
+    train_ds = CorrectorDataset(data_dir, seed=seed, show_progress=show_progress)
     train_loader = DataLoader(train_ds, batch_sampler=CorrectorBatchSampler(
         train_ds, batch_size=batch_size, seed=seed), collate_fn=collate_corrector,
         num_workers=0)
     try:
-        eval_ds = CorrectorDataset(data_dir, only_eval=True, seed=seed)
+        eval_ds = CorrectorDataset(data_dir, only_eval=True, seed=seed,
+                                   show_progress=show_progress)
     except ValueError:
         eval_ds = None
 
@@ -401,7 +446,13 @@ def day1_unet(data_dir: Path, device, max_steps: int = 600, batch_size: int = 8,
     model = CorrectorUNet2D(ccfg).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=3e-4)
     it = iter(train_loader)
+    pbar = _bar(show_progress, max_steps, "day1-unet", "step")
+    t_start = time.time()
+    loss_ema: Optional[float] = None
+    min_loss = float("inf")
+    final_loss = float("nan")
     for step in range(1, max_steps + 1):
+        t_step0 = time.time()
         try:
             b = next(it)
         except StopIteration:
@@ -415,6 +466,34 @@ def day1_unet(data_dir: Path, device, max_steps: int = 600, batch_size: int = 8,
                 dim=(1, 2, 3)) / (b["v_true"].float().square().mean(dim=(1, 2, 3)) + 1e-8)).mean()
         loss.backward()
         opt.step()
+        loss_v = float(loss.item())
+        loss_ema = loss_v if loss_ema is None else 0.99 * loss_ema + 0.01 * loss_v
+        min_loss = min(min_loss, loss_v)
+        final_loss = loss_v
+        if timer is not None:
+            timer.record_step(time.time() - t_step0)
+        if pbar is not None:
+            st = timer.step_time() if timer is not None else 0.0
+            rem = st * (max_steps - step) if st > 0 else 0.0
+            pbar.set_postfix(loss=f"{loss_ema:.5f}",
+                             it=f"{timer.steps_per_sec() if timer is not None else float('nan'):.2f}/s",
+                             rem=format_duration(rem), refresh=False)
+            pbar.update(1)
+        if step % 50 == 0 or step == 1:
+            line = (f"  [day1] step {step:>4d}/{max_steps}  loss={loss_v:.5f} "
+                    f"(ema {loss_ema:.5f}, min {min_loss:.5f})  "
+                    f"it/s={timer.steps_per_sec() if timer is not None else float('nan'):.2f}  "
+                    f"elapsed={format_duration(time.time() - t_start)}")
+            emit(pbar, line)
+            if metrics is not None:
+                metrics.write({
+                    "type": "day1_step", "step": step, "loss": loss_v,
+                    "loss_ema": loss_ema, "min_loss": min_loss,
+                    "wall_s": time.time() - t_start,
+                    "vram_gb": torch.cuda.max_memory_allocated() / (1024 ** 3),
+                })
+    if pbar is not None:
+        pbar.close()
     # eval
     def eval_pairs(ds):
         if ds is None:
@@ -422,6 +501,7 @@ def day1_unet(data_dir: Path, device, max_steps: int = 600, batch_size: int = 8,
         errs = []
         loader = DataLoader(ds, batch_sampler=CorrectorBatchSampler(ds, 16, seed + 1),
                             collate_fn=collate_corrector, num_workers=0)
+        bar2 = _bar(show_progress, len(loader), "day1-eval", "batch")
         model.eval()
         with torch.no_grad():
             for b in loader:
@@ -432,17 +512,33 @@ def day1_unet(data_dir: Path, device, max_steps: int = 600, batch_size: int = 8,
                 err = (v - b["v_true"]).float().flatten(1).norm(dim=1)
                 den = b["v_true"].float().flatten(1).norm(dim=1) + 1e-8
                 errs.extend((err / den).tolist())
+                if bar2 is not None:
+                    bar2.update(1)
         model.train()
+        if bar2 is not None:
+            bar2.close()
         return float(np.mean(errs))
 
+    t_e0 = time.time()
+    day1_eval = eval_pairs(eval_ds)
+    if timer is not None:
+        timer.add("eval", time.time() - t_e0)
+
     # Lag-readability (plan 3d): Δ̂ vs lag for fixed (x_t, t) — smooth/monotone?
-    lag_stats = _lag_readability(model, device, data_dir)
+    t_l0 = time.time()
+    lag_stats = _lag_readability(model, device, data_dir, show_progress=show_progress)
+    if timer is not None:
+        timer.add("lag", time.time() - t_l0)
 
-    return {"day1_unet_rel_mse": eval_pairs(eval_ds),
-            "lag_readability": lag_stats}
+    return {"day1_unet_rel_mse": day1_eval,
+            "lag_readability": lag_stats,
+            "loss_final": round(final_loss, 6),
+            "loss_min": round(min_loss, 6),
+            "steps": max_steps,
+            "wall_s": round(time.time() - t_start, 1)}
 
 
-def _lag_readability(model, device, data_dir) -> dict:
+def _lag_readability(model, device, data_dir, show_progress: bool = False) -> dict:
     """For fixed (x_t, t) steps: Δ̂(lag) must vary smoothly (ideally monotonically).
 
     Uses the trained Day-1 UNet on steps where the full ladder exists: the
@@ -453,7 +549,9 @@ def _lag_readability(model, device, data_dir) -> dict:
     from scipy.stats import spearmanr
     mags_by_step, smoothness = [], []
     n = 0
-    for entry in refiner_data.iter_generations(data_dir):
+    entries = refiner_data.iter_generations(data_dir)
+    bar = _bar(show_progress, len(entries), "lag-readability", "gen")
+    for entry in entries:
         gen = refiner_data.load_generation(data_dir / entry["bin"])
         for slot in gen.recorded_slots:
             for t in range(len(gen.v_true[slot])):
@@ -484,8 +582,12 @@ def _lag_readability(model, device, data_dir) -> dict:
                     break
             if n >= 24:
                 break
+        if bar is not None:
+            bar.update(1)
         if n >= 24:
             break
+    if bar is not None:
+        bar.close()
     if not mags_by_step:
         return {"note": "no steps with ≥3 lags found"}
     corrs = []
@@ -515,7 +617,15 @@ def main(argv=None):
     parser.add_argument("--record-lags", default="1,2,4,8,16")
     parser.add_argument("--day1-steps", type=int, default=600)
     parser.add_argument("--day1-batch", type=int, default=8)
+    parser.add_argument("--no-progress", type=int, default=None,
+                        help="Disable tqdm progress bars (default: auto TTY detect)")
+    parser.add_argument("--metrics", default=None,
+                        help="JSONL metrics path (default: <data_dir>/../probe_metrics.jsonl)")
     args = parser.parse_args(argv)
+
+    show_progress = tqdm is not None and not bool(args.no_progress)
+    timer = TrainTimer(window=100)
+    t_start = time.time()
 
     if args.config is None:
         args.config = str(Path(__file__).parent / "config.json")
@@ -523,6 +633,7 @@ def main(argv=None):
 
     if args.data:
         data_dir = Path(args.data)
+        recording = None
     else:
         if not args.comfy_dir:
             raise SystemExit("provide --data (existing refiner_data) or --comfy-dir (record)")
@@ -531,37 +642,83 @@ def main(argv=None):
         out_dir.mkdir(parents=True, exist_ok=True)
         seeds = [int(s) for s in args.seeds.split(",")]
         lags = refiner_data.parse_lags(args.record_lags)
+        t_rec0 = time.time()
         data_dir = record_probe_generations(tcfg, max(2, min(args.prompts, 5)),
-                                            seeds, lags, out_dir)
+                                            seeds, lags, out_dir,
+                                            show_progress=show_progress)
+        timer.add("record", time.time() - t_rec0)
+        recording = {"gens_requested": max(2, min(args.prompts, 5))}
     report = {"data": str(data_dir), "lags": refiner_data.parse_lags(args.record_lags)}
+    if recording is not None:
+        report["recording"] = recording
+
+    metrics = MetricsLog(args.metrics or str(Path(data_dir).parent / "probe_metrics.jsonl"))
 
     print("=" * 60)
     print("  Refiner Probe")
     print("=" * 60)
     print(f"  Data: {data_dir}")
 
-    # ── Collect tensors ────────────────────────────────────────────────
-    tensors = _collect_tensors(data_dir)
-    n_gens = len(refiner_data.iter_generations(data_dir))
-    print(f"  Generations: {n_gens}  tensors: "
-          f"{ {k: len(v) for k, v in tensors.items()} }")
-    if not tensors["delta"]:
-        raise SystemExit("[probe] no recorded pairs found — nothing to analyze")
-
-    # ── 3a codecs + t-gap cancellation ─────────────────────────────────
-    codec_results = benchmark_codecs(tensors)
-    report["codec"] = codec_results
-    # t-gap cancellation: |Δ_MA| vs |v_true(t) − v_true(t−1)|
+    # ── Single walk: decode each generation once for codecs + t-gap + learnability ──
+    print("  Loading generations and collecting tensors/stats...")
+    manifest = refiner_data.load_manifest(data_dir)
+    entries = refiner_data.iter_generations(data_dir, manifest=manifest)
+    tensors = {"x_t": [], "v_ma": [], "v_true": [], "delta": []}
     gap_true, gap_delta = [], []
-    for entry in refiner_data.iter_generations(data_dir):
+    deltas_by_lag: Dict[int, List[Tuple[int, torch.Tensor]]] = {}
+    v_ma_all, v_true_all, x_t_all = [], [], []
+    v_true_by_slot: Dict[int, List[torch.Tensor]] = {}
+    t_an0 = time.time()
+    bar = _bar(show_progress, len(entries), "analysis", "gen")
+    for entry in entries:
         gen = refiner_data.load_generation(data_dir / entry["bin"])
+        n_steps = max(int(entry.get("num_steps", 1)), 1)
         for slot in gen.recorded_slots:
             vts = gen.v_true[slot]
+            v_true_by_slot.setdefault(slot, [])
+            # t-gap cancellation (all steps, all lags)
             for t in range(1, len(vts)):
                 gap_true.append((vts[t].float() - vts[t - 1].float()).abs().mean().item())
                 step_ma = gen.v_ma[slot][t]
                 for lag in step_ma:
                     gap_delta.append((vts[t].float() - step_ma[lag].float()).abs().mean().item())
+            # learnability + codec tensor collection (first 8 steps)
+            for t in range(min(len(vts), 8)):
+                vt = vts[t]
+                xt = gen.x[slot][t]
+                v_true_by_slot[slot].append(vt)
+                if len(tensors["x_t"]) < 12:
+                    tensors["x_t"].append(xt)
+                    tensors["v_true"].append(vt)
+                region = min(2, 3 * t // n_steps)
+                for lag in sorted(gen.v_ma[slot][t]):
+                    vm = gen.v_ma[slot][t][lag]
+                    deltas_by_lag.setdefault(lag, []).append((region, vt - vm))
+                    if len(tensors["v_ma"]) < 12:
+                        tensors["v_ma"].append(vm)
+                        tensors["delta"].append(vt - vm)
+                    if len(v_ma_all) < 256:
+                        v_ma_all.append(vm)
+                        v_true_all.append(vt)
+                        x_t_all.append(xt)
+        if bar is not None:
+            bar.update(1)
+    if bar is not None:
+        bar.close()
+    timer.add("analysis", time.time() - t_an0)
+    n_gens = len(entries)
+    print(f"  Generations: {n_gens}  tensors: "
+          f"{ {k: len(v) for k, v in tensors.items()} }")
+    if not tensors["delta"]:
+        raise SystemExit("[probe] no recorded pairs found — nothing to analyze")
+    metrics.write({"type": "phase", "phase": "analysis", "gens": n_gens,
+                   "wall_s": round(timer.phase_seconds("analysis"), 2)})
+
+    # ── 3a codecs + t-gap cancellation ─────────────────────────────────
+    t_c0 = time.time()
+    codec_results = benchmark_codecs(tensors)
+    timer.add("codec", time.time() - t_c0)
+    report["codec"] = codec_results
     tg = {"mean_abs_v_true_step_delta": round(float(np.mean(gap_true)), 6),
           "mean_abs_delta_ma": round(float(np.mean(gap_delta)), 6)}
     tg["ratio"] = round(tg["mean_abs_delta_ma"] / max(tg["mean_abs_v_true_step_delta"], 1e-9), 3)
@@ -569,28 +726,9 @@ def main(argv=None):
     print(f"\n  t-gap cancellation: |Δ_MA|={tg['mean_abs_delta_ma']} vs "
           f"|v_true(t)−v_true(t−1)|={tg['mean_abs_v_true_step_delta']} "
           f"→ ratio {tg['ratio']} (<1 confirms the t-gap cancels)")
+    _write_report(report, data_dir)
 
     # ── 3b learnability ────────────────────────────────────────────────
-    deltas_by_lag: Dict[int, List[Tuple[int, torch.Tensor]]] = {}
-    v_ma_all, v_true_all, x_t_all = [], [], []
-    v_true_by_slot: Dict[int, List[torch.Tensor]] = {}
-    for entry in refiner_data.iter_generations(data_dir):
-        gen = refiner_data.load_generation(data_dir / entry["bin"])
-        n_steps = max(int(entry.get("num_steps", 1)), 1)
-        for slot in gen.recorded_slots:
-            v_true_by_slot.setdefault(slot, [])
-            for t in range(min(len(gen.v_true[slot]), 8)):
-                vt = gen.v_true[slot][t]
-                xt = gen.x[slot][t]
-                v_true_by_slot[slot].append(vt)
-                region = min(2, 3 * t // n_steps)
-                for lag in sorted(gen.v_ma[slot][t]):
-                    vm = gen.v_ma[slot][t][lag]
-                    deltas_by_lag.setdefault(lag, []).append((region, vt - vm))
-                    if len(v_ma_all) < 256:
-                        v_ma_all.append(vm)
-                        v_true_all.append(vt)
-                        x_t_all.append(xt)
     learn = {}
     learn["svd"] = svd_rank_95([d for _, d in deltas_by_lag.get(1, [])][:128])
     learn["predictability_ceiling"] = {
@@ -619,6 +757,13 @@ def main(argv=None):
     print(f"\n  SVD rank(95%): {rank}   affine ceiling (1−R²): {ceiling}   "
           f"staleness monotone: {monotone}")
     print(f"  Decision gate: {'PROCEED' if gate['proceed'] else 'RECONSIDER'}")
+    stal = learn["staleness_curve"]
+    for r in range(3):
+        region = stal.get(f"region_{r}")
+        if region:
+            print(f"      staleness region {r}: " + "  ".join(
+                f"d{lag}={v:.4f}" for lag, v in sorted(region.items())))
+    _write_report(report, data_dir)
 
     # ── 3d Day-1 ───────────────────────────────────────────────────────
     print("\n  Day-1 experiment (MLP → tiny UNet, plan 3d)...")
@@ -626,7 +771,8 @@ def main(argv=None):
     mlp_err = day1_mlp(x_t_all, v_ma_all, v_true_all, device)
     print(f"  Day-1 MLP (pooled features) mean-Δ error: {mlp_err:.5f}")
     day1 = day1_unet(data_dir, device, max_steps=args.day1_steps,
-                     batch_size=args.day1_batch)
+                     batch_size=args.day1_batch, show_progress=show_progress,
+                     metrics=metrics, timer=timer)
     day1["mlp_pooled_mean_error"] = round(float(mlp_err), 5)
     day1["linear_ceiling"] = ceiling
     if day1["day1_unet_rel_mse"] is not None:
@@ -639,12 +785,30 @@ def main(argv=None):
     else:
         day1["verdict"] = "no_eval_pairs"
     report["day1"] = day1
+    metrics.write({
+        "type": "day1_eval", "rel_mse": day1.get("day1_unet_rel_mse"),
+        "verdict": day1["verdict"], "wall_s": round(timer.phase_seconds("train"), 2),
+    })
 
-    # ── Write report ───────────────────────────────────────────────────
-    report_path = data_dir.parent / "refiner_probe_report.json"
-    report_path.write_text(json.dumps(report, indent=2, default=str))
-    print(f"\n  Report: {report_path}")
+    # ── Write report + summary ─────────────────────────────────────────
+    report_path = _write_report(report, data_dir)
+    wall = time.time() - t_start
+    phase_parts = []
+    for name, label in (("record", "record"), ("analysis", "analysis"),
+                        ("codec", "codec bench"), ("train", "day1 train"),
+                        ("eval", "day1 eval"), ("lag", "lag-readability")):
+        s = timer.phase_seconds(name)
+        if s > 0:
+            phase_parts.append(f"{label} {format_duration(s)}")
+    print("\n  ── Probe complete ──")
+    print(f"  Wall time:    {format_duration(wall)}"
+          + (f"  ({' | '.join(phase_parts)})" if phase_parts else ""))
+    print(f"  VRAM peak:    {torch.cuda.max_memory_allocated() / (1024 ** 3):.1f} GB")
+    print(f"  Metrics:      {metrics.path}")
+    print(f"  Report:       {report_path}")
     print("=" * 60)
+    metrics.write({"type": "done", "wall_s": round(wall, 2)})
+    metrics.close()
 
 
 if __name__ == "__main__":

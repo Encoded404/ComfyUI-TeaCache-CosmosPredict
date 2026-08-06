@@ -127,6 +127,20 @@ the Day-1 experiment verdict (tiny UNet beats the linear ceiling by ≥25% →
 build the full corrector). `train_corrector` reads the ceiling from this
 report for its did-it-learn gate.
 
+- **Progress & metrics**: tqdm bars for recording, analysis and Day-1 phases
+  (`--no-progress` disables), per-50-step Day-1 log lines (EMA loss, it/s),
+  and a final summary with per-phase timings and VRAM peak. Step + eval
+  scalars stream to `probe_metrics.jsonl` (JSONL, `tail -f` friendly;
+  `--metrics PATH` relocates).
+- **Crash resilience**: the report is written progressively (atomic
+  tmp+replace) after codec/learnability/gate results and again after the
+  Day-1 experiment, so a crash keeps everything computed so far. Failed
+  generations during recording are logged and skipped instead of aborting
+  the run (all-fail still aborts).
+- **Performance**: the analysis phase decodes each generation exactly once
+  (single pass feeds the codec benchmark, t-gap cancellation and learnability
+  stats instead of three full re-decodes).
+
 ### Training (plan Task 6)
 
 ```bash

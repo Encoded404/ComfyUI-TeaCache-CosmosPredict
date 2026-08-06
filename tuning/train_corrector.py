@@ -48,7 +48,7 @@ from .corrector import (CorrectorConfig, CorrectorUNet2D, FULL_STEP_FLOP_512,
                         estimate_corrector_flops, save_corrector)
 from .corrector_dataset import (CorrectorBatchSampler, CorrectorDataset,
                                 augment_batch, collate_corrector)
-from .utils import TrainTimer, format_duration
+from .utils import MetricsLog, TrainTimer, format_duration
 
 from torch.utils.data import DataLoader
 
@@ -430,24 +430,6 @@ def config_drift(snapshot: dict, cfg: dict) -> List[str]:
         if snapshot.get(k) != cfg.get(k):
             drift.append(f"  {k}: checkpoint={snapshot.get(k)!r} current={cfg.get(k)!r}")
     return drift
-
-
-class MetricsLog:
-    """JSONL sink for training scalars (step rows) and eval rows.
-
-    One JSON object per line, flushed per write — ``tail -f`` friendly.
-    """
-
-    def __init__(self, path: str):
-        self.path = Path(path)
-        self._f = open(self.path, "a")
-
-    def write(self, row: Dict) -> None:
-        self._f.write(json.dumps(row, default=str) + "\n")
-        self._f.flush()
-
-    def close(self) -> None:
-        self._f.close()
 
 
 # ── Main ──────────────────────────────────────────────────────────────
