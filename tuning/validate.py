@@ -235,11 +235,19 @@ def run_single_teacache(
     sampler: str, scheduler: str,
     width: int, height: int,
     cfg_val: float = 5.0,
+    corrector: str = None,
+    corrector_passes: int = 1,
+    corrector_trust: float = 1.0,
+    return_latent: bool = False,
 ) -> tuple:
-    """Run one TeaCache generation. Returns (image, wall_time_sec, total_steps, cached_steps).
+    """Run one TeaCache generation. Returns
+    (image_or_latent, wall_time_sec, total_steps, cached_steps, drift, slot_stats).
 
     total_steps is the number of denoising steps where TeaCache was active.
     cached_steps is the number of those steps where caching was used.
+    drift is the skip-run length distribution (max run + histogram) tracked
+    in the wrapper — no forward state needed (plan Task 7).
+    slot_stats is the per-slot correction report from Mode B′ (diagnostic).
     """
     dm = get_diffusion_model(unet)
     if hasattr(dm, "teacache_state"):
@@ -256,7 +264,27 @@ def run_single_teacache(
     cfg.inject_into_transformer_options(to)
     to["enable_teacache"] = True
 
+    # ── Mode B′ corrector (plan Task 7) ────────────────────────────────
+    if corrector:
+        from .corrector import prepare_corrector, CorrectorUNet2D, CorrectorConfig
+        if corrector == "__zero_init__":
+            # Sanity gate: fresh zero-init corrector ⇒ Mode B′ ≡ Mode A
+            corr = CorrectorUNet2D(CorrectorConfig.for_size("tiny"))
+            corr = corr.to(next(dm.parameters()).device).eval()
+        else:
+            corr = prepare_corrector(corrector, next(dm.parameters()).device)
+        dm._tc_corrector = corr
+        dm._tc_collect_stats = True
+        dm._tc_corr_slot_stats = {}
+        cfg.correction_mode = "latent_denoiser"
+        cfg.refine_passes = max(1, int(corrector_passes))
+        cfg.corrector_trust = float(corrector_trust)
+
+    drift = {"max_skip_run": 0, "histogram": {}, "n_steps": 0}
+    run_len = 0
+
     def tc_wrapper(model_function, kwargs):
+        nonlocal run_len
         c = kwargs["c"]
         timestep = kwargs["timestep"]
         c_to = c.setdefault("transformer_options", {})
@@ -275,7 +303,22 @@ def run_single_teacache(
             c_to["enable_teacache"] = (
                 cfg.start_percent <= c_to["current_percent"] <= cfg.end_percent
             )
-        return model_function(kwargs["input"], timestep, **c)
+        out = model_function(kwargs["input"], timestep, **c)
+        # Drift exposure (plan Task 7): skip-run lengths from the state the
+        # forward already maintains — no forward changes needed.
+        st = getattr(dm, "teacache_state", None)
+        skipped = False
+        if st:
+            skipped = not any(s.get("should_calc", True) for s in st.values())
+        if skipped:
+            run_len += 1
+        else:
+            if run_len > 0:
+                drift["histogram"][run_len] = drift["histogram"].get(run_len, 0) + 1
+                drift["max_skip_run"] = max(drift["max_skip_run"], run_len)
+            run_len = 0
+        drift["n_steps"] += 1
+        return out
 
     try:
         unet.set_model_unet_function_wrapper(tc_wrapper)
@@ -287,15 +330,24 @@ def run_single_teacache(
             cfg=cfg_val,
             sampler_name=sampler, scheduler=scheduler,
             negative=negative,
+            return_latent=return_latent,
         )
         dt = time.time() - t0
         total_steps = getattr(dm, "_tc_diag_runs", 0)
         cached_steps = getattr(dm, "_tc_diag_skips", 0)
+        if run_len > 0:
+            drift["histogram"][run_len] = drift["histogram"].get(run_len, 0) + 1
+            drift["max_skip_run"] = max(drift["max_skip_run"], run_len)
+        slot_stats = dict(getattr(dm, "_tc_corr_slot_stats", {}))
     finally:
         dm._forward = original
         _cleanup_patch(dm, unet)
+        if hasattr(dm, "_tc_corrector"):
+            delattr(dm, "_tc_corrector")
+        if hasattr(dm, "_tc_collect_stats"):
+            delattr(dm, "_tc_collect_stats")
 
-    return img, dt, total_steps, cached_steps
+    return img, dt, total_steps, cached_steps, drift, slot_stats
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Validation core
@@ -314,7 +366,10 @@ def validate_config(
     steps: int,
     prompt_sampler: GenerationPromptSampler,
     quiet: bool = False,
-) -> ValidationResult:
+    corrector: str = None,
+    corrector_passes: int = 1,
+    corrector_trust: float = 1.0,
+) -> tuple:
     """End-to-end validation of one configuration at a specific
     resolution and step count.
 
@@ -322,6 +377,10 @@ def validate_config(
     (width, height, steps, prompt_idx, seed). The prompt for each key is
     re-drawn via the sampler, which must match the draw used when the
     baseline was generated.
+
+    Returns (ValidationResult, drift_report, slot_stats) — drift_report is
+    the skip-run length distribution (Mode A or B′), slot_stats the per-slot
+    correction magnitudes (Mode B′ only; empty otherwise).
     """
     metric_names = qm.metric_names()
     all_scores: Dict[str, List[float]] = {k: [] for k in metric_names}
@@ -331,6 +390,8 @@ def validate_config(
     sampler = tcfg.sampling["sampler"]
     scheduler = tcfg.sampling["scheduler"]
     cfg_val = tcfg.sampling["cfg"]
+    drift_agg = {"max_skip_run": 0, "histogram": {}}
+    slot_agg = {}
 
     for pi, pdata in enumerate(prompts):
         for seed in seeds:
@@ -346,15 +407,28 @@ def validate_config(
             img_base = bl["image"]
             t_base = bl["time"]
 
-            img_tc, t_tc, total_diag_steps, cached_diag_steps = run_single_teacache(
-                unet, clip, vae,
-                full_prompt, neg_prompt,
-                cfg,
-                seed=seed, steps=steps,
-                sampler=sampler, scheduler=scheduler,
-                width=width, height=height,
-                cfg_val=cfg_val,
-            )
+            img_tc, t_tc, total_diag_steps, cached_diag_steps, drift, slot_stats = \
+                run_single_teacache(
+                    unet, clip, vae,
+                    full_prompt, neg_prompt,
+                    cfg,
+                    seed=seed, steps=steps,
+                    sampler=sampler, scheduler=scheduler,
+                    width=width, height=height,
+                    cfg_val=cfg_val,
+                    corrector=corrector,
+                    corrector_passes=corrector_passes,
+                    corrector_trust=corrector_trust,
+                )
+            drift_agg["max_skip_run"] = max(drift_agg["max_skip_run"],
+                                            drift.get("max_skip_run", 0))
+            for k, v in drift.get("histogram", {}).items():
+                drift_agg["histogram"][k] = drift_agg["histogram"].get(k, 0) + v
+            for k, (s_dv, s_blend, n) in slot_stats.items():
+                a = slot_agg.setdefault(k, [0.0, 0.0, 0])
+                a[0] += s_dv
+                a[1] += s_blend
+                a[2] += n
 
             speedup = t_base / max(t_tc, 0.001)
             all_speedups.append(speedup)
@@ -378,11 +452,16 @@ def validate_config(
 
     n = len(all_speedups)
     if n == 0:
-        return ValidationResult(
-            config=cfg, mean_speedup=1.0,
-            mean_psnr=float("inf"), mean_ssim=1.0, mean_lpips=0.0,
-            mean_time_sec=0.0, n_samples=0, mean_metrics={},
-            actual_skip_rate=0.0, skip_rates=[],
+        return (
+            ValidationResult(
+                config=cfg, mean_speedup=1.0,
+                mean_psnr=float("inf"), mean_ssim=1.0, mean_lpips=0.0,
+                mean_time_sec=0.0, n_samples=0, mean_metrics={},
+                actual_skip_rate=0.0, skip_rates=[],
+            ),
+            drift_agg,
+            {k: [round(a[0] / max(a[2], 1), 6), round(a[1] / max(a[2], 1), 6)]
+             for k, a in slot_agg.items()},
         )
 
     mean_metrics = {}
@@ -392,7 +471,7 @@ def validate_config(
 
     mean_skip = round(sum(all_skip_rates) / len(all_skip_rates), 4) if all_skip_rates else 0.0
 
-    return ValidationResult(
+    result = ValidationResult(
         config=cfg,
         mean_speedup=round(sum(all_speedups) / n, 3),
         mean_psnr=round(mean_metrics.get("psnr", float("inf")), 2),
@@ -404,6 +483,9 @@ def validate_config(
         actual_skip_rate=mean_skip,
         skip_rates=all_skip_rates,
     )
+    return (result, drift_agg,
+            {k: [round(a[0] / max(a[2], 1), 6), round(a[1] / max(a[2], 1), 6)]
+             for k, a in slot_agg.items()})
 
 
 def sweep_thresholds(
@@ -426,12 +508,108 @@ def sweep_thresholds(
         cfg = TeacacheConfig.from_dict(base_cfg.to_dict())
         cfg.rel_l1_thresh = thresh
         print(f"\n  Threshold sweep: thresh={thresh}  ({width}x{height} @ {steps}s)")
-        result = validate_config(
+        result, _drift, _slots = validate_config(
             cfg, unet, clip, vae, prompts, seeds, tcfg, qm,
             baselines, width, height, steps, prompt_sampler,
         )
         results.append(result)
     return results
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Mode B′ gates (plan Task 7)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def run_sanity_gate(cfg: TeacacheConfig, unet, clip, vae, prompts, seeds, tcfg,
+                    width, height, steps, prompt_sampler) -> dict:
+    """Zero-init Mode B′ must reproduce Mode A EXACTLY (bitwise, plan Task 7).
+
+    Compares the final sampler latents of a Mode A run and a Mode B′ run with
+    a fresh zero-init corrector, under deterministic cuDNN settings.
+    """
+    import torch.backends.cudnn as cudnn
+    old_det, old_bench = cudnn.deterministic, cudnn.benchmark
+    cudnn.deterministic, cudnn.benchmark = True, False
+    try:
+        lat_a, lat_b, ok = None, None, False
+        for pi, pdata in enumerate(prompts[:1]):
+            for seed in seeds[:1]:
+                full_prompt, neg_prompt, _ = resolve_generation(
+                    prompt_sampler, pdata["entry"], pi, seed, steps, width, height,
+                )
+                sampler_name = tcfg.sampling["sampler"]
+                scheduler = tcfg.sampling["scheduler"]
+                cfg_val = tcfg.sampling["cfg"]
+                lat_a, _t, _ts, _cs, _d, _s = run_single_teacache(
+                    unet, clip, vae, full_prompt, neg_prompt,
+                    TeacacheConfig.from_dict(cfg.to_dict()),
+                    seed=seed, steps=steps, sampler=sampler_name, scheduler=scheduler,
+                    width=width, height=height, cfg_val=cfg_val, return_latent=True,
+                )
+                cfg_b = TeacacheConfig.from_dict(cfg.to_dict())
+                lat_b, _t, _ts, _cs, _d, _s = run_single_teacache(
+                    unet, clip, vae, full_prompt, neg_prompt, cfg_b,
+                    seed=seed, steps=steps, sampler=sampler_name, scheduler=scheduler,
+                    width=width, height=height, cfg_val=cfg_val, return_latent=True,
+                    corrector="__zero_init__",
+                )
+        if lat_a is not None and lat_b is not None:
+            lat_a = lat_a[0] if isinstance(lat_a, tuple) else lat_a
+            lat_b = lat_b[0] if isinstance(lat_b, tuple) else lat_b
+            ok = torch.equal(lat_a, lat_b)
+        return {"exact_equality": ok, "shape": list(lat_a.shape) if lat_a is not None else None}
+    finally:
+        cudnn.deterministic, cudnn.benchmark = old_det, old_bench
+
+
+def shipping_gate(ab_rows: List[dict]) -> dict:
+    """Plan Task 7 acceptance: Mode B′ ≥ Mode A LPIPS in ≥70% of (resolution,
+    steps) cells AND ≥5% better on the aggressive half of the threshold curve."""
+    from collections import defaultdict
+    cells = defaultdict(lambda: {"better": 0, "worse": 0, "samples": []})
+    for row in ab_rows:
+        key = (row["resolution"][0], row["resolution"][1], row["steps"])
+        lp_b = row["lpips_b"]
+        lp_a = row["lpips_a"]
+        if lp_a != lp_a or lp_b != lp_b:
+            continue
+        cells[key]["samples"].append((lp_a, lp_b))
+        if lp_b <= lp_a:
+            cells[key]["better"] += 1
+        else:
+            cells[key]["worse"] += 1
+    cell_pass = 0
+    cell_details = {}
+    for key, c in sorted(cells.items()):
+        n = c["better"] + c["worse"]
+        frac = c["better"] / max(n, 1)
+        cell_details[str(key)] = {"better": c["better"], "worse": c["worse"],
+                                  "frac_better": round(frac, 3)}
+        if frac >= 0.5:
+            cell_pass += 1
+    cells_70 = cell_pass / max(len(cells), 1) >= 0.7
+    # Aggressive half: configs above the median threshold
+    threshes = sorted(r["thresh"] for r in ab_rows)
+    median_t = threshes[len(threshes) // 2] if threshes else 0.0
+    agg = [r for r in ab_rows if r["thresh"] >= median_t and r["lpips_a"] == r["lpips_a"]
+           and r["lpips_b"] == r["lpips_b"]]
+    agg_improvement = None
+    if agg:
+        ma = sum(r["lpips_a"] for r in agg) / len(agg)
+        mb = sum(r["lpips_b"] for r in agg) / len(agg)
+        agg_improvement = (ma - mb) / max(ma, 1e-9)
+    aggressive_5 = agg_improvement is not None and agg_improvement >= 0.05
+    passed = cells_70 and aggressive_5
+    return {
+        "cells_70pct_better_or_equal": cells_70,
+        "cell_details": cell_details,
+        "aggressive_half_improvement": (round(agg_improvement, 4)
+                                        if agg_improvement is not None else None),
+        "aggressive_half_5pct": aggressive_5,
+        "passed": passed,
+        "note": ("ship Mode B′ as default" if passed
+                 else "keep Mode B′ opt-in experimental"),
+    }
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  CLI argument parsing helpers
@@ -493,12 +671,15 @@ def _parse_float_list(raw: str) -> List[float]:
 def _build_flat_results(
     all_results: List[tuple],
 ) -> List[dict]:
-    """Convert (result, width, height, steps) tuples to JSON-serializable dicts."""
+    """Convert (result, width, height, steps[, mode]) tuples to JSON dicts."""
     out = []
-    for result, w, h, steps in all_results:
+    for item in all_results:
+        result, w, h, steps = item[:4]
+        mode = item[4] if len(item) > 4 else "A"
         d = result.to_dict()
         d["resolution"] = [w, h]
         d["steps"] = steps
+        d["mode"] = mode
         out.append(d)
     return out
 
@@ -541,6 +722,18 @@ def main():
                         help="Run threshold sweeps at key error points")
     parser.add_argument("--extra-sweep-errors", type=str, default=None,
                         help="Comma-separated error targets, e.g. '0.01,0.05,0.10'")
+
+    # ── Mode B′ latent corrector (plan Task 7) ─────────────────────────
+    parser.add_argument("--corrector", default=None,
+                        help="Path to a corrector .safetensors. When set, every "
+                             "validated config also runs in Mode B′ and an A/B "
+                             "report (Mode A vs Mode B′), per-slot quality, "
+                             "drift exposure, the sanity gate and the shipping "
+                             "gate are produced.")
+    parser.add_argument("--corrector-passes", type=int, default=1,
+                        help="K for Mode B′ validation runs (default 1)")
+    parser.add_argument("--corrector-trust", type=float, default=1.0,
+                        help="Correction blend factor for Mode B′ runs (default 1.0)")
 
     args = parser.parse_args()
 
@@ -609,6 +802,9 @@ def main():
     print(f"  Step counts:     {step_counts}")
     if do_extra_sweep:
         print(f"  Extra sweep at:  {extra_sweep_errors}")
+    if args.corrector:
+        print(f"  Corrector:       {args.corrector}  (Mode B′ A/B, K={args.corrector_passes}, "
+              f"trust={args.corrector_trust})")
     print(f"  Output:          {out_dir}")
     total_combo = (len(resolutions) * len(step_counts) * num_prompts * num_seeds)
     print(f"  Baseline images: {total_combo}")
@@ -724,6 +920,8 @@ def main():
 
     val_start = time.time()
     done = 0
+    ab_rows: List[dict] = []
+    drift_reports: List[dict] = []
 
     for cfg in selected_cfgs:
         for w, h in resolutions:
@@ -733,13 +931,59 @@ def main():
                       f"{cfg.source} {cfg.metric_type} {cfg.mapping_type} "
                       f"{w}x{h} @ {steps}s  thresh={cfg.rel_l1_thresh}")
 
-                result = validate_config(
+                result, drift, _slots = validate_config(
                     cfg, unet, clip, vae, prompts, seeds, tcfg, qm,
                     baselines, w, h, steps, prompt_sampler,
                 )
-                all_results.append((result, w, h, steps))
+                all_results.append((result, w, h, steps, "A"))
+                drift_reports.append({"mode": "A", "thresh": cfg.rel_l1_thresh,
+                                      "resolution": [w, h], "steps": steps,
+                                      **drift})
+                if args.corrector:
+                    print(f"  ── Mode B′ (corrector) ──")
+                    result_b, drift_b, slot_stats = validate_config(
+                        cfg, unet, clip, vae, prompts, seeds, tcfg, qm,
+                        baselines, w, h, steps, prompt_sampler,
+                        corrector=args.corrector,
+                        corrector_passes=args.corrector_passes,
+                        corrector_trust=args.corrector_trust,
+                    )
+                    all_results.append((result_b, w, h, steps, "B"))
+                    drift_reports.append({"mode": "B", "thresh": cfg.rel_l1_thresh,
+                                          "resolution": [w, h], "steps": steps,
+                                          **drift_b})
+                    ab_rows.append({
+                        "mode": "B",
+                        "thresh": cfg.rel_l1_thresh,
+                        "resolution": [w, h], "steps": steps,
+                        "lpips_a": result.mean_lpips,
+                        "lpips_b": result_b.mean_lpips,
+                        "skip_a": result.actual_skip_rate,
+                        "skip_b": result_b.actual_skip_rate,
+                        "speedup_a": result.mean_speedup,
+                        "speedup_b": result_b.mean_speedup,
+                        "slot_stats": slot_stats,
+                    })
 
     val_elapsed = time.time() - val_start
+
+    # ── Mode B′ sanity gate + shipping gate (plan Task 7) ──────────────
+    gate_report = {}
+    if args.corrector:
+        print("\n  ── Sanity gate: zero-init Mode B′ ≡ Mode A ──")
+        first = selected_cfgs[0]
+        sw, sh = resolutions[0]
+        ssteps = step_counts[0]
+        sanity = run_sanity_gate(first, unet, clip, vae, prompts, seeds, tcfg,
+                                 sw, sh, ssteps, prompt_sampler)
+        print(f"  exact equality: {sanity['exact_equality']}")
+        print("\n  ── Shipping gate (plan Task 7) ──")
+        ship = shipping_gate(ab_rows)
+        for k, v in ship.items():
+            if k != "cell_details":
+                print(f"  {k}: {v}")
+        gate_report = {"sanity": sanity, "shipping": ship}
+
     sweep_gens = 0
     sweep_iters = 0
 
@@ -782,6 +1026,14 @@ def main():
     (out_dir / "validation_results.json").write_text(
         json.dumps(flat, indent=2)
     )
+    if drift_reports:
+        (out_dir / "validation_drift.json").write_text(
+            json.dumps(drift_reports, indent=2)
+        )
+    if gate_report:
+        (out_dir / "validation_corrector_gates.json").write_text(
+            json.dumps(gate_report, indent=2)
+        )
 
     # ── Final speed summary across all GPU work ────────────────────────
     total_wall = bsl_elapsed + val_elapsed
@@ -818,7 +1070,8 @@ def main():
     # Group by (resolution, steps)
     from collections import defaultdict
     groups: Dict[tuple, List[ValidationResult]] = defaultdict(list)
-    for result, w, h, steps in all_results:
+    for item in all_results:
+        result, w, h, steps = item[:4]
         groups[(w, h, steps)].append(result)
 
     for (w, h, steps), group_results in sorted(groups.items()):
@@ -855,6 +1108,25 @@ def main():
                   f"thresh={best.config.rel_l1_thresh} "
                   f"speedup={best.mean_speedup}x "
                   f"LPIPS={best.mean_lpips}")
+
+    # ── Mode B′ A/B report (plan Task 7) ───────────────────────────────
+    if ab_rows:
+        from collections import defaultdict
+        print(f"\n{'=' * 60}")
+        print(f"  Mode A vs Mode B′ — A/B report")
+        print(f"{'=' * 60}")
+        ab_groups = defaultdict(list)
+        for row in ab_rows:
+            ab_groups[(tuple(row["resolution"]), row["steps"])].append(row)
+        for (res, st), rows in sorted(ab_groups.items()):
+            print(f"\n  {res[0]}x{res[1]} @ {st} steps  ({len(rows)} configs)")
+            print(f"  {'thresh':>7} | {'LPIPS A':>8} | {'LPIPS B':>8} | {'ΔLPIPS':>8} | "
+                  f"{'skip A':>7} | {'skip B':>7} | {'slot stats'}")
+            for r in sorted(rows, key=lambda x: x["thresh"]):
+                d = r["lpips_b"] - r["lpips_a"]
+                slots = ", ".join(f"{k}: Δv̂={v[0]:.5f}" for k, v in sorted(r["slot_stats"].items()))
+                print(f"  {r['thresh']:>7.4f} | {r['lpips_a']:>8.4f} | {r['lpips_b']:>8.4f} | "
+                      f"{d:>+8.4f} | {r['skip_a']:>6.1%} | {r['skip_b']:>6.1%} | {slots}")
 
     print(f"\n  Results saved to: {out_dir}/validation_results.json")
 

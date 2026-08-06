@@ -1,2 +1,5 @@
 einops >= 0.7.0
 diffusers >= 0.31.0
+# Latent refiner / corrector (plan Task 8): checkpoint IO + compression
+safetensors >= 0.4
+blosc2 >= 2.0

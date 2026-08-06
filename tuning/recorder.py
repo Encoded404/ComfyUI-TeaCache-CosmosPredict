@@ -96,7 +96,7 @@ def _capture_refiner_step(self, x_orig, ori_x, residual, result, t_emb, adaln_lo
     states, state_keys, t_rows, a_rows = [], [], [], []
     for i, k in enumerate(cond_or_uncond):
         k = int(k)
-        if record_slots == "cond" and k != 1:
+        if record_slots == "cond" and k != 0:
             continue
         ring = buf["ring"].get(k)
         if not ring:
@@ -132,9 +132,12 @@ def _capture_refiner_step(self, x_orig, ori_x, residual, result, t_emb, adaln_lo
             vma_by_slot.setdefault(k, {})[d] = v_slot.detach().to("cpu", dtype=dtype)
 
     # ── Per-slot bookkeeping: ring append + x_t / v_true / metadata ──
+    # ComfyUI cond_or_uncond convention: 0 = cond (positive), 1 = uncond
+    # (verified against comfy/samplers.py sampling_function: conds = [cond, uncond_]).
+    # "cond" mode keeps the cond slot only.
     for i, k in enumerate(cond_or_uncond):
         k = int(k)
-        if record_slots == "cond" and k != 1:
+        if record_slots == "cond" and k != 0:
             continue
 
         x_slot = x_orig[i * b : (i + 1) * b,

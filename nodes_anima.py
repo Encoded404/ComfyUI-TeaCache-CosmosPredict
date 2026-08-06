@@ -257,6 +257,16 @@ def _apply_teacache(model, cfg: TeacacheConfig, preset_steps: int = 30):
     cfg.inject_into_transformer_options(to)
     to["preset_steps"] = preset_steps
 
+    # ── Mode B′ corrector (plan Task 5b): set on the CLONED diffusion model ──
+    # model.clone() does not carry attributes — load here, after the clone.
+    if cfg.correction_mode == "latent_denoiser":
+        from .tuning.corrector import prepare_corrector
+        corr = prepare_corrector(cfg.corrector_model_path,
+                                 next(diffusion_model.parameters()).device)
+        diffusion_model._tc_corrector = corr
+    elif hasattr(diffusion_model, "_tc_corrector"):
+        delattr(diffusion_model, "_tc_corrector")
+
     # Context manager for _forward patching (restores original on exit)
     context = patch.object(
         diffusion_model,
@@ -385,6 +395,18 @@ class TeaCacheAnima:
                                            "tooltip": "Window size for 'windowed' accumulation."}),
                 "always_fraction": ("FLOAT", {"default": 0.36, "min": 0.01, "max": 0.99, "step": 0.01,
                                                  "tooltip": "Fraction of always-run blocks for 'split_fraction' mode."}),
+                # ── Mode B′ latent corrector (plan Task 5c) ──
+                "corrector": (
+                    ["off", "latent_denoiser"],
+                    {"default": "off",
+                     "tooltip": "Post-process skip-step velocities with a trained latent corrector (Mode B′). Requires a corrector_model checkpoint."},
+                ),
+                "corrector_model": ("STRING", {"default": "",
+                    "tooltip": "Path to a corrector .safetensors checkpoint (trained by tuning/train_corrector.py). Empty = Mode A."}),
+                "refine_passes": ("INT", {"default": 1, "min": 1, "max": 4,
+                    "tooltip": "K — iterative refinement passes (inference default 1; trained checkpoints support K ≤ 3)."}),
+                "corrector_trust": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "v_final = v_MA + trust·(v̂ − v_MA). 1.0 = full correction (the trained regime); lower is a conservative dial."}),
             },
         }
 
@@ -426,6 +448,26 @@ class TeaCacheAnima:
             cfg.block_params["always_fraction"] = kwargs["always_fraction"]
             overrides.append(f"frac={kwargs['always_fraction']}")
 
+        # ── Mode B′ latent corrector (plan Task 5c) ──
+        mode_b = False
+        if kwargs.get("corrector", "off") == "latent_denoiser":
+            model_path = kwargs.get("corrector_model", "") or ""
+            if not model_path or not Path(model_path).exists():
+                print(f"  [TeaCacheAnima] ⚠ corrector 'latent_denoiser' without a "
+                      f"valid corrector_model — falling back to Mode A")
+            else:
+                cfg.correction_mode = "latent_denoiser"
+                cfg.corrector_model_path = model_path
+                cfg.refine_passes = max(1, min(int(kwargs.get("refine_passes", 1)), 4))
+                cfg.corrector_trust = float(kwargs.get("corrector_trust", 1.0))
+                mode_b = True
+                overrides.append(f"mode=B(K={cfg.refine_passes})")
+                # Warning for non-base checkpoints / LoRA (weights trained on
+                # anima-base-v1.0 outputs; patches heuristic).
+                if model.model_options.get("patches"):
+                    print("  [TeaCacheAnima] ⚠ corrector was trained on anima-base-v1.0 "
+                          "outputs — using it with a patched/LoRA model is off-distribution")
+
         new_model = _apply_teacache(model, cfg, preset_steps=preset_steps)
 
         info = (
@@ -433,6 +475,7 @@ class TeaCacheAnima:
             f"thresh={cfg.rel_l1_thresh:.3f}  "
             f"est. {speedup:.1f}x  "
             f"LPIPS≈{lpips_est:.3f}  "
+            f"mode={'B(K=' + str(cfg.refine_passes) + ')' if mode_b else 'A'}  "
             f"src={cfg.source}"
         )
         if overrides:
@@ -526,6 +569,20 @@ class TeaCacheAnimaAdvanced:
                      "tooltip": "Which blocks to cache (all_or_nothing is safest)."},
                 ),
             },
+            "optional": {
+                # ── Mode B′ latent corrector (plan Task 5c) ──
+                "corrector": (
+                    ["off", "latent_denoiser"],
+                    {"default": "off",
+                     "tooltip": "Post-process skip-step velocities with a trained latent corrector (Mode B′). Requires a corrector_model checkpoint."},
+                ),
+                "corrector_model": ("STRING", {"default": "",
+                    "tooltip": "Path to a corrector .safetensors checkpoint (trained by tuning/train_corrector.py). Empty = Mode A."}),
+                "refine_passes": ("INT", {"default": 1, "min": 1, "max": 4,
+                    "tooltip": "K — iterative refinement passes (inference default 1; trained checkpoints support K ≤ 3)."}),
+                "corrector_trust": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "tooltip": "v_final = v_MA + trust·(v̂ − v_MA). 1.0 = full correction (the trained regime); lower is a conservative dial."}),
+            },
         }
 
     RETURN_TYPES = ("MODEL",)
@@ -535,7 +592,7 @@ class TeaCacheAnimaAdvanced:
     def apply_teacache_anima_advanced(
         self, model, source, metric_type, signal_scale,
         mapping_type, rel_l1_thresh, accumulation, step_schedule,
-        residual, start_percent, end_percent, block_mode,
+        residual, start_percent, end_percent, block_mode, **kwargs,
     ):
         cfg = TeacacheConfig(
             source=source,
@@ -551,7 +608,24 @@ class TeaCacheAnimaAdvanced:
             residual_strategy=residual,
             block_mode=block_mode,
         )
+        mode_b = ""
+        if kwargs.get("corrector", "off") == "latent_denoiser":
+            model_path = kwargs.get("corrector_model", "") or ""
+            if not model_path or not Path(model_path).exists():
+                print(f"  [TeaCacheAnimaAdvanced] ⚠ corrector 'latent_denoiser' "
+                      f"without a valid corrector_model — falling back to Mode A")
+            else:
+                cfg.correction_mode = "latent_denoiser"
+                cfg.corrector_model_path = model_path
+                cfg.refine_passes = max(1, min(int(kwargs.get("refine_passes", 1)), 4))
+                cfg.corrector_trust = float(kwargs.get("corrector_trust", 1.0))
+                mode_b = f"B(K={cfg.refine_passes})"
+                if model.model_options.get("patches"):
+                    print("  [TeaCacheAnimaAdvanced] ⚠ corrector was trained on "
+                          "anima-base-v1.0 outputs — using it with a patched/LoRA "
+                          "model is off-distribution")
         new_model = _apply_teacache(model, cfg)
         print(f"  TeaCacheAnimaAdvanced: src={source} thresh={rel_l1_thresh} "
-              f"acc={accumulation} schedule={step_schedule}")
+              f"acc={accumulation} schedule={step_schedule} "
+              f"mode={mode_b if mode_b else 'A'}")
         return (new_model,)

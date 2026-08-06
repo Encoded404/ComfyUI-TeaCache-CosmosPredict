@@ -64,6 +64,13 @@ class TeacacheConfig:
     # into the slim preset config (it arrives via the control point instead).
     step_mults: Optional[dict] = None
 
+    # Mode B′ latent corrector (plan Task 5a). Defaults keep Mode A behavior
+    # byte-for-byte; the corrector post-processes skip-step outputs only.
+    correction_mode: str = "off"        # "off" | "latent_denoiser"
+    refine_passes: int = 1              # K, 1-4 (inference default 1)
+    corrector_trust: float = 1.0        # v_final = v_MA + trust·(v̂ − v_MA)
+    corrector_model_path: str = ""      # .safetensors path (empty = Mode A)
+
     def __post_init__(self):
         if isinstance(self.signal_scale, dict):
             raise TypeError(
@@ -100,6 +107,10 @@ class TeacacheConfig:
             "cosim_threshold": self.cosim_threshold,
             "block_level": self.block_level,
             "block_level_config_scope": self.block_level_config_scope,
+            "correction_mode": self.correction_mode,
+            "refine_passes": self.refine_passes,
+            "corrector_trust": self.corrector_trust,
+            "corrector_model_path": self.corrector_model_path,
         }
 
     @classmethod
@@ -127,6 +138,10 @@ class TeacacheConfig:
             cosim_threshold=d.get("cosim_threshold", 0.95),
             block_level=d.get("block_level", "unified"),
             block_level_config_scope=d.get("block_level_config_scope", ["*"]),
+            correction_mode=d.get("correction_mode", "off"),
+            refine_passes=int(d.get("refine_passes", 1)),
+            corrector_trust=float(d.get("corrector_trust", 1.0)),
+            corrector_model_path=d.get("corrector_model_path", ""),
         )
 
     @classmethod
@@ -143,6 +158,8 @@ class TeacacheConfig:
             "residual_strategy", "residual_params",
             "cross_feed_enabled", "cross_feed_strength",
             "cosim_threshold", "block_level", "block_level_config_scope",
+            "correction_mode", "refine_passes", "corrector_trust",
+            "corrector_model_path",
         ]:
             if f"tc_{key}" in to:
                 d[key] = to[f"tc_{key}"]

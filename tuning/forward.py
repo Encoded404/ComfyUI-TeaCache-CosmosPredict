@@ -402,6 +402,43 @@ def _record_per_block_outputs(self, transformer_options, cache_blocks):
         pass  # Hooks are registered separately during calibration
 
 
+def _apply_corrector(self, out, x_orig, crossattn_emb, cond_or_uncond, b,
+                     current_percent, cfg):
+    """Mode B′ post-hook (plan Task 5b): correct the skip-step velocity per slot.
+
+    Runs after the final layer + unpatchify on skip steps only. The corrector
+    (set on the diffusion model by the node) maps (x_t, v_MA) → Δv̂; the blend
+    ``v_final = v_MA + trust·(v̂ − v_MA)`` defaults to full correction (trust=1).
+    No new state, no feedback loop — the input is always the deterministic
+    Mode-A output.
+    """
+    corr = getattr(self, "_tc_corrector", None)
+    if corr is None:
+        return out
+    K = max(1, int(cfg.refine_passes))
+    trust = float(cfg.corrector_trust)
+    t = torch.tensor([current_percent], dtype=torch.float32, device=out.device)
+    collect = bool(getattr(self, "_tc_collect_stats", False))
+    if collect:
+        if not hasattr(self, "_tc_corr_slot_stats"):
+            self._tc_corr_slot_stats = {}
+    for i, k in enumerate(cond_or_uncond):
+        x_slot = x_orig[i * b : (i + 1) * b, :, 0]       # (B', 16, H, W), T=1
+        v_slot = out[i * b : (i + 1) * b, :, 0]          # (B', 16, H, W)
+        p = crossattn_emb[i * b : (i + 1) * b]           # (B', N, 1024)
+        v_hat = corr.refine(x_slot, v_slot, p, t.expand(x_slot.shape[0]), K)
+        v_final = v_slot + trust * (v_hat - v_slot)
+        out[i * b : (i + 1) * b, :, 0] = v_final.to(out.dtype)
+        if collect:
+            # diagnostic only (validate.py per-slot report, plan Task 7)
+            dv = (v_hat - v_slot).abs().mean().item()
+            stats = self._tc_corr_slot_stats.setdefault(int(k), [0.0, 0.0, 0])
+            stats[0] += dv
+            stats[1] += (v_final - v_slot).abs().mean().item()
+            stats[2] += 1
+    return out
+
+
 # ═════════════════════════════════════════════════════════════════════
 #  Main forward function
 # ═════════════════════════════════════════════════════════════════════
@@ -443,6 +480,7 @@ def teacache_anima_forward(
 
     # ── 1. Preamble (copied from MiniTrainDIT._forward) ──
     orig_shape = list(x.shape)
+    x_orig = x  # raw pre-pad latent (Mode B′ corrector input, plan 5b)
 
     ref_latents = kwargs.get("ref_latents", None)
     if ref_latents is not None:
@@ -630,6 +668,20 @@ def teacache_anima_forward(
     else:
         should_calc_global = True
 
+    # ── 5b. Mode B′ guard: a slot without a cached residual must full-run ──
+    # Defensive only — step 0 always full-runs today (prev_mod is None → the
+    # accumulator never trips), so prev_residual is None only in degenerate
+    # state resets mid-generation (plan Task 5b).
+    correction_enabled = (
+        cfg.correction_mode == "latent_denoiser"
+        and getattr(self, "_tc_corrector", None) is not None
+    )
+    if correction_enabled and not should_calc_global:
+        for k in cond_or_uncond:
+            if self.teacache_state[k].get("prev_residual") is None:
+                should_calc_global = True
+                break
+
     # Diagnostic: track cache decisions
     if not hasattr(self, "_tc_diag_runs"):
         self._tc_diag_runs = 0
@@ -773,6 +825,16 @@ def teacache_anima_forward(
     x_B_C_Tt_Hp_Wp = self.unpatchify(x_B_T_H_W_O)[
         :, :, : orig_shape[-3], : orig_shape[-2], : orig_shape[-1]
     ]
+
+    # ── 7b. Mode B′ post-hook (skip steps only; plan Task 5b) ──
+    # The Mode-A path above is byte-for-byte unchanged; the corrector
+    # post-processes the timestep-aware v_MA on skip steps. x_orig is the
+    # pre-pad latent; corrector input distribution = the recorded pairs.
+    if correction_enabled and not should_calc_global:
+        x_B_C_Tt_Hp_Wp = _apply_corrector(
+            self, x_B_C_Tt_Hp_Wp, x_orig, crossattn_emb, cond_or_uncond, b,
+            current_percent, cfg,
+        )
 
     if ref_latents is not None:
         x_B_C_Tt_Hp_Wp = x_B_C_Tt_Hp_Wp[:, :, : orig_shape[-3], :, :]

@@ -116,6 +116,7 @@
         "k_curriculum": true,
         "stop_grad": true,
         "model_size": "20m",
+        "depth": "auto",
         "loss": "rel_mse",
         "optimizer": "sophia",
         "lr": 4e-4,

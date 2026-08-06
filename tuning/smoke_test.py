@@ -527,14 +527,98 @@ def run_smoke_test(comfy_dir: str, steps: int = 30):
     except Exception as e:
         print(f"  Could not compute metrics: {e}")
 
-    # ── [8/8] Summary ──────────────────────────────────────────────────
+    # ── [8/8] Corrector smoke (Mode B′, plan Task 8) ───────────────────
+    _run_corrector_smoke(unet, clip, vae, tcfg, steps=base_run["steps"])
+
+    # ── [9/9] Summary ──────────────────────────────────────────────────
     print(f"\n{'=' * 60}")
-    print(f"  Smoke test PASSED — all 8 checks completed")
+    print(f"  Smoke test PASSED — all 9 checks completed")
     print(f"  Ready for full calibration run:")
     print(f"    PYTHONPATH='.:custom_nodes/ComfyUI-TeaCache-CosmosPredict'")
     print(f"    python -m tuning.calibrate --comfy-dir .")
     print(f"{'=' * 60}")
     return True
+
+
+def _run_corrector_smoke(unet, clip, vae, tcfg, steps: int = 30):
+    """Mode B′ end-to-end smoke (plan Task 8): zero-init corrector, exact
+    equality with Mode A at init, output shape/dtype, live-corrector path.
+
+    Uses the same TeaCache patch path as validate.py (run_single_teacache).
+    """
+    import os
+    import tempfile
+    import torch.backends.cudnn as cudnn
+    from .config_types import TeacacheConfig
+    from .validate import run_single_teacache
+    from .corrector import CorrectorUNet2D, CorrectorConfig, save_corrector
+
+    print(f"\n{'─' * 60}")
+    print(f"  Corrector Smoke (Mode B′)")
+    print(f"{'─' * 60}")
+
+    cfg = TeacacheConfig(
+        source="pooled_latent", rel_l1_thresh=0.07,
+        accumulation_type="carry_over", step_schedule="bell",
+        block_mode="all_or_nothing", residual_strategy="hard",
+    )
+    sampler = tcfg.sampling["sampler"]
+    scheduler = tcfg.sampling["scheduler"]
+    cfg_val = tcfg.sampling["cfg"]
+    seed = SMOKE_RUNS[0]["seed"]
+
+    os.environ["TEA_CACHE_NO_COMPILE"] = "1"  # keep the smoke test fast
+
+    old_det, old_bench = cudnn.deterministic, cudnn.benchmark
+    cudnn.deterministic, cudnn.benchmark = True, False
+    try:
+        lat_a, _t, _ts, _cs, _d, _s = run_single_teacache(
+            unet, clip, vae, SMOKE_FULL, SMOKE_NEGATIVE,
+            TeacacheConfig.from_dict(cfg.to_dict()),
+            seed=seed, steps=steps, sampler=sampler, scheduler=scheduler,
+            width=512, height=512, cfg_val=cfg_val, return_latent=True,
+        )
+        lat_b, _t, ts_b, cs_b, _d, _s = run_single_teacache(
+            unet, clip, vae, SMOKE_FULL, SMOKE_NEGATIVE,
+            TeacacheConfig.from_dict(cfg.to_dict()),
+            seed=seed, steps=steps, sampler=sampler, scheduler=scheduler,
+            width=512, height=512, cfg_val=cfg_val, return_latent=True,
+            corrector="__zero_init__",
+        )
+    finally:
+        cudnn.deterministic, cudnn.benchmark = old_det, old_bench
+
+    eq = torch.equal(lat_a[0], lat_b[0]) if isinstance(lat_a, tuple) else torch.equal(lat_a, lat_b)
+    lat_b = lat_b[0] if isinstance(lat_b, tuple) else lat_b
+    print(f"  zero-init Mode B′ ≡ Mode A (exact): {eq}")
+    assert eq, "zero-init corrector must reproduce Mode A exactly"
+    assert lat_b.ndim == 4 and lat_b.shape[1] == 16, f"unexpected latent shape {lat_b.shape}"
+    print(f"  latent shape/dtype: {tuple(lat_b.shape)} {lat_b.dtype}  "
+          f"skip rate: {cs_b/max(ts_b,1):.1%}")
+
+    # Live corrector: output shape/dtype sane and (when skips occur) different.
+    corr = CorrectorUNet2D(CorrectorConfig.for_size("tiny"))
+    with torch.no_grad():
+        corr.head_conv.weight.normal_(0, 0.02)
+    tmp = Path(tempfile.gettempdir()) / "smoke_corrector.safetensors"
+    save_corrector(corr, tmp, corr.cfg)
+    lat_c, _t, ts_c, cs_c, _d, slots_c = run_single_teacache(
+        unet, clip, vae, SMOKE_FULL, SMOKE_NEGATIVE,
+        TeacacheConfig.from_dict(cfg.to_dict()),
+        seed=seed, steps=steps, sampler=sampler, scheduler=scheduler,
+        width=512, height=512, cfg_val=cfg_val, return_latent=True,
+        corrector=str(tmp),
+    )
+    lat_c = lat_c[0] if isinstance(lat_c, tuple) else lat_c
+    lat_a = lat_a[0] if isinstance(lat_a, tuple) else lat_a
+    assert lat_c.shape == lat_a.shape and lat_c.dtype == lat_a.dtype
+    if cs_c > 0:
+        assert not torch.equal(lat_c, lat_a), "live corrector must change the output"
+        print(f"  live corrector: shape/dtype ok, output changed on {cs_c} skip steps")
+        print(f"  per-slot correction stats: { {k: v for k, v in slots_c.items()} }")
+    else:
+        print("  ⚠ no skip steps in this run — live-corrector equality path not exercised")
+    print(f"  Corrector smoke OK")
 
 
 def _run_artist_system_test():
@@ -678,6 +762,47 @@ def _run_estimator_test():
     print(f"  Estimator test: all checks passed.\n")
 
 
+def _run_corrector_solver_test():
+    """CPU-only: size-target parser, width/depth solver, profile invariants."""
+    from .corrector import CorrectorConfig, parse_param_target, estimate_corrector_flops
+
+    assert parse_param_target("50M") == 50e6
+    assert parse_param_target("1.5b") == 1.5e9
+    assert parse_param_target("800k") == 8e5
+    assert parse_param_target("tiny") == 1_830_000
+    for spec, target in [("tiny", 1.83e6), ("2m", 2e6), ("5m", 5e6),
+                         ("20m", 20e6), ("50M", 50e6), ("100M", 1e8),
+                         ("1.5B", 1.5e9)]:
+        cfg = CorrectorConfig.for_size(spec)
+        n = cfg.achieved_params
+        assert abs(n - target) / target <= 0.06, f"{spec}: {n/1e6:.2f}M achieved"
+        c0, c1, c2 = cfg.channels
+        assert (c0, c1, c2) == (cfg.bottleneck_dim // 4, cfg.bottleneck_dim // 2,
+                                cfg.bottleneck_dim), "channel profile 1:2:4"
+        assert cfg.bottleneck_dim % 4 == 0 and cfg.bottleneck_dim % cfg.heads == 0
+        assert 24 <= cfg.bottleneck_dim // cfg.heads <= 48, "head_dim ≈ 32"
+        assert cfg.num_blocks >= 1
+        print(f"  [{spec:5s}] {n/1e6:7.2f}M achieved  depth={cfg.num_blocks} "
+              f"bn={cfg.bottleneck_dim} heads={cfg.heads}  "
+              f"flops/pass @512² ≈ {estimate_corrector_flops(cfg)/1e9:.0f} GFLOP")
+    # manual depth: deeper ⇒ narrower at a fixed target
+    a = CorrectorConfig.for_size("20M", depth=2)
+    b = CorrectorConfig.for_size("20M", depth=8)
+    assert b.bottleneck_dim < a.bottleneck_dim
+    assert abs(a.achieved_params - a.target_params) / a.target_params <= 0.06
+    print(f"  manual depth: depth=2 → bn {a.bottleneck_dim}, depth=8 → bn "
+          f"{b.bottleneck_dim} (narrower at fixed target)")
+    # closed-form achieved == real construction
+    m = CorrectorUNet2D(CorrectorConfig.for_size("20m"))
+    assert m.num_params() == a.achieved_params or abs(m.num_params() - a.achieved_params) <= 1
+    try:
+        CorrectorConfig.for_size("20m", depth=9)
+        raise AssertionError("depth=9 must be rejected")
+    except ValueError:
+        pass
+    print("  Corrector size-solver test: OK\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description="TeaCache Anima Smoke Test")
     parser.add_argument("--comfy-dir", required=True,
@@ -685,6 +810,7 @@ def main():
     parser.add_argument("--steps", type=int, default=30,
                         help="Number of sampling steps (default: 30)")
     args = parser.parse_args()
+    _run_corrector_solver_test()
     _run_estimator_test()
     _run_artist_system_test()
     success = run_smoke_test(args.comfy_dir, args.steps)

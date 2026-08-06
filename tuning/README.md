@@ -68,6 +68,144 @@ The smoke test runs all four phases on a tiny dataset to verify everything works
 
 ---
 
+## Latent-Space Refiner (Mode B′)
+
+An optional **latent correction model** ("corrector") that post-processes TeaCache
+skip-step velocities toward the true velocity: `v_final = v_MA + trust·Δv̂`.
+Mode A (the shipped preset behavior) is byte-for-byte unchanged and remains the
+default; with a zero-initialized corrector, Mode B′ reproduces Mode A exactly.
+
+### Pipeline stages
+
+```
+calibrate.py --refiner-data both|only
+    └── outputs/<ts>/refiner_data/         # per-step x_t / v_MA ladder / v_true (lossless blosc2)
+probe_refiner.py --data ...                # codec + learnability + Day-1 verdict
+train_corrector.py --data ...              # corrector-{size}.safetensors → models/
+validate.py --corrector models/corrector-20m.safetensors   # A/B, sanity + shipping gates
+distill_corrector.py --teacher ...         # K=3→K=1 turbo (optional)
+```
+
+### Recording (plan Task 2)
+
+`--refiner-data {both,off,only}` on `calibrate.py` records, per step per CFG
+slot, the raw latent `x_t`, the Mode-A skip reconstruction `v_MA(d)` for every
+lag in the ladder (built from a per-slot residual ring buffer — bit-for-bit the
+deployment skip construction), and the true velocity `v_true` (the d=0 anchor
+is synthesized at load). The recorder runs the full model every step — no
+TeaCache decisions — so the data is config-independent.
+
+```bash
+python -m tuning.calibrate --comfy-dir . --refiner-data only \
+    --refiner-lags "1,2,4,8,16" --prompts 1 --seeds 34635345
+```
+
+| Flag | Meaning |
+|---|---|
+| `--refiner-data` | `both` = scalar JSONL + latent data, `only` = latent data only, `off` = today's behavior |
+| `--refiner-top-n` | keep the N most volatile generations per resolution (`-1` = keep all) |
+| `--refiner-resolutions` | override `sampling.resolution_mix` (e.g. `512x512:0.8,1024x1024:0.2`) |
+| `--refiner-lags` | staleness ladder (default `1,2,4,8,16`) |
+
+Disk (lossless blosc2): ≈ **27 MB per generation @512², both slots** (30 steps:
+per step per slot `x_t` 107 KB + 5×`v_MA` 51 KB + `v_true` 51 KB + 2×1.3 MB
+prompts). 140 generations ≈ 3.8 GB; 360 all-512² ≈ 9.9 GB. The ring buffer
+lives on GPU: ~128 MB (bf16 model) or ~256 MB (fp16 model) @512² both slots.
+
+### Probe (plan Task 3)
+
+```bash
+python -m tuning.probe_refiner --comfy-dir .          # record 3–5 gens + analyze
+python -m tuning.probe_refiner --data outputs/<ts>/refiner_data   # analyze only
+```
+
+Writes `refiner_probe_report.json` next to the data dir: codec bits/element per
+tensor type, the t-gap-cancellation ratio (`|Δ_MA|` vs `|v_true(t)−v_true(t−1)|`
+— must be < 1), Δ_MA SVD rank, the linear predictability ceiling (1−R² of the
+best per-channel affine `v_MA → v_true`), the per-region staleness curve, and
+the Day-1 experiment verdict (tiny UNet beats the linear ceiling by ≥25% →
+build the full corrector). `train_corrector` reads the ceiling from this
+report for its did-it-learn gate.
+
+### Training (plan Task 6)
+
+```bash
+python -m tuning.train_corrector --data outputs/<ts>/refiner_data \
+    --multipass 1 --model-size 20m --depth auto --optimizer sophia --max-steps 60000
+```
+
+- **Precedence**: `refiner_training` in `tuning/config.json` provides every
+  default; CLI flags override config; the effective post-override config is
+  snapshotted into checkpoint metadata; `--resume` warns on config drift.
+- **Size & depth**: `--model-size` is a *parameter target*, not a fixed
+  architecture — `5M`, `20m`, `50M`, `1.5B` (K/M/B suffixes) or `tiny` (the
+  Day-1 probe UNet, ~1.83M). The width ladder is solved to land within ±5%
+  of the target while keeping the architecture profile intact (channels
+  1:2:4, bottleneck = 4× the first stage, head_dim ≈ 32, mlp_ratio 4, fixed
+  prompt/cond widths). `--depth {auto,1..8}` sets the DiT bottleneck block
+  count: `auto` grows width first and only adds blocks past the canonical
+  ceiling (bottleneck ≈ 640); a manual depth scales the widths down to
+  compensate (`w ∝ 1/√depth` at fixed params). The default `20m` ≈ 20M
+  params. The achieved count is printed at construction and stored in
+  checkpoint metadata (`target_params`/`achieved_params`); warnings fire
+  when the target can't be hit within tolerance, when it needs depth past
+  the family ceiling, or when one pass approaches ~1% of a full model step
+  @512² (the corrector stops being a cheap post-hook).
+- **Multipass**: K≤3 on-policy deep supervision (K curriculum 1→3, masked-K
+  batching, stop-grad between passes). Inference default K=1.
+- **Optimizers**: `sophia` (Gauss-Newton-Bartlett, lr 4e-4, ρ=0.04, k=10 —
+  implemented in `train_corrector.py` per the plan deep-dive), `adamw`,
+  `ademamix`, `schedulefree`. fp16 autocast + GradScaler throughout.
+- **Eval every 500 steps**: per-lag rel-MSE slices at K=1,2,3, plus the gates —
+  did-it-learn (beats the probe ceiling by ≥20% within 6 evals), K-robustness
+  gap and per-lag coverage warnings.
+- **Outputs** (`models/`): `corrector-{size}-{step}.safetensors` per eval,
+  `corrector-{size}-best.safetensors`, `corrector-{size}-train.pt` (resume
+  state), final `corrector-{size}.safetensors` (EMA, fp16, K_recommended=1).
+
+Distillation (optional, plan Task 6l):
+
+```bash
+python -m tuning.distill_corrector --teacher models/corrector-20m.safetensors \
+    --data outputs/<ts>/refiner_data --student-size 5m --mode gkd
+# → models/corrector-5m-turbo.safetensors (K_recommended=1)
+```
+
+### Inference knobs (plan Task 5)
+
+Both nodes (`TeaCacheAnima`, `TeaCacheAnimaAdvanced`) gain optional inputs:
+
+- `corrector`: `off` | `latent_denoiser` (empty/missing `corrector_model`
+  falls back to Mode A with a warning)
+- `corrector_model`: path to a `.safetensors` checkpoint
+- `refine_passes`: K (1–4, default 1)
+- `corrector_trust`: `v_final = v_MA + trust·(v̂ − v_MA)` (default 1.0)
+
+The info string shows `mode=B(K=…)` vs `mode=A`. The corrector is compiled
+standalone (`torch.compile`, "reduce-overhead", cached per path+device; set
+`TEA_CACHE_NO_COMPILE=1` to disable). A warning is printed when the model has
+patches/LoRA (weights were trained on anima-base-v1.0 outputs).
+
+### A/B validation + gates (plan Task 7)
+
+```bash
+python -m tuning.validate --comfy-dir . --pareto outputs/optimization/pareto_frontier.json \
+    --corrector models/corrector-20m.safetensors --corrector-passes 1
+```
+
+With `--corrector`, every validated config also runs in Mode B′; the report
+contains the per-(resolution, steps) A/B table (LPIPS/skip-rate/speedup, per
+config), per-slot correction magnitudes (surfaces CFG amplification of
+uncond-slot errors), the skip-run length distribution (`validation_drift.json`),
+the **sanity gate** (zero-init Mode B′ ≡ Mode A bitwise) and the **shipping
+gate** (Mode B′ ≥ Mode A LPIPS in ≥70% of cells AND ≥5% better on the
+aggressive half of the threshold curve). Only a passing shipping gate makes
+Mode B′ a default for new users — until then it is an opt-in experimental toggle.
+
+---
+
+
+
 ## Phase 4: Build Presets
 
 `build_presets.py` converts the Pareto frontier into a file the TeaCacheAnima node can read at ComfyUI startup.

@@ -21,3 +21,17 @@ blosc2>=2.0
 # Core numerical dependencies (already in ComfyUI, listed for completeness)
 numpy>=1.26
 torch>=2.4
+
+# ── Latent refiner / corrector training (plan Task 6a, Task 8) ──────────
+# safetensors: corrector checkpoint format (Task 4c/6i)
+# tqdm: training progress bars
+# pytorch-optimizer: AdEMAMix / Schedule-Free AdamW (Sophia is implemented
+#   in train_corrector.py per plan deep-dive §1.2 — Gauss-Newton-Bartlett)
+safetensors>=0.4
+tqdm>=4.60
+pytorch-optimizer>=3.0
+
+# Optional probe extras (plan Task 3a) — lossless/lossy codec candidates.
+# zfpy is already used by refiner_data.py when installed (codec 2).
+zfpy>=0.5.5
+fpzip>=1.0
