@@ -735,7 +735,7 @@ def _run_estimator_test():
 
     # 3) Hardware fallback before measurements → measured means after
     hw_total = est.eta_seconds(0)
-    assert abs(hw_total - (3 * 12.3 + 3 * 44.7)) < 1e-6, f"hw total {hw_total}"
+    assert abs(hw_total - (3 * 16.0 + 3 * 61.0)) < 1e-6, f"hw total {hw_total}"
     for i in range(3):
         est.record(sched[i], 4.0)
     for i in range(3, 6):

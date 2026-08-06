@@ -20,9 +20,9 @@ Usage:
     python -m tuning.calibrate --comfy-dir /path/to/ComfyUI \
         --refiner-data only --refiner-lags "1,2,4,8,16" --prompts 1 --seeds 34635345
 
-Runtime estimate (A100-40GB):
+Runtime estimate (A100-40GB, V100 constants refit 2026-08):
     24 prompts × 4 seeds × 5 step variants = 480 generations
-    ~12 seconds per generation → ~96 minutes total
+    ~16 seconds per generation at 512²/30st (V100) → ~1 hour total on A100
 """
 
 import argparse
@@ -375,6 +375,8 @@ def run_calibration(comfy_dir: str, config_path: str = None, overrides: dict = N
         print(f"    {i:>2}: [{sampler} cfg={cfg_val}]  [{', '.join(tags)}]  {short}...")
 
     total_runs = len(prompts) * len(seeds) * len(step_variants)
+    w = tcfg.sampling["width"]
+    h = tcfg.sampling["height"]
 
     # Deterministic resolution assignments: seeded RNG, one draw per run
     # index, independent of prompt/seed/step selection (plan Task 1).
@@ -409,8 +411,6 @@ def run_calibration(comfy_dir: str, config_path: str = None, overrides: dict = N
     avg_steps = sum(s.steps for s in schedule) / max(total_runs, 1)
     est_entries = int(total_runs * (avg_steps - 1) * 2)
 
-    w = tcfg.sampling["width"]
-    h = tcfg.sampling["height"]
     permutation = f"{len(prompts)} prompts \u00d7 {len(seeds)} seeds \u00d7 {len(step_variants)} step variants = {total_runs} total generations"
 
     extra_lines = [

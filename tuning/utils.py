@@ -307,17 +307,26 @@ def print_metrics_legend():
 #  GPU detection + timing estimates
 # ═══════════════════════════════════════════════════════════════════════════
 
-# Baseline: V100 (125 FP16 TFLOPS) does 30 steps at 512² in ~12 seconds
-# for Anima/Cosmos-Predict2.  That gives ~0.40 s/step at 512².
-_V100_SECONDS_PER_STEP_AT_512SQ = 0.40
+# Baseline: V100 (125 FP16 TFLOPS) for Anima/Cosmos-Predict2, refitted from a
+# 360-generation calibration run (2026-08-06, refiner recording ON):
+#   512²:      15st 8.0s, 30st 17.4s, 45st 26.8s
+#   1024²:     15st 25.4s, 30st 54.6s, 45st 84.8s
+#   1024×512:  15st 12.2s, 30st 26.7s, 45st 40.5s
+# A linear least-squares fit (fixed + per-pixel-step) over all nine buckets
+# gives ~1.0 s fixed + ~0.46 s × pixel_ratio × steps; rounding the per-step
+# term up to 0.50 keeps the schedule total within ~1% of the measured 2h 17m
+# and errs slightly high at high resolution / low step counts.  Residual bias
+# remains: per-step cost rises with step count (0.53 → 0.60 s/step at 512²)
+# and superlinearly with pixels (attention), which two terms cannot capture.
+_V100_SECONDS_PER_STEP_AT_512SQ = 0.53
 
 # The refined timing model (ScheduleEstimator) splits that baseline into a
 # per-generation fixed overhead (CLIP encode, VAE decode, patching, cache
 # clears — mostly CPU/VRAM-bound) and a per-pixel-step compute cost, so
 # resolution mixes and step mixes are accounted for exactly:
-#   1.5 s fixed + 0.36 s × pixel_ratio × steps ≈ 12 s @ 512², 30 steps.
-_V100_FIXED_OVERHEAD_SEC = 1.5
-_V100_SECONDS_PER_PIXEL_STEP_AT_512SQ = 0.36
+#   1.0 s fixed + 0.50 s × pixel_ratio × steps ≈ 16 s @ 512², 30 steps.
+_V100_FIXED_OVERHEAD_SEC = 1.0
+_V100_SECONDS_PER_PIXEL_STEP_AT_512SQ = 0.50
 
 # Assumed NVMe bandwidth for refiner latent recording (lossless writes).
 _REFINER_WRITE_BANDWIDTH_BYTES_PER_SEC = 1.0e9
@@ -780,8 +789,8 @@ def print_schedule_estimate(
       Resolution:   512x512 75.0%, 1024x1024 15.0%, 1024x512 10.0%
                     (avg pixel ratio ×1.55, eff. ~637px)
       Steps:        15 steps ×60, 30 steps ×240, 45 steps ×60
-      Est. compute: ~44m (denoising)  + ~4m (fixed/gen)  + ~0.5m (refiner write)
-      Est. time:    ~48m
+      Est. compute: ~1h 01m (denoising)  + ~3m (fixed/gen)  + ~0.5m (refiner write)
+      Est. time:    ~1h 04m
       Excludes:     model load/startup
       ──────────────────────────────────────────────────────────
     """
