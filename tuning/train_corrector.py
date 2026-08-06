@@ -225,6 +225,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                              "(record_lags order)")
     parser.add_argument("--normalization", type=str, default=None,
                         choices=["none", "perchannel"])
+    parser.add_argument("--normalization-samples", type=int, default=None,
+                        help="Pairs subsampled for normalization/ε stats "
+                             "(config: normalization_samples)")
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--eval-every", type=int, default=None)
     parser.add_argument("--compile", type=int, default=None,
@@ -265,6 +268,7 @@ def resolve_config(args: argparse.Namespace) -> dict:
         "loss": ("loss", "rel_mse"),
         "lag_weights": ("lag_weights", [1, 1, 1, 1, 1]),
         "normalization": ("normalization", "none"),
+        "normalization_samples": ("normalization_samples", 128),
         "max_steps": ("max_steps", 60000),
         "eval_every": ("eval_every", 500),
         "seed": ("seed", 42),
@@ -292,6 +296,11 @@ def resolve_config(args: argparse.Namespace) -> dict:
             cfg["depth"].isdigit() and 1 <= int(cfg["depth"]) <= 8):
         raise SystemExit(f"[train_corrector] invalid --depth {cfg['depth']!r} "
                          f"(auto or 1-8)")
+    cfg["normalization_samples"] = max(0, int(cfg["normalization_samples"]))
+    if cfg["normalization"] == "perchannel" and cfg["normalization_samples"] < 1:
+        raise SystemExit(f"[train_corrector] normalization=perchannel needs "
+                         f"--normalization-samples >= 1, got "
+                         f"{cfg['normalization_samples']}")
     cfg["out"] = args.out or str(Path(__file__).resolve().parent.parent / "models")
     cfg["data"] = args.data
     cfg["resume"] = args.resume
@@ -474,12 +483,13 @@ def main(argv=None):
         seed=cfg["seed"],
         lag_weights=cfg["lag_weights"],
         compute_normalization=(cfg["normalization"] == "perchannel"),
-        normalization_samples=512,
+        normalization_samples=cfg["normalization_samples"],
+        show_progress=not cfg["no_progress"],
     )
     if not len(ds):
         raise SystemExit("[train_corrector] no training pairs (all generations eval?)")
     print(f"  Training pairs: {len(ds)}   eval pairs: "
-          f"{len(CorrectorDataset(data_dir, only_eval=True))}")
+          f"{len(CorrectorDataset(data_dir, only_eval=True, normalization_samples=0))}")
 
     sampler = CorrectorBatchSampler(ds, batch_size=cfg["batch_size"], seed=cfg["seed"])
     loader = DataLoader(ds, batch_sampler=sampler, collate_fn=collate_corrector,
@@ -489,7 +499,8 @@ def main(argv=None):
           f"(~{cfg['max_steps'] / steps_per_epoch:.1f} epochs over {cfg['max_steps']} steps)")
     eval_loader = None
     try:
-        eval_ds = CorrectorDataset(data_dir, only_eval=True, seed=cfg["seed"])
+        eval_ds = CorrectorDataset(data_dir, only_eval=True, seed=cfg["seed"],
+                                   normalization_samples=0)
         eval_sampler = CorrectorBatchSampler(eval_ds, batch_size=16, seed=cfg["seed"] + 1)
         eval_loader = DataLoader(eval_ds, batch_sampler=eval_sampler,
                                  collate_fn=collate_corrector, num_workers=0)

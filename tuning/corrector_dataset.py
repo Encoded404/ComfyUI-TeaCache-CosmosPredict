@@ -31,6 +31,11 @@ from torch.utils.data import Dataset, Sampler
 
 from . import refiner_data
 
+try:
+    from tqdm import tqdm
+except ImportError:  # progress bars are optional (requirements: tqdm)
+    tqdm = None
+
 MAX_CACHED_GENERATIONS = 8
 
 
@@ -48,8 +53,9 @@ class CorrectorDataset(Dataset):
     def __init__(self, data_dir, include_eval: bool = False, only_eval: bool = False,
                  seed: int = 42, lag_weights: Optional[List[float]] = None,
                  rel_mse_eps_scale: float = 1e-4,
-                 normalization_samples: int = 512,
-                 compute_normalization: bool = False):
+                 normalization_samples: int = 128,
+                 compute_normalization: bool = False,
+                 show_progress: bool = True):
         data_dir = Path(data_dir)
         self.data_dir = data_dir
         self.seed = seed
@@ -99,7 +105,7 @@ class CorrectorDataset(Dataset):
         self.normalization_stats: Optional[dict] = None
         self.rel_mse_eps: float = 1e-8
         if compute_normalization or normalization_samples > 0:
-            self._compute_stats(normalization_samples)
+            self._compute_stats(normalization_samples, show_progress)
 
     # ── generation loading ─────────────────────────────────────────────
 
@@ -115,35 +121,35 @@ class CorrectorDataset(Dataset):
             self._gen_cache.popitem(last=False)
         return gen
 
-    def _compute_stats(self, n_samples: int):
-        means, sqs, counts = [], [], []
+    def _compute_stats(self, n_samples: int, show_progress: bool = True):
+        """Per-channel mean/std of the 32ch input (x_t ⊕ v_MA) and the rel-MSE ε
+        floor, from one shared random subsample — one load per pair (plan 6d/6f)."""
+        means, sqs, v_sq = [], [], []
         idxs = list(range(len(self.pairs)))
         self.rng.shuffle(idxs)
+        pbar = None
+        if show_progress and tqdm is not None and n_samples > 0:
+            pbar = tqdm(total=min(n_samples, len(idxs)), desc="dataset stats",
+                        unit="pair", leave=False, dynamic_ncols=True)
         n = 0
         for i in idxs:
             if n >= n_samples:
                 break
-            x, v, _, _ = self._load_pair(i)
+            x, v, vt, _ = self._load_pair(i)
             z = torch.cat([x, v], dim=0).float()
             means.append(z.mean(dim=(1, 2)))
             sqs.append((z * z).mean(dim=(1, 2)))
+            v_sq.append(vt.float().square().mean().item())
             n += 1
+            if pbar is not None:
+                pbar.update(1)
+        if pbar is not None:
+            pbar.close()
         if n:
             mean = torch.stack(means).mean(dim=0)
             var = torch.stack(sqs).mean(dim=0) - mean * mean
             std = var.clamp_min(1e-6).sqrt()
             self.normalization_stats = {"mean": mean.tolist(), "std": std.tolist()}
-        # rel-MSE ε floor: relative to the dataset mean ||v_true||² (plan 6f)
-        v_sq = []
-        self.rng.shuffle(idxs)
-        n = 0
-        for i in idxs:
-            if n >= n_samples:
-                break
-            _, _, vt, _ = self._load_pair(i)
-            v_sq.append(vt.float().square().mean().item())
-            n += 1
-        if v_sq:
             mean_v_sq = sum(v_sq) / len(v_sq)
             self.rel_mse_eps = max(mean_v_sq * self.rel_mse_eps_scale, 1e-8)
 

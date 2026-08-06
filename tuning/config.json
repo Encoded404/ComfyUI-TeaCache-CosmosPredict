@@ -124,7 +124,8 @@
         "max_steps": 60000,
         "eval_every": 500,
         "ema_decay": 0.9999,
-        "normalization": "none",
+        "normalization": "perchannel",
+        "normalization_samples": 128,
         "lag_weights": [1, 1, 1, 1, 1],
         "seed": 42
     },
