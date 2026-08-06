@@ -159,6 +159,12 @@ python -m tuning.train_corrector --data outputs/<ts>/refiner_data \
 - **Eval every 500 steps**: per-lag rel-MSE slices at K=1,2,3, plus the gates —
   did-it-learn (beats the probe ceiling by ≥20% within 6 evals), K-robustness
   gap and per-lag coverage warnings.
+- **Progress & metrics**: live tqdm bar (EMA loss, lr, K, it/s, remaining),
+  per-50-step log lines with ETA, and a per-eval timing report (train / eval /
+  hessian phases; the ETA projects eval + checkpoint overhead). Step + eval
+  scalars go to `train_metrics.jsonl` (JSONL) next to the checkpoints
+  (`--no-progress` disables the bar; `--metrics PATH` relocates the log;
+  `--resume` reports the previously elapsed wall time).
 - **Outputs** (`models/`): `corrector-{size}-{step}.safetensors` per eval,
   `corrector-{size}-best.safetensors`, `corrector-{size}-train.pt` (resume
   state), final `corrector-{size}.safetensors` (EMA, fp16, K_recommended=1).

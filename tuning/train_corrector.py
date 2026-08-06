@@ -14,7 +14,12 @@ pairs from a refiner recording run (``outputs/<ts>/refiner_data``). Supports:
   the plan's gates (did-it-learn vs the probe's linear ceiling, per-lag
   coverage, K-robustness gap) — plan 6h;
 - checkpointing: EMA .safetensors per eval + best-by-eval + full-state .pt
-  resume with config-drift warning (plan 6i).
+  resume with config-drift warning (plan 6i);
+- live reporting: tqdm progress bar (EMA loss, lr, K, it/s, remaining),
+  per-50-step durable log lines, per-eval timing reports (train/eval/hessian
+  phases; the ETA projects eval + checkpoint overhead), VRAM peak, and a
+  JSONL metrics file (``train_metrics.jsonl`` next to the checkpoints;
+  ``--metrics`` relocates, ``--no-progress`` disables the bar).
 
 Every flag defaults to the ``refiner_training`` config section
 (config.json); CLI flags override config (calibrate.py precedence pattern).
@@ -23,7 +28,7 @@ The effective post-override config is snapshotted into checkpoint metadata.
 Usage:
     python -m tuning.train_corrector --data outputs/<ts>/refiner_data
     python -m tuning.train_corrector --data outputs/<ts>/refiner_data \
-        --multipass 0 --model-size 5m --max-steps 2000
+        --multipass 0 --model-size 5m --max-steps 2000 --no-progress 1
 """
 
 import argparse
@@ -42,8 +47,14 @@ from .corrector import (CorrectorConfig, CorrectorUNet2D, FULL_STEP_FLOP_512,
                         estimate_corrector_flops, save_corrector)
 from .corrector_dataset import (CorrectorBatchSampler, CorrectorDataset,
                                 augment_batch, collate_corrector)
+from .utils import TrainTimer, format_duration
 
 from torch.utils.data import DataLoader
+
+try:
+    from tqdm import tqdm
+except ImportError:  # progress bars are optional (requirements: tqdm)
+    tqdm = None
 
 # ── Losses (plan 6f) ──────────────────────────────────────────────────
 
@@ -224,6 +235,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="Resume from a full-state .pt checkpoint")
     parser.add_argument("--out", type=str, default=None,
                         help="Checkpoint output dir (default: <repo>/models)")
+    parser.add_argument("--metrics", type=str, default=None,
+                        help="JSONL metrics path (default: <out>/train_metrics.jsonl)")
+    parser.add_argument("--no-progress", type=int, default=None,
+                        help="Disable tqdm progress bars (default: auto TTY detect)")
     return parser.parse_args(argv)
 
 
@@ -280,6 +295,8 @@ def resolve_config(args: argparse.Namespace) -> dict:
     cfg["out"] = args.out or str(Path(__file__).resolve().parent.parent / "models")
     cfg["data"] = args.data
     cfg["resume"] = args.resume
+    cfg["metrics"] = args.metrics or str(Path(cfg["out"]) / "train_metrics.jsonl")
+    cfg["no_progress"] = bool(args.no_progress) if args.no_progress is not None else False
     return cfg
 
 
@@ -324,12 +341,16 @@ def compute_train_loss(model, batch, Ks: torch.Tensor, loss_fn, eps: float,
 
 
 def eval_model(model, eval_loader, lags: List[int], ks: List[int],
-               device, eps: float) -> Dict:
+               device, eps: float, show_progress: bool = False) -> Dict:
     """Per-lag, per-K rel-MSE (‖v̂−v_true‖₂/‖v_true‖₂) and cosine."""
     model.eval()
     acc = {(k, lag): [0.0, 0.0, 0] for k in ks for lag in lags}
+    batches = eval_loader
+    if show_progress and tqdm is not None:
+        batches = tqdm(eval_loader, desc="eval", unit="batch", leave=False,
+                       dynamic_ncols=True, mininterval=0.5)
     with torch.no_grad():
-        for batch in eval_loader:
+        for batch in batches:
             x = batch["x_t"].to(device)
             v0 = batch["v_ma"].to(device)
             vt = batch["v_true"].to(device)
@@ -375,7 +396,8 @@ def load_linear_ceiling(data_dir: Path) -> Optional[float]:
 # ── Checkpointing (plan 6i) ───────────────────────────────────────────
 
 
-def save_full_state(path, model, ema, opt, scaler, scheduler, step, cfg, best):
+def save_full_state(path, model, ema, opt, scaler, scheduler, step, cfg, best,
+                    best_step: Optional[int] = None, wall_s: Optional[float] = None):
     torch.save({
         "model": model.state_dict(),
         "ema": ema,
@@ -384,6 +406,8 @@ def save_full_state(path, model, ema, opt, scaler, scheduler, step, cfg, best):
         "scheduler": scheduler.state_dict() if scheduler is not None else None,
         "step": step,
         "best": best,
+        "best_step": best_step,
+        "wall_s": wall_s,
         "config_snapshot": cfg,
     }, path)
 
@@ -396,6 +420,24 @@ def config_drift(snapshot: dict, cfg: dict) -> List[str]:
         if snapshot.get(k) != cfg.get(k):
             drift.append(f"  {k}: checkpoint={snapshot.get(k)!r} current={cfg.get(k)!r}")
     return drift
+
+
+class MetricsLog:
+    """JSONL sink for training scalars (step rows) and eval rows.
+
+    One JSON object per line, flushed per write — ``tail -f`` friendly.
+    """
+
+    def __init__(self, path: str):
+        self.path = Path(path)
+        self._f = open(self.path, "a")
+
+    def write(self, row: Dict) -> None:
+        self._f.write(json.dumps(row, default=str) + "\n")
+        self._f.flush()
+
+    def close(self) -> None:
+        self._f.close()
 
 
 # ── Main ──────────────────────────────────────────────────────────────
@@ -426,6 +468,7 @@ def main(argv=None):
           f"max_steps={cfg['max_steps']}")
     print(f"  Device:         {device}")
 
+    print("  Preparing dataset (pair index + normalization stats)...")
     ds = CorrectorDataset(
         data_dir,
         seed=cfg["seed"],
@@ -441,6 +484,9 @@ def main(argv=None):
     sampler = CorrectorBatchSampler(ds, batch_size=cfg["batch_size"], seed=cfg["seed"])
     loader = DataLoader(ds, batch_sampler=sampler, collate_fn=collate_corrector,
                         num_workers=0)
+    steps_per_epoch = max(len(sampler), 1)
+    print(f"  Batches/epoch:  {steps_per_epoch}   "
+          f"(~{cfg['max_steps'] / steps_per_epoch:.1f} epochs over {cfg['max_steps']} steps)")
     eval_loader = None
     try:
         eval_ds = CorrectorDataset(data_dir, only_eval=True, seed=cfg["seed"])
@@ -465,6 +511,7 @@ def main(argv=None):
     step = 0
     ema = init_ema(model)
     best = None
+    best_step: Optional[int] = None
     opt = None
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
     scheduler = None
@@ -519,6 +566,7 @@ def main(argv=None):
             scheduler.load_state_dict(sd["scheduler"])
         step = int(sd["step"])
         best = sd.get("best")
+        best_step = sd.get("best_step")
         snapshot = sd.get("config_snapshot") or {}
         drift = config_drift(snapshot, cfg)
         if drift:
@@ -526,8 +574,12 @@ def main(argv=None):
             print("\n".join(drift))
         else:
             print(f"  Resumed from {cfg['resume']} at step {step}")
+        if sd.get("wall_s") is not None:
+            print(f"  Previously elapsed: {format_duration(sd['wall_s'])}")
+    ema_model = CorrectorUNet2D(ccfg).to(device)
     if cfg["compile"]:
         model = torch.compile(model, mode="reduce-overhead")
+        print("  torch.compile enabled — first steps include compile latency")
 
     loss_fn = LOSS_FNS[cfg["loss"]]
     eps = ds.rel_mse_eps
@@ -553,8 +605,25 @@ def main(argv=None):
     aug_rng = random.Random(cfg["seed"] + 1000)
     iter_loader = iter(loader)
     t_start = time.time()
+    timer = TrainTimer(window=100)
+    metrics = MetricsLog(cfg["metrics"])
+    loss_ema: Optional[float] = None
+    min_loss = float("inf")
+    pbar = None
+    if tqdm is not None and not cfg["no_progress"]:
+        pbar = tqdm(total=cfg["max_steps"], desc="train", unit="step",
+                    dynamic_ncols=True, mininterval=0.5)
+
+    def emit(line: str) -> None:
+        """Print a log line above the progress bar (bar-safe)."""
+        if pbar is not None:
+            pbar.write(line)
+        else:
+            print(line)
+
     while step < cfg["max_steps"]:
         step += 1
+        t_step0 = time.time()
         try:
             batch = next(iter_loader)
         except StopIteration:
@@ -570,8 +639,7 @@ def main(argv=None):
                            device=device)
 
         if isinstance(opt, SophiaG) and step % cfg["hessian_every"] == 0:
-            with torch.no_grad():
-                pass
+            t_h0 = time.time()
             with torch.autocast("cuda", enabled=False):
                 dv = model(batch["x_t"].float(), batch["v_ma"].float(),
                            batch["prompt"].float(), batch["t_frac"].float(),
@@ -579,6 +647,7 @@ def main(argv=None):
                 loss_h = per_sample_rel_mse(batch["v_ma"].float() + dv,
                                             batch["v_true"].float(), eps).mean()
             opt.update_hessian(loss_h)
+            timer.add("hessian", time.time() - t_h0)
 
         opt.zero_grad(set_to_none=True)
         with torch.autocast("cuda", dtype=torch.float16):
@@ -586,18 +655,50 @@ def main(argv=None):
                                       cfg["stop_grad"], cfg["multipass"], k_max_cur)
         scaler.scale(loss).backward()
         scaler.unscale_(opt)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         scaler.step(opt)
         scaler.update()
         ema_update(model, ema, step, decay=cfg["ema_decay"])
+        timer.record_step(time.time() - t_step0)
+
+        loss_v = float(loss.item())
+        loss_ema = loss_v if loss_ema is None else 0.99 * loss_ema + 0.01 * loss_v
+        min_loss = min(min_loss, loss_v)
+        grad_norm_v = float(grad_norm) if grad_norm is not None else float("nan")
+
+        if pbar is not None:
+            pbar.set_postfix(
+                loss=f"{loss_ema:.5f}",
+                lr=f"{opt.param_groups[0]['lr']:.1e}",
+                K=k_max_cur,
+                it=f"{timer.steps_per_sec():.2f}/s",
+                rem=format_duration(timer.remaining_seconds(
+                    cfg["max_steps"] - step, cfg["eval_every"])),
+                refresh=False)
+            pbar.update(1)
 
         if step % 50 == 0 or step == 1:
-            print(f"  [train] step {step:>6d}/{cfg['max_steps']}  "
-                  f"loss={loss.item():.5f}  lr={opt.param_groups[0]['lr']:.2e}  "
-                  f"elapsed={time.time()-t_start:.0f}s")
+            wall = time.time() - t_start
+            line = (f"  [train] step {step:>6d}/{cfg['max_steps']}  "
+                    f"loss={loss_v:.5f} (ema {loss_ema:.5f}, min {min_loss:.5f})  "
+                    f"lr={opt.param_groups[0]['lr']:.2e}  "
+                    f"it/s={timer.steps_per_sec():.2f}  "
+                    f"elapsed={format_duration(wall)}  "
+                    f"remaining~{format_duration(timer.remaining_seconds(cfg['max_steps'] - step, cfg['eval_every']))}")
+            emit(line)
+            metrics.write({
+                "type": "step", "step": step,
+                "epoch": step / steps_per_epoch,
+                "loss": loss_v, "loss_ema": loss_ema, "min_loss": min_loss,
+                "grad_norm": grad_norm_v, "lr": opt.param_groups[0]["lr"],
+                "k_max": k_max_cur, "wall_s": wall,
+                "vram_gb": torch.cuda.max_memory_allocated() / (1024 ** 3),
+            })
 
         if step % cfg["eval_every"] == 0 and eval_loader is not None:
-            results = eval_model(model, eval_loader, lags, ks_eval, device, eps)
+            t_e0 = time.time()
+            results = eval_model(model, eval_loader, lags, ks_eval, device, eps,
+                                 show_progress=(pbar is not None))
             k1_pairs = [r["rel_mse"] for (kk, _), r in results.items() if kk == 1]
             k1 = sum(k1_pairs) / max(len(k1_pairs), 1) if k1_pairs else None
             row = "  [eval] step %d  " % step
@@ -605,15 +706,15 @@ def main(argv=None):
                 avg = sum(r["rel_mse"] for (kk, _), r in results.items() if kk == k)
                 n = sum(1 for (kk, _) in results if kk == k)
                 row += f"K{k}={avg/max(n,1):.4f}  "
-            print(row)
+            emit(row)
             for lag in lags:
                 parts = [f"K{k}={results.get((k, lag), {}).get('rel_mse', float('nan')):.4f}"
                          for k in ks_eval]
-                print(f"      lag {lag:>2d}: " + "  ".join(parts))
+                emit(f"      lag {lag:>2d}: " + "  ".join(parts))
             if ceiling is not None and not gate_fired and step >= gate_deadline:
                 if k1 is None or k1 > 0.8 * ceiling:
-                    print("  ✗ BELOW LINEAR CEILING — did-it-learn gate fired; "
-                          "stopping per plan 6h")
+                    emit("  ✗ BELOW LINEAR CEILING — did-it-learn gate fired; "
+                         "stopping per plan 6h")
                     step = cfg["max_steps"]
                     gate_fired = True
             # K-robustness + per-lag coverage (report-only warnings)
@@ -622,26 +723,27 @@ def main(argv=None):
                 r3 = sum(v["rel_mse"] for (kk, _), v in results.items() if kk == max(ks_eval))
                 nk = max(1, sum(1 for (kk, _) in results if kk == 1))
                 if r3 > 0 and (r1 - r3) / r3 > 0.2:
-                    print("  ⚠ K-robustness gap large (K=1 ≫ K=K_max) — consider "
-                          "strengthening the K curriculum (plan 6h)")
+                    emit("  ⚠ K-robustness gap large (K=1 ≫ K=K_max) — consider "
+                         "strengthening the K curriculum (plan 6h)")
             per_lag_k1 = [results.get((1, lag), {}).get("rel_mse", float("nan"))
                           for lag in lags]
             finite = [x for x in per_lag_k1 if x == x]
             if len(finite) >= 3 and finite[0] > 0:
                 growth = (finite[-1] - finite[0]) / finite[0]
                 if growth > 1.5:
-                    print(f"  ⚠ Per-lag rel-MSE grows {growth:.2f}× from lag "
-                          f"{lags[0]} to lag {lags[-1]} — check the per-lag "
-                          "coverage gate (plan 6h); extend record_lags if "
-                          "superlinear")
+                    emit(f"  ⚠ Per-lag rel-MSE grows {growth:.2f}× from lag "
+                         f"{lags[0]} to lag {lags[-1]} — check the per-lag "
+                         "coverage gate (plan 6h); extend record_lags if "
+                         "superlinear")
 
             # Checkpointing (plan 6i)
-            ema_model = CorrectorUNet2D(ccfg).to(device)
             ema_model.load_state_dict(ema)
             cfg_meta = {k: v for k, v in cfg.items()
-                        if k not in ("data", "resume", "out", "compile", "channels_last")}
+                        if k not in ("data", "resume", "out", "compile",
+                                     "channels_last", "metrics", "no_progress")}
             if k1 is not None and (best is None or k1 < best):
                 best = k1
+                best_step = step
                 save_corrector(ema_model, out_dir / f"corrector-{size}-best.safetensors",
                                ccfg, extra_metadata={"config_snapshot": cfg_meta,
                                                      "best_rel_mse_k1": k1})
@@ -652,20 +754,54 @@ def main(argv=None):
                     continue
                 old.unlink(missing_ok=True)
             save_full_state(out_dir / f"corrector-{size}-train.pt", model, ema, opt,
-                            scaler, scheduler, step, cfg, best)
-            print(f"      saved corrector-{size}-{step}.safetensors"
-                  + (f" (best K1={best:.4f})" if best is not None else ""))
+                            scaler, scheduler, step, cfg, best, best_step=best_step,
+                            wall_s=time.time() - t_start)
+            emit(f"      saved corrector-{size}-{step}.safetensors"
+                 + (f" (best K1={best:.4f} @ {best_step})" if best is not None else ""))
+            timer.add("eval", time.time() - t_e0)
+            for line2 in timer.summary_lines(time.time() - t_start, step,
+                                             cfg["max_steps"], cfg["eval_every"]):
+                emit(line2)
+            metrics.write({
+                "type": "eval", "step": step, "k1": k1,
+                "k_avg": {str(k): round(sum(r["rel_mse"] for (kk, _), r in results.items()
+                                            if kk == k) / max(sum(1 for (kk, _) in results if kk == k), 1), 6)
+                          for k in ks_eval},
+                "per_lag": {str(lag): results.get((1, lag), {}).get("rel_mse")
+                            for lag in lags},
+                "best_k1": best, "best_step": best_step, "gate_fired": gate_fired,
+            })
 
     # ── Final (plan 6i) ────────────────────────────────────────────────
-    ema_model = CorrectorUNet2D(ccfg)
     ema_model.load_state_dict(ema)
     final = out_dir / f"corrector-{size}.safetensors"
     cfg_meta = {k: v for k, v in cfg.items()
-                if k not in ("data", "resume", "out", "compile", "channels_last")}
+                if k not in ("data", "resume", "out", "compile",
+                             "channels_last", "metrics", "no_progress")}
     save_corrector(ema_model, final, ccfg,
                    extra_metadata={"config_snapshot": cfg_meta})
-    print(f"\n  Final checkpoint: {final}  (K_recommended=1)")
-    print(f"  Total time: {time.time()-t_start:.0f}s")
+    if pbar is not None:
+        pbar.n = step
+        pbar.total = step
+        pbar.refresh()
+        pbar.close()
+    wall = time.time() - t_start
+    print("\n  ── Training complete ──")
+    print(f"  Steps:        {step}/{cfg['max_steps']}")
+    print(f"  Wall time:    {format_duration(wall)}  (train {format_duration(timer.phase_seconds('train'))}, "
+          f"eval {format_duration(timer.phase_seconds('eval'))}, "
+          f"hessian {format_duration(timer.phase_seconds('hessian'))})")
+    print(f"  Throughput:   {timer.steps_per_sec():.2f} it/s  "
+          f"(median step {timer.step_time() * 1000:.0f} ms)")
+    if loss_ema is not None:
+        print(f"  Loss:         final {loss_v:.5f}   min {min_loss:.5f}   "
+              f"(ema {loss_ema:.5f})")
+    if best is not None:
+        print(f"  Best K1:      {best:.4f} @ step {best_step}")
+    print(f"  VRAM peak:    {torch.cuda.max_memory_allocated() / (1024 ** 3):.1f} GB")
+    print(f"  Metrics:      {cfg['metrics']}")
+    print(f"  Final checkpoint: {final}  (K_recommended=1)")
+    metrics.close()
 
 
 if __name__ == "__main__":
