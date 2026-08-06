@@ -1,7 +1,7 @@
 {
   "_description": "Weighted artist-tag pool for per-generation injection. Weights are SELECTION probabilities (weight_mode 'relative': 3 is 3x as likely as 1; 'static': weights must sum to 1.0). tag null = no artist block. Tags are fed to the model verbatim — escaped parens \\( \\) are intentional (literal parens, since (text) means emphasis).",
   "artists": [
-    { "tag": null, "weight": 60 },
+    { "tag": null, "weight": 40 },
     { "tag": "@shanguier", "weight": 1 },
     { "tag": "@serino itsuki", "weight": 1 },
     { "tag": "@matt frank", "weight": 1 },
@@ -20,7 +20,7 @@
     { "tag": "@m-da s-tarou", "weight": 0.5 },
     { "tag": "@mochi au lait", "weight": 0.5 },
     { "tag": "@kani biimu", "weight": 0.5 },
-    { "tag": "@tsukishiro saika", "weight": 0.5 },
+    { "tag": "@tsukishiro saika", "weight": 1 },
     { "tag": "@shirabi", "weight": 0.5 },
     { "tag": "@taromarun", "weight": 0.5 },
     { "tag": "@toosaka asagi", "weight": 0.5 },
@@ -31,6 +31,15 @@
     { "tag": "@momoko \\(momopoco\\)", "weight": 0.5 },
     { "tag": "@horn/wood", "weight": 0.5 },
     { "tag": "@piromizu", "weight": 0.5 },
-    { "tag": "@rokuwata tomoe", "weight": 0.5 }
+    { "tag": "@rokuwata tomoe", "weight": 0.5 },
+    { "tag": "@haun", "weight": 0.5 },
+    { "tag": "@ecru", "weight": 0.5 },
+    { "tag": "@onikobe rin", "weight": 0.5 },
+    { "tag": "@konpeto", "weight": 0.5 },
+    { "tag": "@nitamago", "weight": 0.5 },
+    { "tag": "@frogsnake", "weight": 0.5 },
+    { "tag": "@waa153", "weight": 0.5 },
+    { "tag": "@basedbinkie", "weight": 0.5 },
+    { "tag": "@ouchi kaeru", "weight": 0.5 }
   ]
 }
