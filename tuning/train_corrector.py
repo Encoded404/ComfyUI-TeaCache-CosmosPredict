@@ -54,6 +54,8 @@ from .corrector import (CorrectorConfig, CorrectorUNet2D, FULL_STEP_FLOP_512,
 from .corrector_dataset import (CorrectorBatchSampler, CorrectorDataset,
                                 augment_batch, collate_corrector)
 from .utils import MetricsLog, TrainTimer, format_duration
+from .utils import (affine_oob_eval, affine_oob_json, collect_affine_maps,
+                    split_affine_per_pair)
 from .utils import (delta_distribution, per_channel_affine_ceiling,
                     pooled_feature_ceiling, step_correlations, staleness_curve,
                     svd_rank_95)
@@ -414,13 +416,19 @@ def compute_train_loss(model, batch, Ks: torch.Tensor, loss_fn, eps: float,
 
 
 def eval_model(model, eval_loader, lags: List[int], ks: List[int],
-               device, eps: float, show_progress: bool = False) -> Tuple[Dict, Dict]:
+               device, eps: float, show_progress: bool = False) -> Tuple[Dict, Dict, Dict]:
     """Per-lag, per-K rel-MSE (‖v̂−v_true‖₂/‖v_true‖₂) and cosine, plus the
     same metrics grouped per spatial shape ((k, (h, w))) for the per-resolution
-    eval report (resolution-independence check)."""
+    eval report (resolution-independence check).
+
+    Also collects the eval (v_ma, v_true) maps per latent shape (with per-pair
+    d=0-anchor masks) for the OOD affine recovery row — the affine is fit on
+    TRAIN pairs by the caller and scored here, never on its own eval slice.
+    """
     model.eval()
     acc = {(k, lag): [0.0, 0.0, 0] for k in ks for lag in lags}
     acc_shape: Dict[Tuple[int, Tuple[int, int]], List[float]] = {}
+    eval_maps: Dict[Tuple[int, int], dict] = {}
     batches = eval_loader
     if show_progress and tqdm is not None:
         batches = tqdm(eval_loader, desc="eval", unit="batch", leave=False,
@@ -435,6 +443,11 @@ def eval_model(model, eval_loader, lags: List[int], ks: List[int],
             t = batch["t_frac"].to(device)
             lags_b = batch["lag"].tolist()
             hw = (int(x.shape[-2]), int(x.shape[-1]))
+            vm = batch["v_ma"].float().cpu()
+            em = eval_maps.setdefault(hw, {"vm": [], "vt": [], "anchor": []})
+            em["vm"].append(vm)
+            em["vt"].append(batch["v_true"].float().cpu())
+            em["anchor"].extend([lag == 0 for lag in lags_b])
             for k in ks:
                 v = v0
                 for _ in range(k):
@@ -463,7 +476,7 @@ def eval_model(model, eval_loader, lags: List[int], ks: List[int],
         if n:
             by_shape[(k, hw)] = {"rel_mse": s_rel / n, "cosine": s_cos / n, "n": n}
     model.train()
-    return out, by_shape
+    return out, by_shape, eval_maps
 
 
 def load_linear_ceiling(data_dir: Path) -> Optional[float]:
@@ -493,36 +506,90 @@ def load_linear_ceiling(data_dir: Path) -> Optional[float]:
 
 
 def recovery_rows(results: Dict[Tuple[int, int], dict],
-                  ks: List[int]) -> List[Tuple[int, float]]:
-    """Pooled per-K rel-MSE from an eval result dict (K=0 is the base)."""
+                  ks: List[int]) -> List[dict]:
+    """Per-K rel-MSE pooled per-pair (n-weighted over lags), plus ladder-only
+    and d=0-anchor-only splits and the pair count (K=0 is the base)."""
     rows = []
     for k in ks:
-        parts = [r["rel_mse"] for (kk, _), r in results.items() if kk == k]
-        rows.append((k, sum(parts) / max(len(parts), 1) if parts else float("nan")))
+        items = [(lag, r["rel_mse"], r["n"]) for (kk, lag), r in results.items()
+                 if kk == k]
+        if not items:
+            rows.append({"k": k, "rel_mse": float("nan"),
+                         "ladder_only": float("nan"), "anchors_only": float("nan"),
+                         "n_pairs": 0})
+            continue
+
+        def pooled(sub):
+            tot = sum(m * n for _, m, n in sub)
+            n = sum(n for _, _, n in sub)
+            return tot / n if n else float("nan")
+
+        rows.append({"k": k,
+                     "rel_mse": pooled(items),
+                     "ladder_only": pooled([it for it in items if it[0] != 0]),
+                     "anchors_only": pooled([it for it in items if it[0] == 0]),
+                     "n_pairs": sum(n for _, _, n in items)})
     return rows
 
 
-def recovery_table_lines(rows: List[Tuple[int, float]]) -> List[str]:
-    """Human-readable recovery table: abs err, ×base and % recovered per K."""
-    base = next((err for k, err in rows if k == 0), None)
+def recovery_table_lines(rows: List[dict],
+                         affine: Optional[dict] = None) -> List[str]:
+    """Human-readable recovery table: abs err, ×base and % recovered per K.
+
+    ``affine`` is an :func:`~tuning.utils.affine_oob_eval` result (plus a
+    "split" key with ladder/anchor means) for the OOD per-channel affine row.
+    """
+    base = next((r["rel_mse"] for r in rows if r["k"] == 0), None)
     lines = [
         "  v_t error recovery vs TeaCache base "
         "(pooled rel-MSE ‖v̂−v_true‖₂/‖v_true‖₂)",
-        "  " + "─" * 56,
-        f"  {'method':<22}{'abs err':>10}{'× base':>9}{'recovered':>12}",
-        "  " + "─" * 56,
+        "  " + "─" * 62,
+        f"  {'method':<24}{'abs err':>10}{'× base':>9}{'recovered':>12}",
+        "  " + "─" * 62,
     ]
-    for k, err in rows:
-        name = "TeaCache base (K=0)" if k == 0 else f"Corrector K={k}"
+    for r in rows:
+        name = "TeaCache base (K=0)" if r["k"] == 0 else f"Corrector K={r['k']}"
+        err = r["rel_mse"]
         if base is None or base <= 0 or err != err:
-            lines.append(f"  {name:<22}{err:>10.5f}")
+            lines.append(f"  {name:<24}{err:>10.5f}")
             continue
         ratio = err / base
-        rec = 1.0 - ratio
-        rec_str = "—" if k == 0 else f"{100 * rec:>10.1f}%"
-        lines.append(f"  {name:<22}{err:>10.5f}{ratio:>9.3f}{rec_str:>12}")
-    lines.append("  " + "─" * 56)
-    lines.append(f"  {'Oracle (v_true)':<22}{'0.00000':>10}{'0.000':>9}{'100.0%':>12}")
+        rec = None if r["k"] == 0 else 1.0 - ratio
+        rec_str = "—" if rec is None else f"{100 * rec:>10.1f}%"
+        lines.append(f"  {name:<24}{err:>10.5f}{ratio:>9.3f}{rec_str:>12}")
+        if r["ladder_only"] == r["ladder_only"]:
+            lines.append(f"    ladder only          {r['ladder_only']:>10.5f}")
+        if r["anchors_only"] == r["anchors_only"]:
+            lines.append(f"    d=0 anchors only     {r['anchors_only']:>10.5f}")
+    if affine is not None:
+        a_all = affine.get("overall")
+        if a_all is None:
+            lines.append(f"  {'Per-channel affine (OOD)':<24}{'—':>10}")
+        else:
+            ratio = a_all / base if base and base > 0 else None
+            rec = None if ratio is None else 1.0 - ratio
+            rat_str = "—" if ratio is None else f"{ratio:>9.3f}"
+            rec_str = "—" if rec is None else f"{100 * rec:>10.1f}%"
+            lines.append(f"  {'Per-channel affine (OOD)':<24}{a_all:>10.5f}"
+                         f"{rat_str}{rec_str:>12}")
+            lad = (affine.get("split") or {}).get("ladder")
+            anc = (affine.get("split") or {}).get("anchor")
+            if lad is not None:
+                lines.append(f"    ladder only          {lad:>10.5f}")
+            if anc is not None:
+                lines.append(f"    d=0 anchors only     {anc:>10.5f}")
+    lines.append("  " + "─" * 62)
+    lines.append(f"  {'Oracle (v_true)':<24}{'0.00000':>10}{'0.000':>9}{'100.0%':>12}")
+    by_shape = (affine or {}).get("by_shape") or {}
+    if by_shape:
+        lines.append("  affine per stratum (fit = train pairs, scored = eval pairs):")
+        for shape, d in sorted(by_shape.items(), key=lambda kv: kv[0][0] * kv[0][1]):
+            if d.get("rel_mse") is None:
+                lines.append(f"    {shape[0]}x{shape[1]}:  no train fit pairs — row skipped")
+                continue
+            lines.append(f"    {shape[0]}x{shape[1]}:  rel {d['rel_mse']:.4f}  "
+                         f"(n={d['n_pairs']}, fit {d['fit_n_batches']} batches)  "
+                         f"|a−1|≤{d['max_abs_a_minus_1']:.4f}  |b|≤{d['max_abs_b']:.4f}")
     return lines
 
 
@@ -824,6 +891,12 @@ def main(argv=None):
                                  pin_memory=cfg["num_workers"] > 0)
     except ValueError as e:
         print(f"  ⚠ no eval generations — eval loop and gates skipped ({e})")
+    # Fit loader for the OOD affine recovery row: a short capped pass over the
+    # TRAIN pairs (never the eval set), so the affine faces the same
+    # distribution contract as the corrector (fit=train, scored=eval).
+    fit_loader = DataLoader(ds, batch_sampler=CorrectorBatchSampler(
+        ds, batch_size=16, seed=cfg["seed"] + 6), collate_fn=collate_corrector,
+        num_workers=cfg["num_workers"], pin_memory=cfg["num_workers"] > 0)
     lags = sorted(set(lag for _, _, _, lag in ds.pairs))
     if 0 not in lags:
         lags = [0] + lags
@@ -941,7 +1014,9 @@ def main(argv=None):
     metrics = MetricsLog(cfg["metrics"])
     loss_ema: Optional[float] = None
     min_loss = float("inf")
-    last_eval_rows: List[Tuple[int, float]] = []
+    last_eval_rows: List[dict] = []
+    last_affine: Optional[dict] = None
+    affine_fit_maps: Optional[dict] = None
     pbar = None
     if tqdm is not None and not cfg["no_progress"]:
         pbar = tqdm(total=cfg["max_steps"], desc="train", unit="step",
@@ -1050,10 +1125,20 @@ def main(argv=None):
 
         if step % cfg["eval_every"] == 0 and eval_loader is not None:
             t_e0 = time.time()
-            results, by_shape = eval_model(model, eval_loader, lags, ks_eval, device,
-                                           eps, show_progress=(pbar is not None))
+            results, by_shape, eval_maps = eval_model(
+                model, eval_loader, lags, ks_eval, device,
+                eps, show_progress=(pbar is not None))
             k1_pairs = [r["rel_mse"] for (kk, _), r in results.items() if kk == 1]
             k1 = sum(k1_pairs) / max(len(k1_pairs), 1) if k1_pairs else None
+            affine = None
+            if affine_fit_maps is None and fit_loader is not None:
+                affine_fit_maps = collect_affine_maps(fit_loader)
+            if affine_fit_maps and eval_maps:
+                aff = affine_oob_eval(affine_fit_maps, eval_maps)
+                lad, anc = split_affine_per_pair(aff, eval_maps)
+                aff["split"] = {"ladder": round(sum(lad) / len(lad), 5) if lad else None,
+                                "anchor": round(sum(anc) / len(anc), 5) if anc else None}
+                affine = aff
             row = "  [eval] step %d  " % step
             for k in ks_eval:
                 avg = sum(r["rel_mse"] for (kk, _), r in results.items() if kk == k)
@@ -1073,7 +1158,8 @@ def main(argv=None):
                 emit(f"      {hw[0]}x{hw[1]}: " + "  ".join(parts))
             rows = recovery_rows(results, ks_eval)
             last_eval_rows = rows
-            for line2 in recovery_table_lines(rows):
+            last_affine = affine
+            for line2 in recovery_table_lines(rows, affine):
                 emit(line2)
             if ceiling is not None and not gate_fired and step >= gate_deadline:
                 if k1 is None or k1 > 0.8 * ceiling:
@@ -1136,7 +1222,12 @@ def main(argv=None):
                 "per_shape": {f"{h}x{w}": {str(k): round(by_shape.get((k, (h, w)), {}).get("rel_mse", float("nan")), 6)
                                            for k in ks_eval}
                               for (h, w) in shape_keys},
-                "recovery": {str(k): round(err, 6) for k, err in rows},
+                "recovery": {str(r["k"]): {"rel_mse": round(r["rel_mse"], 6),
+                                           "ladder_only": round(r["ladder_only"], 6),
+                                           "anchors_only": round(r["anchors_only"], 6),
+                                           "n_pairs": r["n_pairs"]}
+                             for r in rows},
+                "affine_oob": affine_oob_json(affine) if affine is not None else None,
                 "best_k1": best, "best_step": best_step, "gate_fired": gate_fired,
             })
 
@@ -1167,7 +1258,7 @@ def main(argv=None):
     if best is not None:
         print(f"  Best K1:      {best:.4f} @ step {best_step}")
     if last_eval_rows:
-        for line2 in recovery_table_lines(last_eval_rows):
+        for line2 in recovery_table_lines(last_eval_rows, last_affine):
             print(line2)
     print(f"  VRAM peak:    {torch.cuda.max_memory_allocated() / (1024 ** 3):.1f} GB")
     print(f"  Metrics:      {cfg['metrics']}")

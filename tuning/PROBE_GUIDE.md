@@ -389,6 +389,31 @@ L2 norm ratio** (square roots, not squares) — do not compare it 1:1 with the
 squared training loss or with R²-based ceilings. It is the number the verdict
 uses.
 
+**The recovery table** (printed after the verdict, `day1.recovery` in the
+report) compares every method on the *same* eval pairs with the *same* metric,
+so it is the apples-to-apples OOD view the verdict line is not:
+
+- **TeaCache base (v_MA)** — `‖v_MA − v_true‖/‖v_true‖`. Deflated by the
+  ~20% d=0 anchor pairs (error exactly 0 by construction); the **ladder-only**
+  sub-row (≈0.49 on the example run) is the honest "doing nothing" baseline.
+- **Per-channel affine (OOD)** — the per-stratum affine fit from §6.2, but
+  now fit on **train pairs** and scored on the eval pairs (same distribution
+  contract as the UNet: fit = train, scored = held-out). Fit and score are
+  per resolution stratum; the `|a−1|` / `|b|` diagnostics report how far the
+  fit sits from identity — near-zero means "nothing beyond scale+shift was
+  learnable", large values are a red flag that the fit slice is
+  unrepresentative of the scored slice.
+- **Day-1 tiny UNet** — the held-out eval number, with the anchor/ladder
+  split.
+- **Oracle (v_true)** — the 0-error anchor of the scale.
+
+`recovered = 1 − err/base`; negative means "makes things worse than doing
+nothing". A `−134.6%` affine row on an early run of this table turned out to
+be an artifact of fitting the affine **on the eval pairs themselves** (an
+in-sample fit can never beat identity on its own objective, so a blowup of
+that size is a diagnostic flag, not a finding) — hence the current OOD
+fit-on-train design.
+
 **Example run: `0.4015`** — the corrected velocity's leftover error has
 magnitude ≈ 40% of the true velocity's magnitude. Not "solved" (a 40% miss
 still distorts a video), but clearly better than the baselines.
@@ -483,6 +508,12 @@ day1
   mlp_pooled_mean_error     — the blind baseline
   linear_ceiling            — the ceiling the verdict compared against
   day1_unet_rel_mse         — held-out relative L2 error
+  base_rel_mse              — TeaCache base error on the same eval pairs
+  recovery_split            — base/model/affine ladder-only + d=0-anchor means
+  affine_oob                — OOD affine (fit=train, scored=eval): overall +
+                              by_shape rel_mse, n_pairs, fit_n_batches, |a−1|/|b|
+  recovery                  — per-method abs_err, ratio_base, recovered,
+                              ladder_only, anchors_only
   beats_linear_ceiling_by_25pct / verdict
   lag_readability           — smoothness, spearman_lag_vs_mag, n_steps
   loss_final / loss_min / steps / wall_s
@@ -492,7 +523,12 @@ day1
 (= 0.6584 in this run) via `load_linear_ceiling` and applies the **did-it-learn
 gate** at the end of its own training: the trained corrector's held-out error
 must beat the same `0.75 × ceiling` bar, otherwise the training is flagged as
-not having learned (see `train_corrector.py` ~line 695).
+not having learned (see `train_corrector.py` ~line 695). Its per-eval recovery
+table shows the same rows (K=0 base / K≥1 passes, per-pair pooled, with
+ladder/anchor splits) plus the same OOD affine row and per-stratum
+diagnostics; the shared implementation lives in `utils.py`
+(`fit_affine_coefs` / `affine_oob_eval` / `collect_affine_maps` /
+`split_affine_per_pair`).
 
 Step-level scalars stream to `probe_metrics.jsonl` (`tail -f` friendly):
 per-50-step Day-1 losses, phase timings, eval verdict.
@@ -524,14 +560,16 @@ python -m tuning.probe_refiner --data outputs/<ts>/refiner_data
 |---|---|
 | Recording (ring-buffer ladder, v_true) | `refiner_data.py:104` (`record_probe_generations`), `refiner_data.py` storage v2 (header docstring) |
 | t-gap cancellation | `probe_refiner.py:494-500` (per-gen), `:965-971` (report + print) |
-| SVD rank(95%) | `probe_refiner.py:296` (`svd_rank_95`) |
-| Affine ceiling | `probe_refiner.py:312` (`per_channel_affine_ceiling`), pooled variant `:326` |
-| Staleness curve | `probe_refiner.py:364` (`staleness_curve`) |
-| Decision gate | `probe_refiner.py:995-1014` |
-| Day-1 MLP | `probe_refiner.py:629` |
-| Day-1 UNet + eval + verdict | `probe_refiner.py:656-776` |
-| Lag-readability | `probe_refiner.py:779` (`_lag_readability`) |
+| SVD rank(95%) | `utils.py` (`svd_rank_95`) |
+| Affine ceiling | `utils.py` (`per_channel_affine_ceiling`), pooled variant (`pooled_feature_ceiling`) |
+| OOD affine fit + score + diagnostics | `utils.py` (`fit_affine_coefs`, `affine_coef_diagnostics`, `affine_rel_mse_per_pair`, `collect_affine_maps`, `affine_oob_eval`, `split_affine_per_pair`, `affine_oob_json`) |
+| Staleness curve | `utils.py` (`staleness_curve`) |
+| Decision gate | `probe_refiner.py` (gate block in `main`) |
+| Day-1 MLP | `probe_refiner.py` (`day1_mlp`) |
+| Day-1 UNet + eval + verdict | `probe_refiner.py` (`day1_unet`, `eval_pairs`) |
+| Lag-readability | `probe_refiner.py` (`_lag_readability`) |
 | Corrector model ("tiny" = 1.83 M) | `corrector.py:542` (`CorrectorUNet2D`), size solver `corrector.py:64` |
 | Dataset (d=0 anchor synthesis, pairs) | `refiner_data.py:648` (`iter_pairs`), `corrector_dataset.py` |
-| Ceiling consumer (did-it-learn gate) | `train_corrector.py:461` (`load_linear_ceiling`), `:695` |
+| Recovery table (trainer K rows + affine row) | `train_corrector.py` (`recovery_rows`, `recovery_table_lines`, `eval_model`) |
+| Ceiling consumer (did-it-learn gate) | `train_corrector.py` (`load_linear_ceiling`) |
 | Target model | Anima = Cosmos-Predict2-2B-Text2Image (DiT, 2B, 16-ch 8× latent; gated NVIDIA Open Model License) — `tuning/forward.py`, `README.md:59` |

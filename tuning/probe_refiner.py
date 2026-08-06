@@ -50,6 +50,8 @@ from .corrector_dataset import CorrectorDataset, CorrectorBatchSampler, collate_
 from .prompt_loader import load_prompt_config, select_prompts, GenerationPromptSampler, resolve_generation
 from .utils import MetricsLog, TrainTimer, format_duration
 from .utils import load_models, sample
+from .utils import (affine_oob_eval, affine_oob_json, collect_affine_maps,
+                    split_affine_per_pair)
 from .utils import (delta_distribution, per_channel_affine_ceiling,
                     pooled_feature_ceiling, step_correlations, staleness_curve,
                     svd_rank_95)
@@ -550,33 +552,6 @@ def day1_mlp(x_t_maps, v_ma_maps, v_true_maps, device, steps=400, lr=1e-3) -> fl
     return err
 
 
-def per_channel_affine_rel_mse(vm_maps, vt_maps, fit_pairs: int = 128) -> Optional[float]:
-    """Best per-channel affine v̂ = a_c·v_MA_c + b_c, scored with rel-MSE.
-
-    Fits on the first ``fit_pairs`` maps (per-pixel pooled, same formulation as
-    ``per_channel_affine_ceiling``) and scores with the same per-sample rel-MSE
-    used for the Day-1 UNet, so the method lands on the recovery table. Input
-    maps may be single (C, H, W) or batched (B, C, H, W) tensors — the channel
-    dim is taken from ``shape[1]`` either way.
-    """
-    if not vm_maps:
-        return None
-    c = vm_maps[0].shape[1]
-    n_fit = min(len(vm_maps), fit_pairs)
-    xf = torch.cat(vm_maps[:n_fit], 0).reshape(-1, c).float()
-    yf = torch.cat(vt_maps[:n_fit], 0).reshape(-1, c).float()
-    xa = torch.cat([xf, torch.ones_like(xf[:, :1])], dim=1)
-    coefs, _, _, _ = torch.linalg.lstsq(xa, yf)              # (C+1, C)
-    errs = []
-    for vm, vt in zip(vm_maps, vt_maps):
-        x = vm.reshape(-1, c).float()
-        y = vt.reshape(-1, c).float()
-        pred = torch.cat([x, torch.ones_like(x[:, :1])], dim=1) @ coefs
-        err = (pred - y).flatten().norm() / (y.flatten().norm() + 1e-8)
-        errs.append(err.item())
-    return float(np.mean(errs))
-
-
 def day1_unet(data_dir: Path, device, max_steps: int = 600, batch_size: int = 8,
               seed: int = 42, show_progress: bool = False,
               metrics: Optional[MetricsLog] = None,
@@ -656,11 +631,13 @@ def day1_unet(data_dir: Path, device, max_steps: int = 600, batch_size: int = 8,
     if pbar is not None:
         pbar.close()
     # eval
-    def eval_pairs(ds):
+    def eval_pairs(ds, fit_maps):
         if ds is None:
             return None
         errs, base_errs = [], []
-        fit_vm, fit_vt = [], []
+        split = {"base": {"ladder": [], "anchor": []},
+                 "model": {"ladder": [], "anchor": []}}
+        eval_maps = {}
         loader = DataLoader(ds, batch_sampler=CorrectorBatchSampler(ds, 16, seed + 1),
                             collate_fn=collate_corrector, num_workers=0)
         bar2 = _bar(show_progress, len(loader), "day1-eval", "batch")
@@ -673,24 +650,47 @@ def day1_unet(data_dir: Path, device, max_steps: int = 600, batch_size: int = 8,
                     v = v + model(b["x_t"], v, b["prompt"], b["t_frac"], b["prompt_mask"])
                 err = (v - b["v_true"]).float().flatten(1).norm(dim=1)
                 den = b["v_true"].float().flatten(1).norm(dim=1) + 1e-8
-                errs.extend((err / den).tolist())
+                rel = (err / den).tolist()
                 base = (b["v_ma"] - b["v_true"]).float().flatten(1).norm(dim=1)
-                base_errs.extend((base / den).tolist())
-                if len(fit_vm) < 512:
-                    fit_vm.append(b["v_ma"].float().cpu())
-                    fit_vt.append(b["v_true"].float().cpu())
+                base_rel = (base / den).tolist()
+                anchors = (b["lag"].cpu() == 0).tolist()
+                errs.extend(rel)
+                base_errs.extend(base_rel)
+                vm = b["v_ma"].float().cpu()
+                vt = b["v_true"].float().cpu()
+                shape = (int(vm.shape[-2]), int(vm.shape[-1]))
+                em = eval_maps.setdefault(shape, {"vm": [], "vt": [], "anchor": []})
+                em["vm"].append(vm)
+                em["vt"].append(vt)
+                em["anchor"].extend(anchors)
+                for r, br, is_a in zip(rel, base_rel, anchors):
+                    (split["base"]["anchor"] if is_a else split["base"]["ladder"]).append(br)
+                    (split["model"]["anchor"] if is_a else split["model"]["ladder"]).append(r)
                 if bar2 is not None:
                     bar2.update(1)
         model.train()
         if bar2 is not None:
             bar2.close()
+        # OOD affine: fit per stratum on TRAIN maps, score per stratum on the
+        # eval maps (the UNet is also evaluated only on eval pairs — the same
+        # distribution contract). d=0 anchors are split out because identity
+        # scores exactly 0 there and any |a−1|/|b| is pure loss.
+        aff = affine_oob_eval(fit_maps, eval_maps)
+        aff_lad, aff_anc = split_affine_per_pair(aff, eval_maps)
+        split["affine"] = {"ladder": aff_lad, "anchor": aff_anc}
         return {"rel_mse": float(np.mean(errs)) if errs else None,
                 "base_rel_mse": float(np.mean(base_errs)) if base_errs else None,
-                "affine_rel_mse": per_channel_affine_rel_mse(fit_vm, fit_vt),
+                "split": split,
+                "affine": aff,
                 "n_pairs": len(errs)}
 
     t_e0 = time.time()
-    ev = eval_pairs(eval_ds)
+    ev = None
+    if eval_ds is not None:
+        fit_loader = DataLoader(train_ds, batch_sampler=CorrectorBatchSampler(
+            train_ds, 16, seed + 5), collate_fn=collate_corrector, num_workers=0)
+        fit_maps = collect_affine_maps(fit_loader)
+        ev = eval_pairs(eval_ds, fit_maps)
     day1_eval = ev["rel_mse"] if ev is not None else None
     if timer is not None:
         timer.add("eval", time.time() - t_e0)
@@ -702,9 +702,18 @@ def day1_unet(data_dir: Path, device, max_steps: int = 600, batch_size: int = 8,
     if timer is not None:
         timer.add("lag", time.time() - t_l0)
 
+    split_json = None
+    if ev is not None:
+        split_json = {"base": {k: round(float(np.mean(v)), 5) if v else None
+                               for k, v in ev["split"]["base"].items()},
+                      "model": {k: round(float(np.mean(v)), 5) if v else None
+                                for k, v in ev["split"]["model"].items()},
+                      "affine": {k: round(float(np.mean(v)), 5) if v else None
+                                 for k, v in ev["split"]["affine"].items()}}
     return {"day1_unet_rel_mse": day1_eval,
             "base_rel_mse": ev["base_rel_mse"] if ev is not None else None,
-            "affine_rel_mse": ev["affine_rel_mse"] if ev is not None else None,
+            "recovery_split": split_json,
+            "affine_oob": affine_oob_json(ev["affine"]) if ev is not None else None,
             "eval_pairs": ev["n_pairs"] if ev is not None else 0,
             "lag_readability": lag_stats,
             "loss_final": round(final_loss, 6),
@@ -989,43 +998,71 @@ def main(argv=None):
     metrics.write({
         "type": "day1_eval", "rel_mse": day1.get("day1_unet_rel_mse"),
         "base_rel_mse": day1.get("base_rel_mse"),
-        "affine_rel_mse": day1.get("affine_rel_mse"),
+        "affine_rel_mse": (day1.get("affine_oob") or {}).get("overall"),
         "verdict": day1["verdict"], "wall_s": round(timer.phase_seconds("train"), 2),
     })
 
     # ── Recovery table: each method's v_t error vs the TeaCache base ─────
     base_rel = day1.get("base_rel_mse")
     if base_rel is not None and base_rel > 0:
+        split = day1.get("recovery_split") or {}
+        aff = day1.get("affine_oob") or {}
+        b_lad = (split.get("base") or {}).get("ladder")
+        b_anc = (split.get("base") or {}).get("anchor")
+        m_lad = (split.get("model") or {}).get("ladder")
+        m_anc = (split.get("model") or {}).get("anchor")
+        a_lad = (split.get("affine") or {}).get("ladder")
+        a_anc = (split.get("affine") or {}).get("anchor")
         print("\n  v_t error recovery vs TeaCache base "
-              "(rel-MSE ‖v̂−v_true‖₂/‖v_true‖₂, eval pairs)")
-        print("  " + "─" * 56)
-        print(f"  {'method':<22}{'abs err':>10}{'× base':>9}{'recovered':>12}")
-        print("  " + "─" * 56)
-        recovery = {}
+              "(rel-L2 ‖v̂−v_true‖₂/‖v_true‖₂, eval pairs)")
+        print("  " + "─" * 62)
+        print(f"  {'method':<24}{'abs err':>10}{'× base':>9}{'recovered':>12}")
+        print("  " + "─" * 62)
         rows = [
-            ("TeaCache base (v_MA)", base_rel, 1.0, None),
-            ("Per-channel affine fit", day1.get("affine_rel_mse"), None, None),
-            ("Day-1 tiny UNet", day1.get("day1_unet_rel_mse"), None, None),
-            ("Oracle (v_true)", 0.0, 0.0, 1.0),
+            {"name": "TeaCache base (v_MA)", "err": base_rel, "ladder": b_lad,
+             "anchor": b_anc, "is_base": True},
+            {"name": "Per-channel affine (OOD)", "err": aff.get("overall"),
+             "ladder": a_lad, "anchor": a_anc},
+            {"name": "Day-1 tiny UNet", "err": day1.get("day1_unet_rel_mse"),
+             "ladder": m_lad, "anchor": m_anc},
+            {"name": "Oracle (v_true)", "err": 0.0, "ladder": None, "anchor": None,
+             "oracle": True},
         ]
-        for name, err, ratio, rec in rows:
+        recovery = {}
+        for r in rows:
+            name, err = r["name"], r["err"]
             if err is None:
-                print(f"  {name:<22}{'—':>10}")
+                print(f"  {name:<24}{'—':>10}")
                 recovery[name] = None
                 continue
-            if ratio is None:
-                ratio = err / base_rel
-                rec = 1.0 - ratio
+            ratio = 0.0 if r.get("oracle") else err / base_rel
+            rec = 1.0 if r.get("oracle") else (None if r.get("is_base") else 1.0 - ratio)
             recovery[name] = {"abs_err": round(err, 5),
                               "ratio_base": round(ratio, 4),
-                              "recovered": round(rec, 4) if rec is not None else None}
+                              "recovered": round(rec, 4) if rec is not None else None,
+                              "ladder_only": round(r["ladder"], 5) if r["ladder"] is not None else None,
+                              "anchors_only": round(r["anchor"], 5) if r["anchor"] is not None else None}
             rec_str = "—" if rec is None else f"{100 * rec:>10.1f}%"
-            print(f"  {name:<22}{err:>10.5f}{ratio:>9.3f}{rec_str:>12}")
-        print("  " + "─" * 56)
+            print(f"  {name:<24}{err:>10.5f}{ratio:>9.3f}{rec_str:>12}")
+            if r["ladder"] is not None:
+                print(f"    ladder only          {r['ladder']:>10.5f}")
+            if r["anchor"] is not None:
+                print(f"    d=0 anchors only     {r['anchor']:>10.5f}")
+        print("  " + "─" * 62)
+        by_shape = aff.get("by_shape") or {}
+        if by_shape:
+            print("  affine per stratum (fit = train pairs, scored = eval pairs):")
+            for shape, d in sorted(by_shape.items(), key=lambda kv: kv[0][0] * kv[0][1]):
+                if d.get("rel_mse") is None:
+                    print(f"    {shape[0]}x{shape[1]}:  no train fit pairs — row skipped")
+                    continue
+                print(f"    {shape[0]}x{shape[1]}:  rel {d['rel_mse']:.4f}  "
+                      f"(n={d['n_pairs']}, fit {d['fit_n_batches']} batches)  "
+                      f"|a−1|≤{d['max_abs_a_minus_1']:.4f}  |b|≤{d['max_abs_b']:.4f}")
         day1["recovery"] = recovery
         report["day1"] = day1
         metrics.write({"type": "recovery", "base_rel_mse": round(base_rel, 5),
-                       "methods": recovery})
+                       "methods": recovery, "affine_oob": aff})
 
     # ── Write report + summary ─────────────────────────────────────────
     report_path = _write_report(report, data_dir)

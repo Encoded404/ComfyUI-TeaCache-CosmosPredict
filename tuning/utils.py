@@ -12,7 +12,7 @@ from collections import deque
 import sys
 import time
 from pathlib import Path
-from typing import Dict, NamedTuple, Tuple
+from typing import Dict, List, NamedTuple, Tuple
 
 import numpy as np
 import torch
@@ -808,6 +808,147 @@ def delta_distribution(delta_maps: list) -> dict:
         "sparsity": round(float((flat.abs() < 1e-4).float().mean()), 4),
         "per_channel_std": [round(float(s), 5) for s in d.std(dim=(0, 2, 3)).tolist()],
     }
+
+
+# ── Recovery-table affine (OOD: fit on train pairs, score on eval pairs) ──
+
+
+def fit_affine_coefs(vm_maps, vt_maps) -> torch.Tensor:
+    """Best per-channel affine v̂ = a_c·v_MA_c + b_c from pooled pixels.
+
+    ``vm_maps``/``vt_maps`` are lists of (B, C, H, W) (or (C, H, W)) tensors;
+    the channel dim is read from ``shape[1]``. Returns a (C+1, C) coefficient
+    matrix (last row = intercepts). Identity is in the class, so the fit can
+    never be worse than "×1 + 0" *on this objective* (pooled per-pixel MSE).
+    """
+    c = vm_maps[0].shape[1]
+    x = torch.cat([v.float() for v in vm_maps], 0).reshape(-1, c)
+    y = torch.cat([v.float() for v in vt_maps], 0).reshape(-1, c)
+    xa = torch.cat([x, torch.ones_like(x[:, :1])], dim=1)   # (N, C+1)
+    coefs, _, _, _ = torch.linalg.lstsq(xa, y)              # (C+1, C)
+    return coefs
+
+
+def affine_coef_diagnostics(coefs) -> dict:
+    """How far a (C+1, C) affine map is from identity: |a_c − 1| and |b_c|.
+
+    Near-zero values mean the fit learned nothing beyond identity (no affine
+    structure to exploit); large values mean the fit slice is unrepresentative
+    of the scored slice — a red flag for the recovery-table row.
+    """
+    c = coefs.shape[1]
+    dev = coefs[:c, :].diag() - 1.0
+    b = coefs[c, :]
+    return {
+        "max_abs_a_minus_1": round(float(dev.abs().max()), 6),
+        "mean_abs_a_minus_1": round(float(dev.abs().mean()), 6),
+        "max_abs_b": round(float(b.abs().max()), 6),
+        "mean_abs_b": round(float(b.abs().mean()), 6),
+    }
+
+
+def affine_rel_mse_per_pair(coefs, vm, vt) -> List[float]:
+    """Per-pair relative L2 ‖v̂−v_true‖₂/‖v_true‖₂ for an affine map.
+
+    ``vm``/``vt`` are batched (B, C, H, W) tensors; returns one error per pair.
+    """
+    c = vm.shape[1]
+    x = vm.reshape(-1, c).float()
+    y = vt.reshape(-1, c).float()
+    pred = torch.cat([x, torch.ones_like(x[:, :1])], dim=1) @ coefs
+    pred = pred.reshape(vm.shape)
+    err = (pred - vt.float()).flatten(1).norm(dim=1)
+    den = vt.float().flatten(1).norm(dim=1) + 1e-8
+    return (err / den).tolist()
+
+
+def collect_affine_maps(loader, cap_batches_per_shape: int = 128,
+                        cap_batches_total: int = 512) -> dict:
+    """Collect (v_ma, v_true) batch tensors per latent shape from a loader.
+
+    Returns ``{shape: {"vm": [tensor...], "vt": [tensor...]}}`` — CPU float32,
+    batched (B, C, H, W); capped at ``cap_batches_per_shape`` batch tensors per
+    shape (first-come) and ``cap_batches_total`` overall (early exit).
+    """
+    by_shape = {}
+    total = 0
+    for b in loader:
+        vm = b["v_ma"].float().cpu()
+        vt = b["v_true"].float().cpu()
+        shape = (int(vm.shape[-2]), int(vm.shape[-1]))
+        entry = by_shape.setdefault(shape, {"vm": [], "vt": []})
+        if len(entry["vm"]) >= cap_batches_per_shape:
+            continue
+        entry["vm"].append(vm)
+        entry["vt"].append(vt)
+        total += 1
+        if total >= cap_batches_total:
+            break
+    return by_shape
+
+
+def affine_oob_eval(fit_by_shape, eval_by_shape, cap_batches: int = 128) -> dict:
+    """OOD per-channel affine: fit per stratum on train maps, score per
+    stratum on eval maps with per-pair relative L2 (the recovery-table row).
+
+    ``fit_by_shape``/``eval_by_shape``: {shape: {"vm": [...], "vt": [...]}} as
+    produced by :func:`collect_affine_maps` (eval maps may carry an extra
+    "anchor" key, ignored here). The fit uses the first ``cap_batches`` batch
+    tensors per stratum; scoring covers every eval pair.
+
+    Returns {"by_shape": {shape: {"per_pair": [float], "rel_mse": float,
+             "n_pairs": int, "fit_n_batches": int, **affine_coef_diagnostics}},
+             "overall": pooled mean over all eval pairs}.
+    """
+    out = {"by_shape": {}}
+    pooled_sum, pooled_n = 0.0, 0
+    for shape in sorted(eval_by_shape, key=lambda s: s[0] * s[1]):
+        ef = eval_by_shape[shape]
+        ff = fit_by_shape.get(shape, {"vm": [], "vt": []})
+        if not ef["vm"]:
+            continue
+        if not ff["vm"]:
+            out["by_shape"][shape] = {"per_pair": [], "rel_mse": None,
+                                      "n_pairs": 0, "fit_n_batches": 0}
+            continue
+        coefs = fit_affine_coefs(ff["vm"][:cap_batches], ff["vt"][:cap_batches])
+        per_pair = []
+        for vm, vt in zip(ef["vm"], ef["vt"]):
+            per_pair.extend(affine_rel_mse_per_pair(coefs, vm, vt))
+        d = {"per_pair": per_pair,
+             "rel_mse": round(float(np.mean(per_pair)), 5) if per_pair else None,
+             "n_pairs": len(per_pair),
+             "fit_n_batches": min(len(ff["vm"]), cap_batches),
+             **affine_coef_diagnostics(coefs)}
+        out["by_shape"][shape] = d
+        if d["rel_mse"] is not None:
+            pooled_sum += d["rel_mse"] * len(per_pair)
+            pooled_n += len(per_pair)
+    out["overall"] = round(pooled_sum / max(pooled_n, 1), 5) if pooled_n else None
+    return out
+
+
+def split_affine_per_pair(aff, eval_by_shape) -> Tuple[List[float], List[float]]:
+    """Split an :func:`affine_oob_eval` result into (ladder, d=0 anchor) errors.
+
+    The anchor masks must be stored per pair, in append order, under
+    ``eval_by_shape[shape]["anchor"]`` (aligned with the "per_pair" lists).
+    """
+    ladder, anchor = [], []
+    for shape, d in aff.get("by_shape", {}).items():
+        masks = (eval_by_shape.get(shape) or {}).get("anchor", [])
+        for err, is_a in zip(d.get("per_pair", []), masks):
+            (anchor if is_a else ladder).append(err)
+    return ladder, anchor
+
+
+def affine_oob_json(aff) -> dict:
+    """JSON-safe copy of an :func:`affine_oob_eval` result (drops per-pair lists)."""
+    out = {"overall": aff.get("overall"), "by_shape": {}}
+    for shape, d in (aff.get("by_shape") or {}).items():
+        out["by_shape"][f"{shape[0]}x{shape[1]}"] = {
+            k: v for k, v in d.items() if k != "per_pair"}
+    return out
 
 
 class TrainTimer:
