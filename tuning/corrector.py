@@ -272,7 +272,9 @@ class CorrectorConfig:
     out_channels: int = OUT_CHANNELS
     k_recommended: int = 1
     normalization: str = "none"          # "none" | "perchannel"
-    normalization_stats: Optional[dict] = None   # {"mean": [...], "std": [...]} (32ch, input space)
+    # {"areas": [...], "mean": [[32ch]×S], "std": [[32ch]×S]} (per-stratum,
+    # sorted by area) or legacy flat {"mean": [...], "std": [...]} (S=1)
+    normalization_stats: Optional[dict] = None
     folded: bool = False                 # RepBlocks fused (export-time)
     target_params: float = 0.0           # requested size target (0 = fixed-dim config)
     achieved_params: int = 0             # measured at construction (solver closed form)
@@ -575,12 +577,28 @@ class CorrectorUNet2D(nn.Module):
         nn.init.zeros_(self.head_conv.weight)
         nn.init.zeros_(self.head_conv.bias)
 
-        # Input normalization (perchannel option, plan 6d)
+        # Input normalization (perchannel option, plan 6d) — per resolution
+        # stratum: normalization_stats = {"areas": [...], "mean": [[32ch]×S],
+        # "std": [[32ch]×S]} (strata sorted by area; the forward selects the
+        # nearest area at runtime). Legacy single-stratum {"mean","std"} flat
+        # lists are still accepted (S=1).
         stats = cfg.normalization_stats or {}
-        self.register_buffer("_norm_mean", torch.tensor(stats.get("mean", []), dtype=torch.float32)
-                             if stats.get("mean") else None)
-        self.register_buffer("_norm_std", torch.tensor(stats.get("std", []), dtype=torch.float32)
-                             if stats.get("std") else None)
+        mean, std = stats.get("mean"), stats.get("std")
+        if mean and std and isinstance(mean[0], (list, tuple)):
+            areas = torch.tensor([float(a) for a in (stats.get("areas") or [])],
+                                 dtype=torch.float32)
+            mean_t = torch.tensor([list(m) for m in mean], dtype=torch.float32)
+            std_t = torch.tensor([list(s) for s in std], dtype=torch.float32)
+        elif mean and std:
+            areas = torch.tensor([0.0], dtype=torch.float32)
+            mean_t = torch.tensor(list(mean), dtype=torch.float32).reshape(1, -1)
+            std_t = torch.tensor(list(std), dtype=torch.float32).reshape(1, -1)
+        else:
+            areas = torch.zeros(0, dtype=torch.float32)
+            mean_t = std_t = None
+        self.register_buffer("_norm_areas", areas)
+        self.register_buffer("_norm_mean", mean_t)
+        self.register_buffer("_norm_std", std_t)
 
         self.apply(self._init_weights)
         for block in self.blocks:
@@ -595,15 +613,34 @@ class CorrectorUNet2D(nn.Module):
 
     # ── forward ────────────────────────────────────────────────────────
 
-    def _normalize_input(self, x: torch.Tensor) -> torch.Tensor:
-        if self._norm_mean is None or self._norm_std is None:
-            return x
-        return (x - self._norm_mean.view(1, -1, 1, 1)) / self._norm_std.view(1, -1, 1, 1)
+    def _norm_stats(self, x: torch.Tensor):
+        """Per-stratum (mean, std) views selected by the batch's spatial area.
 
-    def _unnormalize_output(self, out: torch.Tensor) -> torch.Tensor:
-        if self._norm_std is None:
+        Pure function of the input shape (no module state) so it compiles and
+        stays correct for rotated/scaled batch layouts (area is preserved by
+        rot90). Single-stratum (legacy) stats always match.
+        """
+        if self._norm_mean is None or self._norm_std is None:
+            return None
+        if self._norm_areas.numel() <= 1:
+            return (self._norm_mean.view(1, -1, 1, 1),
+                    self._norm_std.view(1, -1, 1, 1))
+        area = int(x.shape[-2]) * int(x.shape[-1])
+        idx = (self._norm_areas - area).abs().argmin()
+        return (self._norm_mean.index_select(0, idx).view(1, -1, 1, 1),
+                self._norm_std.index_select(0, idx).view(1, -1, 1, 1))
+
+    def _normalize_input(self, x: torch.Tensor, ns) -> torch.Tensor:
+        if ns is None:
+            return x
+        mean, std = ns
+        return (x - mean) / std
+
+    def _unnormalize_output(self, out: torch.Tensor, ns) -> torch.Tensor:
+        if ns is None:
             return out
-        v_std = self._norm_std[IN_CHANNELS:]
+        _, std = ns
+        v_std = std[0, IN_CHANNELS:, 0, 0]
         return out * v_std.view(1, -1, 1, 1)
 
     def forward(self, x_t: torch.Tensor, v_prev: torch.Tensor,
@@ -620,7 +657,8 @@ class CorrectorUNet2D(nn.Module):
         if t.ndim == 2:
             t = t[:, 0]
         x = torch.cat([x_t, v_prev], dim=1).float()
-        x = self._normalize_input(x)
+        ns = self._norm_stats(x)
+        x = self._normalize_input(x, ns)
 
         skips = []
         for i, blk in enumerate(self.enc):
@@ -651,7 +689,7 @@ class CorrectorUNet2D(nn.Module):
         x = self.dec1(x)
 
         out = self.head_conv(F.silu(self.head_gn(x)))
-        out = self._unnormalize_output(out)
+        out = self._unnormalize_output(out, ns)
         return out.to(v_prev.dtype)
 
     # ── K-pass refinement ─────────────────────────────────────────────

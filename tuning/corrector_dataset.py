@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset, Sampler
 
 from . import refiner_data
@@ -101,8 +102,11 @@ class CorrectorDataset(Dataset):
 
         self.weights = torch.tensor(self.pair_weights, dtype=torch.float64)
 
-        # Per-channel normalization stats (perchannel option, plan 6d):
-        # mean/std over the 32-ch concat input (x_t ⊕ v_MA), from a subsample.
+        # Per-channel normalization stats (perchannel option, plan 6d),
+        # computed **per resolution stratum** (each latent shape's 32-ch concat
+        # input (x_t ⊕ v_MA) gets its own mean/std; the corrector selects the
+        # nearest stratum by spatial area at runtime). rel_mse_eps is pooled
+        # across strata (a global floor constant).
         self.normalization_stats: Optional[dict] = None
         self.rel_mse_eps: float = 1e-8
         if compute_normalization or normalization_samples > 0:
@@ -124,37 +128,49 @@ class CorrectorDataset(Dataset):
 
     def _compute_stats(self, n_samples: int, show_progress: bool = True):
         """Per-channel mean/std of the 32ch input (x_t ⊕ v_MA) and the rel-MSE ε
-        floor, from one shared random subsample — random-access blob reads,
-        one pair at a time (plan 6d/6f)."""
-        means, sqs, v_sq = [], [], []
+        floor, per resolution stratum — random-access blob reads, one pair at a
+        time, ``n_samples`` per stratum (plan 6d/6f, resolution-aware)."""
+        shapes = sorted({s for s in self.pair_shape}, key=lambda s: s[0] * s[1])
+        needed = {s: max(0, int(n_samples)) for s in shapes}
+        means: Dict[Tuple[int, int], List[torch.Tensor]] = {s: [] for s in shapes}
+        sqs: Dict[Tuple[int, int], List[torch.Tensor]] = {s: [] for s in shapes}
+        v_sq: List[float] = []
         idxs = list(range(len(self.pairs)))
         self.rng.shuffle(idxs)
+        remaining = sum(needed.values())
         pbar = None
-        if show_progress and tqdm is not None and n_samples > 0:
-            pbar = tqdm(total=min(n_samples, len(idxs)), desc="dataset stats",
+        if show_progress and tqdm is not None and remaining > 0:
+            pbar = tqdm(total=remaining, desc="dataset stats",
                         unit="pair", leave=False, dynamic_ncols=True)
-        n = 0
         for i in idxs:
-            if n >= n_samples:
+            if remaining <= 0:
                 break
+            shape = self.pair_shape[i]
+            if needed.get(shape, 0) <= 0:
+                continue
             gi, slot, t, lag = self.pairs[i]
             entry = self.entries[gi]
             x, v, vt = refiner_data.load_pair_tensors(
                 self.data_dir / entry["bin"], (t, slot, lag))
             z = torch.cat([x, v], dim=0).float()
-            means.append(z.mean(dim=(1, 2)))
-            sqs.append((z * z).mean(dim=(1, 2)))
+            means[shape].append(z.mean(dim=(1, 2)))
+            sqs[shape].append((z * z).mean(dim=(1, 2)))
             v_sq.append(vt.float().square().mean().item())
-            n += 1
+            needed[shape] -= 1
+            remaining -= 1
             if pbar is not None:
                 pbar.update(1)
         if pbar is not None:
             pbar.close()
-        if n:
-            mean = torch.stack(means).mean(dim=0)
-            var = torch.stack(sqs).mean(dim=0) - mean * mean
-            std = var.clamp_min(1e-6).sqrt()
-            self.normalization_stats = {"mean": mean.tolist(), "std": std.tolist()}
+        strata = [(s, means[s], sqs[s]) for s in shapes if means[s]]
+        if strata:
+            self.normalization_stats = {
+                "areas": [s[0] * s[1] for s, _, _ in strata],
+                "mean": [torch.stack(m).mean(dim=0).tolist() for _, m, _ in strata],
+                "std": [(torch.stack(q).mean(dim=0) - torch.stack(m).mean(dim=0) ** 2)
+                        .clamp_min(1e-6).sqrt().tolist()
+                        for _, m, q in strata],
+            }
             mean_v_sq = sum(v_sq) / len(v_sq)
             self.rel_mse_eps = max(mean_v_sq * self.rel_mse_eps_scale, 1e-8)
 
@@ -233,10 +249,23 @@ def collate_corrector(batch: List[dict]) -> dict:
     }
 
 
-def augment_batch(batch: dict, rng: random.Random) -> dict:
-    """Joint spatial flips + optional 90° rotations on GPU (plan 7.4 / 6f).
+def augment_batch(batch: dict, rng: random.Random, scale_aug: bool = True) -> dict:
+    """Joint spatial flips + 90° rotations + random-scale (plan 7.4 / 6f).
 
-    Applies the same op to x_t, v_ma, v_true. No crops, no color.
+    - per-sample h/v flips (shape-preserving);
+    - **batch-level** 90° rotation (k=1..3): a single k for the whole batch so
+      the H/W transpose is uniform and the stacked tensor stays rectangular —
+      this is the only layout that works for non-square latents (1024×512 →
+      128×64), where per-sample odd rotations would mix shapes in one batch;
+      pairs stay exact (rotating x_t/v_ma/v_true jointly is covariant);
+    - **batch-level random scale, round-trip** (downscale to s·(H,W), then
+      back to (H,W)): resampling is linear per channel, so
+      resize(v_true) − resize(v_ma) = resize(v_true − v_ma) exactly — the
+      target correction stays consistent while the model learns scale-robust
+      content (multi-scale aug; no padding, no crops, no shape change, so the
+      per-stratum normalization selection by spatial area stays exact).
+
+    No crops, no color.
     """
     b = batch["x_t"].shape[0]
     for i in range(b):
@@ -248,11 +277,24 @@ def augment_batch(batch: dict, rng: random.Random) -> dict:
             batch["x_t"][i] = batch["x_t"][i].flip(-2)
             batch["v_ma"][i] = batch["v_ma"][i].flip(-2)
             batch["v_true"][i] = batch["v_true"][i].flip(-2)
-        if rng.random() < 0.25:
-            k = rng.randint(1, 3)
-            batch["x_t"][i] = torch.rot90(batch["x_t"][i], k, (-2, -1))
-            batch["v_ma"][i] = torch.rot90(batch["v_ma"][i], k, (-2, -1))
-            batch["v_true"][i] = torch.rot90(batch["v_true"][i], k, (-2, -1))
+    if rng.random() < 0.25:
+        k = rng.randint(1, 3)
+        for key in ("x_t", "v_ma", "v_true"):
+            batch[key] = torch.rot90(batch[key], k, (-2, -1))
+    if scale_aug and rng.random() < 0.5:
+        s = rng.choice((0.75, 1.0))
+        if s != 1.0:
+            h, w = batch["x_t"].shape[-2:]
+            nh = max(8, int(round(h * s)) // 4 * 4)
+            nw = max(8, int(round(w * s)) // 4 * 4)
+            if (nh, nw) != (h, w):
+                for key in ("x_t", "v_ma", "v_true"):
+                    t = batch[key].float()
+                    t = F.interpolate(t, size=(nh, nw), mode="bilinear",
+                                      align_corners=False)
+                    batch[key] = F.interpolate(t, size=(h, w), mode="bilinear",
+                                               align_corners=False).to(
+                        batch[key].dtype)
     return batch
 
 
@@ -265,14 +307,20 @@ class CorrectorBatchSampler(Sampler):
       interleaved and shuffled (seeded; epoch counter advances each iter).
     """
 
-    def __init__(self, dataset: CorrectorDataset, batch_size: int, seed: int = 42):
+    def __init__(self, dataset: CorrectorDataset, batch_size: int, seed: int = 42,
+                 include_areas: Optional[List[int]] = None):
+        """``include_areas`` restricts sampling to pairs whose latent spatial
+        area (H·W) is in the given list — used by the resolution curriculum's
+        stage 1 (e.g. only 64×64 pairs); None = all resolutions."""
         self.dataset = dataset
         self.batch_size = batch_size
         self.seed = seed
         self._epoch = 0
+        self.include_areas = set(int(a) for a in include_areas) if include_areas else None
         self.buckets: Dict[Tuple[int, int], List[int]] = {}
         for i, (h, w) in enumerate(dataset.pair_shapes()):
-            self.buckets.setdefault((h, w), []).append(i)
+            if self.include_areas is None or h * w in self.include_areas:
+                self.buckets.setdefault((h, w), []).append(i)
 
     def __len__(self) -> int:
         total = 0

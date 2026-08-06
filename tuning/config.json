@@ -127,6 +127,13 @@
         "normalization": "perchannel",
         "normalization_samples": 128,
         "lag_weights": [1, 1, 1, 1, 1],
+        "resolution_curriculum": {
+            "enabled": true,
+            "stage1_fraction": 0.6,
+            "stage1_shapes": ["64x64"]
+        },
+        "accumulate_big_batches": true,
+        "scale_aug": true,
         "seed": 42
     },
 

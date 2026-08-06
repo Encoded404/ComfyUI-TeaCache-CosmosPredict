@@ -666,8 +666,11 @@ def main(argv=None):
     tensors = {"x_t": [], "v_ma": [], "v_true": [], "delta": []}
     gap_true, gap_delta = [], []
     deltas_by_lag: Dict[int, List[Tuple[int, torch.Tensor]]] = {}
-    v_ma_all, v_true_all, x_t_all = [], [], []
-    v_true_by_slot: Dict[int, List[torch.Tensor]] = {}
+    deltas_by_lag_shape: Dict[int, Dict[Tuple[int, int], List[Tuple[int, torch.Tensor]]]] = {}
+    v_ma_by_shape: Dict[Tuple[int, int], List[torch.Tensor]] = {}
+    v_true_by_shape: Dict[Tuple[int, int], List[torch.Tensor]] = {}
+    x_t_by_shape: Dict[Tuple[int, int], List[torch.Tensor]] = {}
+    v_true_corr_by_shape: Dict[Tuple[int, int], List[torch.Tensor]] = {}
     t_an0 = time.time()
     bar = _bar(show_progress, len(entries), "analysis", "gen")
     for entry in entries:
@@ -675,7 +678,6 @@ def main(argv=None):
         n_steps = max(int(entry.get("num_steps", 1)), 1)
         for slot in gen.recorded_slots:
             vts = gen.v_true[slot]
-            v_true_by_slot.setdefault(slot, [])
             # t-gap cancellation (all steps, all lags)
             for t in range(1, len(vts)):
                 gap_true.append((vts[t].float() - vts[t - 1].float()).abs().mean().item())
@@ -686,21 +688,28 @@ def main(argv=None):
             for t in range(min(len(vts), 8)):
                 vt = vts[t]
                 xt = gen.x[slot][t]
-                v_true_by_slot[slot].append(vt)
+                vshape = (int(vt.shape[-2]), int(vt.shape[-1]))
+                # step-correlation pairs must be same-shape: consecutive v_true
+                # entries are compared, so group per shape (mixed-resolution
+                # corpora would otherwise concatenate 64² and 128² tensors)
+                v_true_corr_by_shape.setdefault(vshape, []).append(vt)
                 if len(tensors["x_t"]) < 12:
                     tensors["x_t"].append(xt)
                     tensors["v_true"].append(vt)
                 region = min(2, 3 * t // n_steps)
                 for lag in sorted(gen.v_ma[slot][t]):
                     vm = gen.v_ma[slot][t][lag]
-                    deltas_by_lag.setdefault(lag, []).append((region, vt - vm))
+                    d = vt - vm
+                    shape = (int(d.shape[-2]), int(d.shape[-1]))
+                    deltas_by_lag.setdefault(lag, []).append((region, d))
+                    deltas_by_lag_shape.setdefault(lag, {}).setdefault(shape, []).append((region, d))
                     if len(tensors["v_ma"]) < 12:
                         tensors["v_ma"].append(vm)
-                        tensors["delta"].append(vt - vm)
-                    if len(v_ma_all) < 256:
-                        v_ma_all.append(vm)
-                        v_true_all.append(vt)
-                        x_t_all.append(xt)
+                        tensors["delta"].append(d)
+                    if len(v_ma_by_shape.setdefault(shape, [])) < 256:
+                        v_ma_by_shape[shape].append(vm)
+                        v_true_by_shape.setdefault(shape, []).append(vt)
+                        x_t_by_shape.setdefault(shape, []).append(xt)
         if bar is not None:
             bar.update(1)
     if bar is not None:
@@ -728,25 +737,40 @@ def main(argv=None):
           f"→ ratio {tg['ratio']} (<1 confirms the t-gap cancels)")
     _write_report(report, data_dir)
 
-    # ── 3b learnability ────────────────────────────────────────────────
+    # ── 3b learnability (per resolution stratum — the corpus mixes latent
+    # shapes, and SVD rank / affine ceiling are resolution-dependent) ─────
     learn = {}
-    learn["svd"] = svd_rank_95([d for _, d in deltas_by_lag.get(1, [])][:128])
+    d1 = deltas_by_lag_shape.get(1, {})
+    learn["svd"] = {f"{s[0]}x{s[1]}": svd_rank_95([d for _, d in d1.get(s, [])][:128])
+                    for s in sorted(d1, key=lambda s: s[0] * s[1])}
+    pooled_x = [t for s in sorted(x_t_by_shape) for t in x_t_by_shape[s]]
+    pooled_ma = [t for s in sorted(v_ma_by_shape) for t in v_ma_by_shape[s]]
+    pooled_vt = [t for s in sorted(v_true_by_shape) for t in v_true_by_shape[s]]
     learn["predictability_ceiling"] = {
-        "per_channel_affine": round(per_channel_affine_ceiling(v_ma_all, v_true_all), 4),
-        "pooled_feature": round(pooled_feature_ceiling(x_t_all, v_ma_all, v_true_all), 4),
+        "per_channel_affine": {f"{s[0]}x{s[1]}":
+                               round(per_channel_affine_ceiling(v_ma_by_shape[s], v_true_by_shape[s]), 4)
+                               for s in sorted(v_ma_by_shape, key=lambda s: s[0] * s[1])},
+        "pooled_feature": round(pooled_feature_ceiling(pooled_x, pooled_ma, pooled_vt), 4),
     }
-    learn["v_true_step_correlation"] = step_correlations(v_true_by_slot)
+    learn["v_true_step_correlation"] = step_correlations(v_true_corr_by_shape)
     learn["staleness_curve"] = staleness_curve(deltas_by_lag)
-    learn["delta_distribution"] = delta_distribution([d for _, d in deltas_by_lag.get(1, [])])
+    learn["delta_distribution"] = {f"{s[0]}x{s[1]}": delta_distribution([d for _, d in d1.get(s, [])])
+                                   for s in sorted(d1, key=lambda s: s[0] * s[1])}
     report["learnability"] = learn
 
-    rank = learn["svd"]["rank_95"]
-    ceiling = learn["predictability_ceiling"]["per_channel_affine"]
+    # Decision gate on the dominant (most lag-1 delta samples) stratum — the
+    # pooled-mix numbers would average incomparable resolutions.
+    dom = max(d1, key=lambda s: len(d1[s])) if d1 else None
+    dom_key = f"{dom[0]}x{dom[1]}" if dom else None
+    rank = learn["svd"].get(dom_key, {}).get("rank_95") if dom_key else None
+    ceiling = learn["predictability_ceiling"]["per_channel_affine"].get(dom_key) \
+        if dom_key else None
     monotone = learn["staleness_curve"].get("per_region_monotone", False)
     gate = {
         "effective_rank_le_8": bool(rank is not None and rank <= 8),
         "ceiling_le_60pct": bool(ceiling is not None and ceiling <= 0.60),
         "staleness_per_region_monotone": bool(monotone),
+        "stratum": dom_key,
         "proceed": bool((rank is None or rank <= 8) and (ceiling is None or ceiling <= 0.60)
                         and monotone),
     }
@@ -754,9 +778,13 @@ def main(argv=None):
         gate["note"] = ("reconsider: larger model, or the token-residual "
                         "strategy (plan §4)")
     report["decision_gate"] = gate
-    print(f"\n  SVD rank(95%): {rank}   affine ceiling (1−R²): {ceiling}   "
-          f"staleness monotone: {monotone}")
-    print(f"  Decision gate: {'PROCEED' if gate['proceed'] else 'RECONSIDER'}")
+    print(f"\n  SVD rank(95%): " + "  ".join(
+        f"{k}={v.get('rank_95')}" for k, v in sorted(learn['svd'].items())))
+    print(f"  Affine ceiling (1−R²): " + "  ".join(
+        f"{k}={v:.4f}" for k, v in sorted(learn['predictability_ceiling']['per_channel_affine'].items())))
+    print(f"  Staleness monotone: {monotone}")
+    print(f"  Decision gate ({dom_key or 'no lag-1 deltas'}): "
+          f"{'PROCEED' if gate['proceed'] else 'RECONSIDER'}")
     stal = learn["staleness_curve"]
     for r in range(3):
         region = stal.get(f"region_{r}")
@@ -768,7 +796,7 @@ def main(argv=None):
     # ── 3d Day-1 ───────────────────────────────────────────────────────
     print("\n  Day-1 experiment (MLP → tiny UNet, plan 3d)...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    mlp_err = day1_mlp(x_t_all, v_ma_all, v_true_all, device)
+    mlp_err = day1_mlp(pooled_x, pooled_ma, pooled_vt, device)
     print(f"  Day-1 MLP (pooled features) mean-Δ error: {mlp_err:.5f}")
     day1 = day1_unet(data_dir, device, max_steps=args.day1_steps,
                      batch_size=args.day1_batch, show_progress=show_progress,

@@ -36,7 +36,7 @@ import json
 import random
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -119,19 +119,28 @@ class SophiaG(torch.optim.Optimizer):
         """GNB diagonal-Hessian estimate on a fp32 loss with a live graph.
 
         Cost: one extra forward + backward every ``hessian_every`` steps
-        (amortized ~10–15%). Must be called before ``step``.
+        (amortized ~10–15%). Must be called before ``step``. Parameters not
+        used in the graph (e.g. the prompt layers on an all-uncond 0-token
+        batch) are skipped — their Hessian is undefined that step and their
+        stored h stays stale until a batch that exercises them.
         """
         self._hessian_steps += 1
         params = [p for g in self.param_groups for p in g["params"] if p.requires_grad]
         if not params:
             return
-        grads = torch.autograd.grad(loss, params, create_graph=True, retain_graph=True)
-        us = [torch.randn_like(g) for g in grads]
+        grads = torch.autograd.grad(loss, params, create_graph=True,
+                                    retain_graph=True, allow_unused=True)
+        used = [(p, g) for p, g in zip(params, grads) if g is not None]
+        if not used:
+            return
+        us = [torch.randn_like(g) for _, g in used]
+        used_params = [p for p, _ in used]
         gu = torch.autograd.grad(
-            [(g * u).sum() for g, u in zip(grads, us)], params, retain_graph=True
+            [(g * u).sum() for (_, g), u in zip(used, us)], used_params,
+            retain_graph=True,
         )
         with torch.no_grad():
-            for p, u, gu_i in zip(params, us, gu):
+            for p, u, gu_i in zip(used_params, us, gu):
                 self._state(p)["h"].copy_((u * gu_i).detach().clamp_min(0))
         self._hessian_pending = True
 
@@ -229,6 +238,15 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--normalization-samples", type=int, default=None,
                         help="Pairs subsampled for normalization/ε stats "
                              "(config: normalization_samples)")
+    parser.add_argument("--resolution-curriculum", type=int, default=None,
+                        help="Stage-1 (e.g. 64x64-only) resolution curriculum "
+                             "(config: resolution_curriculum.enabled)")
+    parser.add_argument("--accumulate-big-batches", type=int, default=None,
+                        help="Gradient-accumulate ÷4 resolution buckets up to a "
+                             "full batch (config: accumulate_big_batches)")
+    parser.add_argument("--scale-aug", type=int, default=None,
+                        help="Round-trip 0.75× random-scale augmentation "
+                             "(config: scale_aug)")
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--eval-every", type=int, default=None)
     parser.add_argument("--compile", type=int, default=None,
@@ -270,6 +288,8 @@ def resolve_config(args: argparse.Namespace) -> dict:
         "lag_weights": ("lag_weights", [1, 1, 1, 1, 1]),
         "normalization": ("normalization", "none"),
         "normalization_samples": ("normalization_samples", 128),
+        "accumulate_big_batches": ("accumulate_big_batches", True),
+        "scale_aug": ("scale_aug", True),
         "max_steps": ("max_steps", 60000),
         "eval_every": ("eval_every", 500),
         "seed": ("seed", 42),
@@ -288,6 +308,8 @@ def resolve_config(args: argparse.Namespace) -> dict:
     cfg["multipass"] = bool(cfg["multipass"])
     cfg["k_curriculum"] = bool(cfg["k_curriculum"])
     cfg["stop_grad"] = bool(cfg["stop_grad"])
+    cfg["accumulate_big_batches"] = bool(cfg["accumulate_big_batches"])
+    cfg["scale_aug"] = bool(cfg["scale_aug"])
     cfg["compile"] = bool(args.compile)
     cfg["channels_last"] = bool(args.channels_last)
     cfg["refine_passes_max"] = max(1, min(int(cfg["refine_passes_max"]), 4))
@@ -302,6 +324,29 @@ def resolve_config(args: argparse.Namespace) -> dict:
         raise SystemExit(f"[train_corrector] normalization=perchannel needs "
                          f"--normalization-samples >= 1, got "
                          f"{cfg['normalization_samples']}")
+    rc = rt.get("resolution_curriculum") or {}
+    if isinstance(rc, dict):
+        cfg["resolution_curriculum"] = dict(rc)
+    elif isinstance(rc, (bool, int)):
+        cfg["resolution_curriculum"] = {"enabled": bool(rc)}
+    else:
+        cfg["resolution_curriculum"] = {}
+    if args.resolution_curriculum is not None:
+        cfg["resolution_curriculum"]["enabled"] = bool(args.resolution_curriculum)
+    rc = cfg["resolution_curriculum"]
+    rc.setdefault("enabled", False)
+    rc.setdefault("stage1_fraction", 0.6)
+    rc.setdefault("stage1_shapes", ["64x64"])
+    rc["enabled"] = bool(rc["enabled"])
+    rc["stage1_fraction"] = max(0.0, min(float(rc["stage1_fraction"]), 1.0))
+    stage1_areas = []
+    for spec in rc.get("stage1_shapes") or ["64x64"]:
+        if isinstance(spec, (list, tuple)) and len(spec) == 2:
+            w, h = int(spec[0]), int(spec[1])
+        else:
+            w, h = refiner_data.parse_resolution(str(spec))
+        stage1_areas.append(w * h)
+    rc["stage1_areas"] = sorted(set(stage1_areas))
     cfg["out"] = args.out or str(Path(__file__).resolve().parent.parent / "models")
     cfg["data"] = args.data
     cfg["resume"] = args.resume
@@ -351,10 +396,13 @@ def compute_train_loss(model, batch, Ks: torch.Tensor, loss_fn, eps: float,
 
 
 def eval_model(model, eval_loader, lags: List[int], ks: List[int],
-               device, eps: float, show_progress: bool = False) -> Dict:
-    """Per-lag, per-K rel-MSE (‖v̂−v_true‖₂/‖v_true‖₂) and cosine."""
+               device, eps: float, show_progress: bool = False) -> Tuple[Dict, Dict]:
+    """Per-lag, per-K rel-MSE (‖v̂−v_true‖₂/‖v_true‖₂) and cosine, plus the
+    same metrics grouped per spatial shape ((k, (h, w))) for the per-resolution
+    eval report (resolution-independence check)."""
     model.eval()
     acc = {(k, lag): [0.0, 0.0, 0] for k in ks for lag in lags}
+    acc_shape: Dict[Tuple[int, Tuple[int, int]], List[float]] = {}
     batches = eval_loader
     if show_progress and tqdm is not None:
         batches = tqdm(eval_loader, desc="eval", unit="batch", leave=False,
@@ -368,6 +416,7 @@ def eval_model(model, eval_loader, lags: List[int], ks: List[int],
             pmask = batch["prompt_mask"].to(device)
             t = batch["t_frac"].to(device)
             lags_b = batch["lag"].tolist()
+            hw = (int(x.shape[-2]), int(x.shape[-1]))
             for k in ks:
                 v = v0
                 for _ in range(k):
@@ -383,22 +432,41 @@ def eval_model(model, eval_loader, lags: List[int], ks: List[int],
                         a[0] += rel[j]
                         a[1] += cos[j]
                         a[2] += 1
+                a = acc_shape.setdefault((k, hw), [0.0, 0.0, 0.0])
+                a[0] += sum(rel)
+                a[1] += sum(cos)
+                a[2] += len(rel)
     out = {}
     for (k, lag), (s_rel, s_cos, n) in acc.items():
         if n:
             out[(k, lag)] = {"rel_mse": s_rel / n, "cosine": s_cos / n, "n": n}
+    by_shape = {}
+    for (k, hw), (s_rel, s_cos, n) in acc_shape.items():
+        if n:
+            by_shape[(k, hw)] = {"rel_mse": s_rel / n, "cosine": s_cos / n, "n": n}
     model.train()
-    return out
+    return out, by_shape
 
 
 def load_linear_ceiling(data_dir: Path) -> Optional[float]:
-    """Probe's per-channel affine ceiling (1−R²) for the did-it-learn gate."""
+    """Probe's per-channel affine ceiling (1−R²) for the did-it-learn gate.
+
+    The probe report is per-resolution; the gate ceiling is taken from the
+    report's dominant stratum (``decision_gate.stratum``), falling back to the
+    max across strata, and legacy flat reports are still accepted.
+    """
     report = data_dir.parent / "refiner_probe_report.json"
     if not report.exists():
         return None
     try:
         r = json.loads(report.read_text())
-        return float(r["learnability"]["predictability_ceiling"]["per_channel_affine"])
+        pca = r["learnability"]["predictability_ceiling"]["per_channel_affine"]
+        if isinstance(pca, dict):
+            stratum = (r.get("decision_gate") or {}).get("stratum")
+            if stratum and stratum in pca:
+                return float(pca[stratum])
+            return float(max(pca.values()))
+        return float(pca)
     except Exception:
         return None
 
@@ -424,7 +492,8 @@ def save_full_state(path, model, ema, opt, scaler, scheduler, step, cfg, best,
 
 def config_drift(snapshot: dict, cfg: dict) -> List[str]:
     keys = ["model_size", "depth", "optimizer", "lr", "batch_size", "loss",
-            "max_steps", "refine_passes_max", "multipass"]
+            "max_steps", "refine_passes_max", "multipass",
+            "resolution_curriculum", "accumulate_big_batches", "scale_aug"]
     drift = []
     for k in keys:
         if snapshot.get(k) != cfg.get(k):
@@ -482,6 +551,28 @@ def main(argv=None):
     steps_per_epoch = max(len(sampler), 1)
     print(f"  Batches/epoch:  {steps_per_epoch}   "
           f"(~{cfg['max_steps'] / steps_per_epoch:.1f} epochs over {cfg['max_steps']} steps)")
+
+    # Resolution curriculum (stage 1 = cheap stratum only, then full mix):
+    # the stage-1 sampler filters the pair buckets by latent area, so its
+    # batches are ~4× cheaper while the model builds scale-invariant features.
+    curriculum = cfg["resolution_curriculum"]
+    stage1_loader = None
+    stage1_until = 0
+    if curriculum.get("enabled"):
+        s1_sampler = CorrectorBatchSampler(
+            ds, batch_size=cfg["batch_size"], seed=cfg["seed"] + 7,
+            include_areas=curriculum["stage1_areas"])
+        if s1_sampler.buckets:
+            stage1_loader = DataLoader(ds, batch_sampler=s1_sampler,
+                                       collate_fn=collate_corrector, num_workers=0)
+            stage1_until = int(cfg["max_steps"] * curriculum["stage1_fraction"])
+            print(f"  Curriculum:     stage 1 (steps ≤ {stage1_until}) → "
+                  f"areas {curriculum['stage1_areas']}; then full mix")
+        else:
+            print(f"  ⚠ resolution curriculum enabled but no pairs at "
+                  f"{curriculum['stage1_areas']} — training full mix only")
+    print(f"  Scale aug:      {cfg['scale_aug']} (0.75× round-trip)   "
+          f"accumulate ÷4 buckets: {cfg['accumulate_big_batches']}")
     eval_loader = None
     try:
         eval_ds = CorrectorDataset(data_dir, only_eval=True, seed=cfg["seed"],
@@ -599,7 +690,8 @@ def main(argv=None):
             return b
 
     aug_rng = random.Random(cfg["seed"] + 1000)
-    iter_loader = iter(loader)
+    active_loader = stage1_loader if stage1_loader is not None else loader
+    iter_loader = iter(active_loader)
     t_start = time.time()
     timer = TrainTimer(window=100)
     metrics = MetricsLog(cfg["metrics"])
@@ -620,19 +712,21 @@ def main(argv=None):
     while step < cfg["max_steps"]:
         step += 1
         t_step0 = time.time()
+        if stage1_until and step == stage1_until + 1:
+            active_loader = loader
+            iter_loader = iter(loader)
+            emit(f"  [curriculum] stage 2: full resolution mix from step {step}")
         try:
             batch = next(iter_loader)
         except StopIteration:
-            iter_loader = iter(loader)
+            iter_loader = iter(active_loader)
             batch = next(iter_loader)
         batch = {k: v.to(device) for k, v in batch.items()}
-        batch = to_cl(augment_batch(batch, aug_rng))
+        batch = to_cl(augment_batch(batch, aug_rng, scale_aug=cfg["scale_aug"]))
 
         k_max_cur = k_max_final
         if cfg["k_curriculum"] and cfg["multipass"]:
             k_max_cur = 1 + int(round((k_max_final - 1) * step / cfg["max_steps"]))
-        Ks = torch.randint(1, k_max_cur + 1, (batch["x_t"].shape[0],),
-                           device=device)
 
         if isinstance(opt, SophiaG) and step % cfg["hessian_every"] == 0:
             t_h0 = time.time()
@@ -645,11 +739,29 @@ def main(argv=None):
             opt.update_hessian(loss_h)
             timer.add("hessian", time.time() - t_h0)
 
+        # Gradient accumulation: ÷4 buckets (128² / 1024×512) are accumulated
+        # up to a full batch so every optimizer step sees ~batch_size samples
+        # (equal gradient-noise level across resolutions).
         opt.zero_grad(set_to_none=True)
-        with torch.autocast("cuda", dtype=torch.float16):
-            loss = compute_train_loss(model, batch, Ks, loss_fn, eps,
-                                      cfg["stop_grad"], cfg["multipass"], k_max_cur)
-        scaler.scale(loss).backward()
+        n_micro = max(1, cfg["batch_size"] // int(batch["x_t"].shape[0])) \
+            if cfg["accumulate_big_batches"] else 1
+        micro_losses: List[torch.Tensor] = []
+        for m in range(n_micro):
+            if m > 0:
+                try:
+                    batch = next(iter_loader)
+                except StopIteration:
+                    iter_loader = iter(active_loader)
+                    batch = next(iter_loader)
+                batch = {k: v.to(device) for k, v in batch.items()}
+                batch = to_cl(augment_batch(batch, aug_rng, scale_aug=cfg["scale_aug"]))
+            Ks = torch.randint(1, k_max_cur + 1, (batch["x_t"].shape[0],),
+                               device=device)
+            with torch.autocast("cuda", dtype=torch.float16):
+                loss = compute_train_loss(model, batch, Ks, loss_fn, eps,
+                                          cfg["stop_grad"], cfg["multipass"], k_max_cur)
+            micro_losses.append(loss.detach())
+            scaler.scale(loss).backward()
         scaler.unscale_(opt)
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         scaler.step(opt)
@@ -657,7 +769,7 @@ def main(argv=None):
         ema_update(model, ema, step, decay=cfg["ema_decay"])
         timer.record_step(time.time() - t_step0)
 
-        loss_v = float(loss.item())
+        loss_v = float(sum(micro_losses) / max(len(micro_losses), 1))
         loss_ema = loss_v if loss_ema is None else 0.99 * loss_ema + 0.01 * loss_v
         min_loss = min(min_loss, loss_v)
         grad_norm_v = float(grad_norm) if grad_norm is not None else float("nan")
@@ -693,8 +805,8 @@ def main(argv=None):
 
         if step % cfg["eval_every"] == 0 and eval_loader is not None:
             t_e0 = time.time()
-            results = eval_model(model, eval_loader, lags, ks_eval, device, eps,
-                                 show_progress=(pbar is not None))
+            results, by_shape = eval_model(model, eval_loader, lags, ks_eval, device,
+                                           eps, show_progress=(pbar is not None))
             k1_pairs = [r["rel_mse"] for (kk, _), r in results.items() if kk == 1]
             k1 = sum(k1_pairs) / max(len(k1_pairs), 1) if k1_pairs else None
             row = "  [eval] step %d  " % step
@@ -707,6 +819,13 @@ def main(argv=None):
                 parts = [f"K{k}={results.get((k, lag), {}).get('rel_mse', float('nan')):.4f}"
                          for k in ks_eval]
                 emit(f"      lag {lag:>2d}: " + "  ".join(parts))
+            shape_keys = sorted({hw for (_, hw) in by_shape}, key=lambda hw: hw[0] * hw[1])
+            for hw in shape_keys:
+                parts = []
+                for k in ks_eval:
+                    r = by_shape.get((k, hw))
+                    parts.append(f"K{k}={r['rel_mse']:.4f}" if r is not None else f"K{k}=  -  ")
+                emit(f"      {hw[0]}x{hw[1]}: " + "  ".join(parts))
             if ceiling is not None and not gate_fired and step >= gate_deadline:
                 if k1 is None or k1 > 0.8 * ceiling:
                     emit("  ✗ BELOW LINEAR CEILING — did-it-learn gate fired; "
@@ -765,6 +884,9 @@ def main(argv=None):
                           for k in ks_eval},
                 "per_lag": {str(lag): results.get((1, lag), {}).get("rel_mse")
                             for lag in lags},
+                "per_shape": {f"{h}x{w}": {str(k): round(by_shape.get((k, (h, w)), {}).get("rel_mse", float("nan")), 6)
+                                           for k in ks_eval}
+                              for (h, w) in shape_keys},
                 "best_k1": best, "best_step": best_step, "gate_fired": gate_fired,
             })
 
