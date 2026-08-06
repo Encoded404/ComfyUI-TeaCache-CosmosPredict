@@ -55,7 +55,8 @@ class CorrectorDataset(Dataset):
                  rel_mse_eps_scale: float = 1e-4,
                  normalization_samples: int = 128,
                  compute_normalization: bool = False,
-                 show_progress: bool = True):
+                 show_progress: bool = True,
+                 manifest: Optional[dict] = None):
         data_dir = Path(data_dir)
         self.data_dir = data_dir
         self.seed = seed
@@ -64,7 +65,7 @@ class CorrectorDataset(Dataset):
         self.rng = random.Random(seed)
         self._gen_cache: "OrderedDict[str, refiner_data.RefinerGeneration]" = OrderedDict()
 
-        self.entries = refiner_data.iter_generations(data_dir)
+        self.entries = refiner_data.iter_generations(data_dir, manifest=manifest)
         if only_eval:
             self.entries = [e for e in self.entries if e.get("eval")]
         elif not include_eval:
@@ -123,7 +124,8 @@ class CorrectorDataset(Dataset):
 
     def _compute_stats(self, n_samples: int, show_progress: bool = True):
         """Per-channel mean/std of the 32ch input (x_t ⊕ v_MA) and the rel-MSE ε
-        floor, from one shared random subsample — one load per pair (plan 6d/6f)."""
+        floor, from one shared random subsample — random-access blob reads,
+        one pair at a time (plan 6d/6f)."""
         means, sqs, v_sq = [], [], []
         idxs = list(range(len(self.pairs)))
         self.rng.shuffle(idxs)
@@ -135,7 +137,10 @@ class CorrectorDataset(Dataset):
         for i in idxs:
             if n >= n_samples:
                 break
-            x, v, vt, _ = self._load_pair(i)
+            gi, slot, t, lag = self.pairs[i]
+            entry = self.entries[gi]
+            x, v, vt = refiner_data.load_pair_tensors(
+                self.data_dir / entry["bin"], (t, slot, lag))
             z = torch.cat([x, v], dim=0).float()
             means.append(z.mean(dim=(1, 2)))
             sqs.append((z * z).mean(dim=(1, 2)))

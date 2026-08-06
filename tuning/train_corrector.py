@@ -43,6 +43,7 @@ import torch.nn.functional as F
 import torch.nn as nn
 
 from .config_types import TuningConfig
+from . import refiner_data
 from .corrector import (CorrectorConfig, CorrectorUNet2D, FULL_STEP_FLOP_512,
                         estimate_corrector_flops, save_corrector)
 from .corrector_dataset import (CorrectorBatchSampler, CorrectorDataset,
@@ -478,6 +479,7 @@ def main(argv=None):
     print(f"  Device:         {device}")
 
     print("  Preparing dataset (pair index + normalization stats)...")
+    manifest = refiner_data.load_manifest(data_dir)
     ds = CorrectorDataset(
         data_dir,
         seed=cfg["seed"],
@@ -485,11 +487,12 @@ def main(argv=None):
         compute_normalization=(cfg["normalization"] == "perchannel"),
         normalization_samples=cfg["normalization_samples"],
         show_progress=not cfg["no_progress"],
+        manifest=manifest,
     )
     if not len(ds):
         raise SystemExit("[train_corrector] no training pairs (all generations eval?)")
     print(f"  Training pairs: {len(ds)}   eval pairs: "
-          f"{len(CorrectorDataset(data_dir, only_eval=True, normalization_samples=0))}")
+          f"{len(CorrectorDataset(data_dir, only_eval=True, normalization_samples=0, manifest=manifest))}")
 
     sampler = CorrectorBatchSampler(ds, batch_size=cfg["batch_size"], seed=cfg["seed"])
     loader = DataLoader(ds, batch_sampler=sampler, collate_fn=collate_corrector,
@@ -500,7 +503,7 @@ def main(argv=None):
     eval_loader = None
     try:
         eval_ds = CorrectorDataset(data_dir, only_eval=True, seed=cfg["seed"],
-                                   normalization_samples=0)
+                                   normalization_samples=0, manifest=manifest)
         eval_sampler = CorrectorBatchSampler(eval_ds, batch_size=16, seed=cfg["seed"] + 1)
         eval_loader = DataLoader(eval_ds, batch_sampler=eval_sampler,
                                  collate_fn=collate_corrector, num_workers=0)

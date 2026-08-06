@@ -219,7 +219,7 @@ def _decompress(data: bytes, codec_id: int, dtype_id: int,
             raise RuntimeError(
                 "blosc2 is required to read codec-1 refiner data; pip install blosc2"
             )
-        return _tensor_from_bytes(b2.decompress2(data), dtype_id, shape)
+        return _tensor_from_bytes(b2.decompress(data), dtype_id, shape)
     if codec_id == CODEC_ZFPY:
         z = _zfpy()
         if z is None:
@@ -484,6 +484,60 @@ def load_generation(bin_path: Union[str, Path]) -> RefinerGeneration:
     )
 
 
+def load_pair_tensors(bin_path: Union[str, Path],
+                      pair: Tuple[int, int, int]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Random-access load of one (step, slot, lag) pair's x_t / v_MA / v_true.
+
+    Reads only the header, the offset table and the 2-3 needed blobs instead
+    of decompressing the whole generation (used by the training-dataset stats
+    pass). The d=0 anchor is synthesized: v_MA = v_true (x_t + v_true only).
+    Raises KeyError when the stored lag blob is empty (ring too short), same
+    defensive contract as ``CorrectorDataset._load_pair``.
+    """
+    bin_path = Path(bin_path)
+    with bin_path.open("rb") as f:
+        (magic, version, codec_id, dtype_id, num_slots,
+         c, h, w, num_steps, num_lags, meta_len) = _HDR_BIN.unpack_from(
+            f.read(_HDR_BIN.size))
+        if magic != MAGIC_BIN:
+            raise ValueError(f"not a refiner .bin file: {bin_path}")
+        if version != FORMAT_VERSION:
+            raise ValueError(f"unsupported refiner format version {version} in {bin_path}")
+
+        lags = list(f.read(num_lags))
+        n_tensors = num_steps * num_slots * (num_lags + 2)
+        f.seek(meta_len, 1)
+        table = f.read(_OFF.size * n_tensors)
+        offsets = [_OFF.unpack_from(table, 8 * i)[0] for i in range(n_tensors)]
+        size = f.seek(0, 2)
+
+        t, slot, lag = pair
+        base = (t * num_slots + slot) * (num_lags + 2)
+        vt_idx = base + num_lags + 1
+        if lag == 0:
+            vma_idx = vt_idx
+        else:
+            vma_idx = base + 1 + lags.index(lag)
+
+        def blob(idx: int) -> bytes:
+            start = offsets[idx]
+            end = offsets[idx + 1] if idx + 1 < n_tensors else size
+            f.seek(start)
+            return f.read(end - start)
+
+        shape = (c, h, w)
+        x = _decompress(blob(base), codec_id, dtype_id, shape)
+        vt = _decompress(blob(vt_idx), codec_id, dtype_id, shape)
+        if lag == 0:
+            v = vt
+        else:
+            vb = blob(vma_idx)
+            if not vb:
+                raise KeyError(f"lag {lag} missing at step {t} in {bin_path.stem}")
+            v = _decompress(vb, codec_id, dtype_id, shape)
+    return x, v, vt
+
+
 def load_prompt_file(path: Union[str, Path]) -> Dict[int, Optional[torch.Tensor]]:
     """Load a .prompt.bin file — slot -> (N, D) bf16 tensor (or empty (0, D))."""
     path = Path(path)
@@ -539,9 +593,16 @@ def save_manifest(refiner_dir: Union[str, Path], manifest: dict) -> None:
     tmp.replace(refiner_dir / "manifest.json")
 
 
-def iter_generations(refiner_dir: Union[str, Path]) -> List[dict]:
-    """List manifest entries for all recorded generations."""
-    return load_manifest(refiner_dir).get("generations", [])
+def iter_generations(refiner_dir: Union[str, Path],
+                     manifest: Optional[dict] = None) -> List[dict]:
+    """List manifest entries for all recorded generations.
+
+    ``manifest`` may be a preloaded manifest (from ``load_manifest``) to
+    avoid re-reading/re-parsing the JSON on every dataset construction.
+    """
+    if manifest is None:
+        manifest = load_manifest(refiner_dir)
+    return manifest.get("generations", [])
 
 
 def iter_pairs(refiner_dir: Union[str, Path], include_eval: bool = False,
