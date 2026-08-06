@@ -385,5 +385,8 @@ class CorrectorBatchSampler(Sampler):
                 carry = full[k:]
             if carry:
                 epoch_batches.append(carry)
-        rng.shuffle(epoch_batches)
+        # NOTE: no final shuffle of the batch list — the per-generation run
+        # order above keeps consecutive batches inside the same generation so
+        # the dataset's generation LRU hits; the generation-order shuffle
+        # (rng.shuffle(runs)) already provides epoch-to-epoch randomness.
         yield from epoch_batches
