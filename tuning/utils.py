@@ -964,6 +964,24 @@ def affine_oob_json(aff) -> dict:
     return out
 
 
+def affine_shape_area(shape) -> int:
+    """Latent-area sort key for an affine by_shape key (tuple or 'WxH' str).
+
+    ``affine_oob_json`` stringifies keys, so consumers must accept both forms.
+    """
+    if isinstance(shape, str):
+        h, w = shape.split("x")
+        return int(h) * int(w)
+    return int(shape[0]) * int(shape[1])
+
+
+def affine_shape_label(shape) -> str:
+    """'WxH' label for an affine by_shape key (tuple or already-string)."""
+    if isinstance(shape, str):
+        return shape
+    return f"{shape[0]}x{shape[1]}"
+
+
 class TrainTimer:
     """Per-phase wall-time tracking + robust per-step rate for training loops.
 

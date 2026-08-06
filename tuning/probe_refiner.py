@@ -50,7 +50,8 @@ from .corrector_dataset import CorrectorDataset, CorrectorBatchSampler, collate_
 from .prompt_loader import load_prompt_config, select_prompts, GenerationPromptSampler, resolve_generation
 from .utils import MetricsLog, TrainTimer, format_duration
 from .utils import load_models, sample
-from .utils import (affine_oob_eval, affine_oob_json, collect_affine_maps,
+from .utils import (affine_oob_eval, affine_oob_json, affine_shape_area,
+                    affine_shape_label, collect_affine_maps,
                     split_affine_per_pair)
 from .utils import (delta_distribution, per_channel_affine_ceiling,
                     pooled_feature_ceiling, step_correlations, staleness_curve,
@@ -1081,11 +1082,11 @@ def main(argv=None):
         by_shape = aff.get("by_shape") or {}
         if by_shape:
             print("  affine per stratum (fit = train pairs, scored = eval pairs):")
-            for shape, d in sorted(by_shape.items(), key=lambda kv: kv[0][0] * kv[0][1]):
+            for shape, d in sorted(by_shape.items(), key=lambda kv: affine_shape_area(kv[0])):
                 if d.get("rel_mse") is None:
-                    print(f"    {shape[0]}x{shape[1]}:  no train fit pairs — row skipped")
+                    print(f"    {affine_shape_label(shape)}:  no train fit pairs — row skipped")
                     continue
-                print(f"    {shape[0]}x{shape[1]}:  rel {d['rel_mse']:.4f}  "
+                print(f"    {affine_shape_label(shape)}:  rel {d['rel_mse']:.4f}  "
                       f"(n={d['n_pairs']}, fit {d['fit_n_batches']} batches)  "
                       f"|a−1|≤{d['max_abs_a_minus_1']:.4f}  |b|≤{d['max_abs_b']:.4f}")
         day1["recovery"] = recovery

@@ -54,7 +54,8 @@ from .corrector import (CorrectorConfig, CorrectorUNet2D, FULL_STEP_FLOP_512,
 from .corrector_dataset import (CorrectorBatchSampler, CorrectorDataset,
                                 augment_batch, collate_corrector)
 from .utils import MetricsLog, TrainTimer, format_duration
-from .utils import (affine_oob_eval, affine_oob_json, collect_affine_maps,
+from .utils import (affine_oob_eval, affine_oob_json, affine_shape_area,
+                    affine_shape_label, collect_affine_maps,
                     split_affine_per_pair)
 from .utils import (delta_distribution, per_channel_affine_ceiling,
                     pooled_feature_ceiling, step_correlations, staleness_curve,
@@ -593,11 +594,11 @@ def recovery_table_lines(rows: List[dict],
     by_shape = (affine or {}).get("by_shape") or {}
     if by_shape:
         lines.append("  affine per stratum (fit = train pairs, scored = eval pairs):")
-        for shape, d in sorted(by_shape.items(), key=lambda kv: kv[0][0] * kv[0][1]):
+        for shape, d in sorted(by_shape.items(), key=lambda kv: affine_shape_area(kv[0])):
             if d.get("rel_mse") is None:
-                lines.append(f"    {shape[0]}x{shape[1]}:  no train fit pairs — row skipped")
+                lines.append(f"    {affine_shape_label(shape)}:  no train fit pairs — row skipped")
                 continue
-            lines.append(f"    {shape[0]}x{shape[1]}:  rel {d['rel_mse']:.4f}  "
+            lines.append(f"    {affine_shape_label(shape)}:  rel {d['rel_mse']:.4f}  "
                          f"(n={d['n_pairs']}, fit {d['fit_n_batches']} batches)  "
                          f"|a−1|≤{d['max_abs_a_minus_1']:.4f}  |b|≤{d['max_abs_b']:.4f}")
     return lines
