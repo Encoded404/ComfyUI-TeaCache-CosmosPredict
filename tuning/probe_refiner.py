@@ -50,6 +50,9 @@ from .corrector_dataset import CorrectorDataset, CorrectorBatchSampler, collate_
 from .prompt_loader import load_prompt_config, select_prompts, GenerationPromptSampler, resolve_generation
 from .utils import MetricsLog, TrainTimer, format_duration
 from .utils import load_models, sample
+from .utils import (delta_distribution, per_channel_affine_ceiling,
+                    pooled_feature_ceiling, step_correlations, staleness_curve,
+                    svd_rank_95)
 
 from torch.utils.data import DataLoader
 
@@ -284,114 +287,8 @@ def benchmark_codecs(tensors_by_type: dict) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  3b — learnability stats
+#  3b — learnability stats (shared: utils.py, reused by train_corrector)
 # ═══════════════════════════════════════════════════════════════════════
-
-def _flatten_maps(tensors: List[torch.Tensor]) -> Optional[np.ndarray]:
-    if not tensors:
-        return None
-    return torch.stack([t.float() for t in tensors]).flatten(0, 1).numpy()
-
-
-def svd_rank_95(delta_maps: List[torch.Tensor]) -> dict:
-    """SVD spectrum of Δ_MA (H·W, 16); rank for 95% variance (plan 3b)."""
-    m = torch.stack([d.float() for d in delta_maps])          # (N, C, H, W)
-    m = m.permute(0, 2, 3, 1).reshape(-1, m.shape[1])          # (N·H·W, 16)
-    m = m - m.mean(dim=0, keepdim=True)
-    try:
-        u, s, v = torch.svd(m)
-    except Exception:
-        return {"rank_95": None, "singular_values": None}
-    var = (s * s).cumsum(0)
-    var = var / var[-1].clamp_min(1e-12)
-    rank95 = int((var <= 0.95).sum().item()) + 1
-    return {"rank_95": rank95,
-            "singular_values": [round(float(x), 4) for x in s[:16].tolist()]}
-
-
-def per_channel_affine_ceiling(v_ma_maps: List[torch.Tensor],
-                               v_true_maps: List[torch.Tensor]) -> float:
-    """Best per-channel affine v̂ = a_c·v_MA_c + b_c; 1 − R² (plan 3b)."""
-    x = torch.stack([v.float().flatten(1) for v in v_ma_maps]).reshape(-1, 16)
-    y = torch.stack([v.float().flatten(1) for v in v_true_maps]).reshape(-1, 16)
-    x_aug = torch.cat([x, torch.ones_like(x[:, :1])], dim=1)   # (N, 17)
-    coefs, _, _, _ = torch.linalg.lstsq(x_aug, y)              # (17, 16)
-    pred = x_aug @ coefs
-    ss_res = ((y - pred) ** 2).sum(dim=0)
-    ss_tot = ((y - y.mean(dim=0)) ** 2).sum(dim=0).clamp_min(1e-12)
-    r2 = (1 - ss_res / ss_tot).mean().item()
-    return max(0.0, 1.0 - r2)
-
-
-def pooled_feature_ceiling(x_t_maps, v_ma_maps, v_true_maps) -> float:
-    """Linear predictor from pooled features (per-channel mean/std + t) → 1−R²."""
-    feats, y = [], []
-    for xt, vm, vt in zip(x_t_maps, v_ma_maps, v_true_maps):
-        f = torch.cat([xt.float().mean(dim=(1, 2)), xt.float().std(dim=(1, 2)),
-                       vm.float().mean(dim=(1, 2)), vm.float().std(dim=(1, 2))])
-        feats.append(f)
-        y.append(vt.float().mean(dim=(1, 2)))
-    X = torch.stack(feats)                                      # (N, 64)
-    Y = torch.stack(y)                                          # (N, 16)
-    X = torch.cat([X, torch.ones(X.shape[0], 1)], dim=1)
-    coefs, _, _, _ = torch.linalg.lstsq(X, Y)
-    pred = X @ coefs
-    ss_res = ((Y - pred) ** 2).sum()
-    ss_tot = ((Y - Y.mean(dim=0)) ** 2).sum().clamp_min(1e-12)
-    return float(max(0.0, 1.0 - ss_res / ss_tot).item())
-
-
-def step_correlations(v_true_by_slot: dict) -> dict:
-    """Step-to-step correlation of v_true per region (early/mid/late)."""
-    out = {}
-    all_corrs = {"early": [], "mid": [], "late": []}
-    for slot, vts in v_true_by_slot.items():
-        n = len(vts)
-        if n < 3:
-            continue
-        thirds = [("early", slice(0, n // 3)), ("mid", slice(n // 3, 2 * n // 3)),
-                  ("late", slice(2 * n // 3, n))]
-        for name, sl in thirds:
-            for t in range(sl.start + 1, sl.stop):
-                a = vts[t].float().flatten()
-                b = vts[t - 1].float().flatten()
-                all_corrs[name].append(F.cosine_similarity(a[None], b[None]).item())
-    for name, corrs in all_corrs.items():
-        out[name] = round(float(np.mean(corrs)), 4) if corrs else None
-    return out
-
-
-def staleness_curve(delta_by_lag: Dict[int, List[Tuple[int, torch.Tensor]]],
-                    num_regions: int = 3) -> dict:
-    """mean|Δ_MA| vs lag per step region (early/mid/late); monotonicity per region."""
-    curve = {r: {} for r in range(num_regions)}
-    for lag, items in delta_by_lag.items():
-        for region, d in items:
-            curve[region].setdefault(lag, []).append(d.abs().mean().item())
-    out = {}
-    monotone = True
-    for r in range(num_regions):
-        lags = sorted(curve[r])
-        means = {lag: float(np.mean(curve[r][lag])) for lag in lags}
-        out[f"region_{r}"] = means
-        vals = [means[lag] for lag in lags]
-        if len(vals) > 1:
-            diffs = [vals[i + 1] - vals[i] for i in range(len(vals) - 1)]
-            if any(d < -1e-9 for d in diffs):
-                monotone = False
-    out["per_region_monotone"] = monotone
-    return out
-
-
-def delta_distribution(delta_maps: List[torch.Tensor]) -> dict:
-    d = torch.stack([x.float() for x in delta_maps])
-    flat = d.flatten()
-    return {
-        "mean": round(float(flat.mean()), 6),
-        "std": round(float(flat.std()), 6),
-        "sparsity": round(float((flat.abs() < 1e-4).float().mean()), 4),
-        "per_channel_std": [round(float(s), 5) for s in d.std(dim=(0, 2, 3)).tolist()],
-    }
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -653,6 +550,33 @@ def day1_mlp(x_t_maps, v_ma_maps, v_true_maps, device, steps=400, lr=1e-3) -> fl
     return err
 
 
+def per_channel_affine_rel_mse(vm_maps, vt_maps, fit_pairs: int = 128) -> Optional[float]:
+    """Best per-channel affine v̂ = a_c·v_MA_c + b_c, scored with rel-MSE.
+
+    Fits on the first ``fit_pairs`` maps (per-pixel pooled, same formulation as
+    ``per_channel_affine_ceiling``) and scores with the same per-sample rel-MSE
+    used for the Day-1 UNet, so the method lands on the recovery table. Input
+    maps may be single (C, H, W) or batched (B, C, H, W) tensors — the channel
+    dim is taken from ``shape[1]`` either way.
+    """
+    if not vm_maps:
+        return None
+    c = vm_maps[0].shape[1]
+    n_fit = min(len(vm_maps), fit_pairs)
+    xf = torch.cat(vm_maps[:n_fit], 0).reshape(-1, c).float()
+    yf = torch.cat(vt_maps[:n_fit], 0).reshape(-1, c).float()
+    xa = torch.cat([xf, torch.ones_like(xf[:, :1])], dim=1)
+    coefs, _, _, _ = torch.linalg.lstsq(xa, yf)              # (C+1, C)
+    errs = []
+    for vm, vt in zip(vm_maps, vt_maps):
+        x = vm.reshape(-1, c).float()
+        y = vt.reshape(-1, c).float()
+        pred = torch.cat([x, torch.ones_like(x[:, :1])], dim=1) @ coefs
+        err = (pred - y).flatten().norm() / (y.flatten().norm() + 1e-8)
+        errs.append(err.item())
+    return float(np.mean(errs))
+
+
 def day1_unet(data_dir: Path, device, max_steps: int = 600, batch_size: int = 8,
               seed: int = 42, show_progress: bool = False,
               metrics: Optional[MetricsLog] = None,
@@ -735,7 +659,8 @@ def day1_unet(data_dir: Path, device, max_steps: int = 600, batch_size: int = 8,
     def eval_pairs(ds):
         if ds is None:
             return None
-        errs = []
+        errs, base_errs = [], []
+        fit_vm, fit_vt = [], []
         loader = DataLoader(ds, batch_sampler=CorrectorBatchSampler(ds, 16, seed + 1),
                             collate_fn=collate_corrector, num_workers=0)
         bar2 = _bar(show_progress, len(loader), "day1-eval", "batch")
@@ -749,15 +674,24 @@ def day1_unet(data_dir: Path, device, max_steps: int = 600, batch_size: int = 8,
                 err = (v - b["v_true"]).float().flatten(1).norm(dim=1)
                 den = b["v_true"].float().flatten(1).norm(dim=1) + 1e-8
                 errs.extend((err / den).tolist())
+                base = (b["v_ma"] - b["v_true"]).float().flatten(1).norm(dim=1)
+                base_errs.extend((base / den).tolist())
+                if len(fit_vm) < 512:
+                    fit_vm.append(b["v_ma"].float().cpu())
+                    fit_vt.append(b["v_true"].float().cpu())
                 if bar2 is not None:
                     bar2.update(1)
         model.train()
         if bar2 is not None:
             bar2.close()
-        return float(np.mean(errs))
+        return {"rel_mse": float(np.mean(errs)) if errs else None,
+                "base_rel_mse": float(np.mean(base_errs)) if base_errs else None,
+                "affine_rel_mse": per_channel_affine_rel_mse(fit_vm, fit_vt),
+                "n_pairs": len(errs)}
 
     t_e0 = time.time()
-    day1_eval = eval_pairs(eval_ds)
+    ev = eval_pairs(eval_ds)
+    day1_eval = ev["rel_mse"] if ev is not None else None
     if timer is not None:
         timer.add("eval", time.time() - t_e0)
 
@@ -769,6 +703,9 @@ def day1_unet(data_dir: Path, device, max_steps: int = 600, batch_size: int = 8,
         timer.add("lag", time.time() - t_l0)
 
     return {"day1_unet_rel_mse": day1_eval,
+            "base_rel_mse": ev["base_rel_mse"] if ev is not None else None,
+            "affine_rel_mse": ev["affine_rel_mse"] if ev is not None else None,
+            "eval_pairs": ev["n_pairs"] if ev is not None else 0,
             "lag_readability": lag_stats,
             "loss_final": round(final_loss, 6),
             "loss_min": round(min_loss, 6),
@@ -1051,8 +988,44 @@ def main(argv=None):
     report["day1"] = day1
     metrics.write({
         "type": "day1_eval", "rel_mse": day1.get("day1_unet_rel_mse"),
+        "base_rel_mse": day1.get("base_rel_mse"),
+        "affine_rel_mse": day1.get("affine_rel_mse"),
         "verdict": day1["verdict"], "wall_s": round(timer.phase_seconds("train"), 2),
     })
+
+    # ── Recovery table: each method's v_t error vs the TeaCache base ─────
+    base_rel = day1.get("base_rel_mse")
+    if base_rel is not None and base_rel > 0:
+        print("\n  v_t error recovery vs TeaCache base "
+              "(rel-MSE ‖v̂−v_true‖₂/‖v_true‖₂, eval pairs)")
+        print("  " + "─" * 56)
+        print(f"  {'method':<22}{'abs err':>10}{'× base':>9}{'recovered':>12}")
+        print("  " + "─" * 56)
+        recovery = {}
+        rows = [
+            ("TeaCache base (v_MA)", base_rel, 1.0, None),
+            ("Per-channel affine fit", day1.get("affine_rel_mse"), None, None),
+            ("Day-1 tiny UNet", day1.get("day1_unet_rel_mse"), None, None),
+            ("Oracle (v_true)", 0.0, 0.0, 1.0),
+        ]
+        for name, err, ratio, rec in rows:
+            if err is None:
+                print(f"  {name:<22}{'—':>10}")
+                recovery[name] = None
+                continue
+            if ratio is None:
+                ratio = err / base_rel
+                rec = 1.0 - ratio
+            recovery[name] = {"abs_err": round(err, 5),
+                              "ratio_base": round(ratio, 4),
+                              "recovered": round(rec, 4) if rec is not None else None}
+            rec_str = "—" if rec is None else f"{100 * rec:>10.1f}%"
+            print(f"  {name:<22}{err:>10.5f}{ratio:>9.3f}{rec_str:>12}")
+        print("  " + "─" * 56)
+        day1["recovery"] = recovery
+        report["day1"] = day1
+        metrics.write({"type": "recovery", "base_rel_mse": round(base_rel, 5),
+                       "methods": recovery})
 
     # ── Write report + summary ─────────────────────────────────────────
     report_path = _write_report(report, data_dir)

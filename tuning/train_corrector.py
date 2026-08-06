@@ -19,7 +19,12 @@ pairs from a refiner recording run (``outputs/<ts>/refiner_data``). Supports:
   per-50-step durable log lines, per-eval timing reports (train/eval/hessian
   phases; the ETA projects eval + checkpoint overhead), VRAM peak, and a
   JSONL metrics file (``train_metrics.jsonl`` next to the checkpoints;
-  ``--metrics`` relocates, ``--no-progress`` disables the bar).
+  ``--metrics`` relocates, ``--no-progress`` disables the bar);
+- pre-train corpus diagnostics (probe Task 3b stats — SVD rank, affine
+  ceiling, staleness curve, Δ_MA distribution, t-gap cancellation, v_true
+  step correlation; from ``refiner_probe_report.json`` or recomputed from a
+  pair subsample) and per-eval v_t error recovery tables vs the K=0 TeaCache
+  base (abs err, ×base, % recovered), also mirrored into the metrics JSONL.
 
 Every flag defaults to the ``refiner_training`` config section
 (config.json); CLI flags override config (calibrate.py precedence pattern).
@@ -49,6 +54,9 @@ from .corrector import (CorrectorConfig, CorrectorUNet2D, FULL_STEP_FLOP_512,
 from .corrector_dataset import (CorrectorBatchSampler, CorrectorDataset,
                                 augment_batch, collate_corrector)
 from .utils import MetricsLog, TrainTimer, format_duration
+from .utils import (delta_distribution, per_channel_affine_ceiling,
+                    pooled_feature_ceiling, step_correlations, staleness_curve,
+                    svd_rank_95)
 
 from torch.utils.data import DataLoader
 
@@ -481,6 +489,218 @@ def load_linear_ceiling(data_dir: Path) -> Optional[float]:
         return None
 
 
+# ── Recovery table: each method's v_t error vs the TeaCache base ──────
+
+
+def recovery_rows(results: Dict[Tuple[int, int], dict],
+                  ks: List[int]) -> List[Tuple[int, float]]:
+    """Pooled per-K rel-MSE from an eval result dict (K=0 is the base)."""
+    rows = []
+    for k in ks:
+        parts = [r["rel_mse"] for (kk, _), r in results.items() if kk == k]
+        rows.append((k, sum(parts) / max(len(parts), 1) if parts else float("nan")))
+    return rows
+
+
+def recovery_table_lines(rows: List[Tuple[int, float]]) -> List[str]:
+    """Human-readable recovery table: abs err, ×base and % recovered per K."""
+    base = next((err for k, err in rows if k == 0), None)
+    lines = [
+        "  v_t error recovery vs TeaCache base "
+        "(pooled rel-MSE ‖v̂−v_true‖₂/‖v_true‖₂)",
+        "  " + "─" * 56,
+        f"  {'method':<22}{'abs err':>10}{'× base':>9}{'recovered':>12}",
+        "  " + "─" * 56,
+    ]
+    for k, err in rows:
+        name = "TeaCache base (K=0)" if k == 0 else f"Corrector K={k}"
+        if base is None or base <= 0 or err != err:
+            lines.append(f"  {name:<22}{err:>10.5f}")
+            continue
+        ratio = err / base
+        rec = 1.0 - ratio
+        rec_str = "—" if k == 0 else f"{100 * rec:>10.1f}%"
+        lines.append(f"  {name:<22}{err:>10.5f}{ratio:>9.3f}{rec_str:>12}")
+    lines.append("  " + "─" * 56)
+    lines.append(f"  {'Oracle (v_true)':<22}{'0.00000':>10}{'0.000':>9}{'100.0%':>12}")
+    return lines
+
+
+# ── Corpus diagnostics (probe Task 3b stats at pre-train time) ─────────
+
+
+def corpus_diagnostics(data_dir: Path, ds, n_samples: int = 384) -> dict:
+    """Probe learnability stats for pre-train sanity.
+
+    Prefers the probe's ``refiner_probe_report.json`` (written next to the data
+    dir); falls back to recomputing the cheap stats from a random subsample of
+    dataset pairs (random-access loads, no full generation decodes).
+    """
+    report = Path(data_dir).parent / "refiner_probe_report.json"
+    if report.exists():
+        try:
+            return _diagnostics_from_report(report)
+        except Exception:
+            pass
+    return _recompute_diagnostics(ds, n_samples)
+
+
+def _diagnostics_from_report(report_path: Path) -> dict:
+    r = json.loads(report_path.read_text())
+    learn = r.get("learnability") or {}
+    diag = {"source": "probe report"}
+    svd = learn.get("svd") or {}
+    diag["svd"] = {k: v.get("rank_95") for k, v in svd.items()}
+    pca = learn.get("predictability_ceiling") or {}
+    diag["affine_ceiling"] = pca.get("per_channel_affine") or {}
+    diag["pooled_feature_ceiling"] = pca.get("pooled_feature")
+    diag["staleness_curve"] = learn.get("staleness_curve") or {}
+    diag["delta_distribution"] = learn.get("delta_distribution") or {}
+    diag["v_true_step_correlation"] = learn.get("v_true_step_correlation") or {}
+    diag["t_gap_cancellation"] = r.get("t_gap_cancellation") or {}
+    gate = r.get("decision_gate") or {}
+    diag["decision_gate"] = {"proceed": gate.get("proceed"),
+                             "stratum": gate.get("stratum")}
+    return diag
+
+
+def _recompute_diagnostics(ds, n_samples: int = 384) -> dict:
+    """Recompute the cheap learnability stats from a dataset subsample."""
+    data_dir = Path(ds.data_dir)
+    entries = ds.entries
+    pairs = ds.pairs
+    idxs = list(range(len(pairs)))
+    ds.rng.shuffle(idxs)
+    delta_by_lag: Dict[int, List[Tuple[int, torch.Tensor]]] = {}
+    delta_by_shape: Dict[Tuple[int, int], List[torch.Tensor]] = {}
+    affine: Dict[Tuple[int, int], Tuple[List[torch.Tensor], List[torch.Tensor]]] = {}
+    gap_delta: List[float] = []
+    loaded = 0
+    for i in idxs:
+        if loaded >= n_samples:
+            break
+        gi, slot, t, lag = pairs[i]
+        if lag == 0:  # synthesized anchor (v_MA == v_true) — no staleness signal
+            continue
+        entry = entries[gi]
+        try:
+            x, v, vt = refiner_data.load_pair_tensors(
+                data_dir / entry["bin"], (t, slot, lag))
+        except KeyError:
+            continue
+        loaded += 1
+        d = vt - v
+        shape = (int(d.shape[-2]), int(d.shape[-1]))
+        region = min(2, 3 * t // max(int(entry.get("num_steps", 1)), 1))
+        if len(delta_by_lag.setdefault(lag, [])) < 48:
+            delta_by_lag[lag].append((region, d))
+        if lag == 1 and len(delta_by_shape.setdefault(shape, [])) < 128:
+            delta_by_shape[shape].append(d)
+        avm, avt = affine.setdefault(shape, ([], []))
+        if len(avm) < 256:
+            avm.append(v)
+            avt.append(vt)
+        if len(gap_delta) < 512:
+            gap_delta.append(d.abs().mean().item())
+    if not delta_by_shape and not delta_by_lag:
+        raise ValueError("no lag>0 pairs available for diagnostics")
+    diag = {"source": "recomputed", "pairs_loaded": loaded}
+    diag["svd"] = {f"{s[0]}x{s[1]}": svd_rank_95(delta_by_shape[s])["rank_95"]
+                   for s in sorted(delta_by_shape)}
+    diag["affine_ceiling"] = {f"{s[0]}x{s[1]}":
+                              round(per_channel_affine_ceiling(*affine[s]), 4)
+                              for s in sorted(affine)}
+    diag["staleness_curve"] = staleness_curve(delta_by_lag)
+    diag["delta_distribution"] = {
+        f"{s[0]}x{s[1]}": delta_distribution(delta_by_shape[s])
+        for s in sorted(delta_by_shape)}
+    step_stats = _step_stats_from_pairs(data_dir, entries)
+    gap_true = step_stats.pop("_gap_true", None)
+    diag["v_true_step_correlation"] = step_stats
+    gap_delta_m = round(float(sum(gap_delta)) / len(gap_delta), 6) if gap_delta else None
+    diag["t_gap_cancellation"] = {
+        "mean_abs_v_true_step_delta": gap_true,
+        "mean_abs_delta_ma": gap_delta_m,
+        "ratio": round(gap_delta_m / max(gap_true, 1e-9), 3)
+        if gap_delta_m is not None and gap_true else None,
+    }
+    return diag
+
+
+def _step_stats_from_pairs(data_dir: Path, entries: list,
+                           max_gens: int = 2, max_steps: int = 48) -> dict:
+    """v_true step-to-step cosine per region + the t-gap step delta.
+
+    Uses the d=0 anchor (always present) of the first few generations so no
+    lag-dependent pair index is needed.
+    """
+    seq_by_shape: Dict[Tuple[int, int], List[torch.Tensor]] = {}
+    gap_true: List[float] = []
+    for entry in entries[:max_gens]:
+        slots = entry.get("slots") or []
+        if not slots:
+            continue
+        n_steps = int(entry.get("num_steps", 1))
+        prev = {}
+        for t in range(min(n_steps, max_steps)):
+            try:
+                _, _, vt = refiner_data.load_pair_tensors(
+                    data_dir / entry["bin"], (t, slots[0], 0))
+            except KeyError:
+                continue
+            shape = (int(vt.shape[-2]), int(vt.shape[-1]))
+            seq_by_shape.setdefault(shape, []).append(vt)
+            if t > 0 and shape in prev:
+                gap_true.append((vt.float() - prev[shape].float()).abs().mean().item())
+            prev[shape] = vt
+    out = step_correlations(seq_by_shape)
+    out["_gap_true"] = round(float(sum(gap_true)) / len(gap_true), 6) if gap_true else None
+    return out
+
+
+def print_corpus_diagnostics(diag: dict) -> None:
+    """Print the diagnostics block (pre-train; plain print — no bar yet)."""
+    print(f"  ── Corpus diagnostics ({diag.get('source', '?')}) ──")
+    svd = diag.get("svd") or {}
+    if svd:
+        print("  SVD rank(95%) Δ_MA:    " + "  ".join(
+            f"{k}={v}" for k, v in sorted(svd.items())))
+    pca = diag.get("affine_ceiling") or {}
+    if pca:
+        print("  Affine ceiling (1−R²):  " + "  ".join(
+            f"{k}={v:.4f}" for k, v in sorted(pca.items())))
+    pf = diag.get("pooled_feature_ceiling")
+    if pf is not None:
+        print(f"  Pooled-feature ceiling: {pf:.4f}")
+    tg = diag.get("t_gap_cancellation") or {}
+    if tg.get("ratio") is not None:
+        print(f"  t-gap cancellation:   |Δ_MA|={tg['mean_abs_delta_ma']} vs "
+              f"|v_true(t)−v_true(t−1)|={tg['mean_abs_v_true_step_delta']} "
+              f"→ ratio {tg['ratio']}")
+    stal = diag.get("staleness_curve") or {}
+    if stal:
+        print(f"  Staleness monotone:   {stal.get('per_region_monotone')}")
+        for r in range(3):
+            region = stal.get(f"region_{r}")
+            if region:
+                print(f"      staleness region {r}: " + "  ".join(
+                    f"d{lag}={v:.4f}" for lag, v in sorted(region.items())))
+    dd = diag.get("delta_distribution") or {}
+    if dd:
+        print("  Δ_MA distribution:      " + "  ".join(
+            f"{k}: μ={v.get('mean')} σ={v.get('std')} "
+            f"sparsity={v.get('sparsity')}" for k, v in sorted(dd.items())))
+    sc = diag.get("v_true_step_correlation") or {}
+    parts = [f"{k}={v}" for k, v in sorted(sc.items())
+             if k != "_gap_true" and v is not None]
+    if parts:
+        print("  v_true step corr:     " + "  ".join(parts))
+    gate = diag.get("decision_gate") or {}
+    if gate.get("proceed") is not None:
+        print(f"  Decision gate ({gate.get('stratum')}): "
+              f"{'PROCEED' if gate['proceed'] else 'RECONSIDER'}")
+
+
 # ── Checkpointing (plan 6i) ───────────────────────────────────────────
 
 
@@ -557,6 +777,10 @@ def main(argv=None):
         raise SystemExit("[train_corrector] no training pairs (all generations eval?)")
     print(f"  Training pairs: {len(ds)}   eval pairs: "
           f"{len(CorrectorDataset(data_dir, only_eval=True, normalization_samples=0, manifest=manifest))}")
+    try:
+        print_corpus_diagnostics(corpus_diagnostics(data_dir, ds))
+    except Exception as e:
+        print(f"  ⚠ corpus diagnostics unavailable: {e}")
 
     sampler = CorrectorBatchSampler(ds, batch_size=cfg["batch_size"], seed=cfg["seed"])
     loader = DataLoader(ds, batch_sampler=sampler, collate_fn=collate_corrector,
@@ -689,7 +913,9 @@ def main(argv=None):
     loss_fn = LOSS_FNS[cfg["loss"]]
     eps = ds.rel_mse_eps
     k_max_final = cfg["refine_passes_max"] if cfg["multipass"] else 1
-    ks_eval = [k for k in (1, 2, 3) if k <= k_max_final]
+    # K=0 is the TeaCache base (v = v_MA, zero passes) — the recovery-table
+    # baseline; K>=1 are the corrector passes.
+    ks_eval = [0] + [k for k in (1, 2, 3) if k <= k_max_final]
     ceiling = load_linear_ceiling(data_dir)
     if ceiling is not None:
         print(f"  Linear ceiling: {ceiling:.4f} (1−R², probe) — did-it-learn target "
@@ -715,6 +941,7 @@ def main(argv=None):
     metrics = MetricsLog(cfg["metrics"])
     loss_ema: Optional[float] = None
     min_loss = float("inf")
+    last_eval_rows: List[Tuple[int, float]] = []
     pbar = None
     if tqdm is not None and not cfg["no_progress"]:
         pbar = tqdm(total=cfg["max_steps"], desc="train", unit="step",
@@ -844,6 +1071,10 @@ def main(argv=None):
                     r = by_shape.get((k, hw))
                     parts.append(f"K{k}={r['rel_mse']:.4f}" if r is not None else f"K{k}=  -  ")
                 emit(f"      {hw[0]}x{hw[1]}: " + "  ".join(parts))
+            rows = recovery_rows(results, ks_eval)
+            last_eval_rows = rows
+            for line2 in recovery_table_lines(rows):
+                emit(line2)
             if ceiling is not None and not gate_fired and step >= gate_deadline:
                 if k1 is None or k1 > 0.8 * ceiling:
                     emit("  ✗ BELOW LINEAR CEILING — did-it-learn gate fired; "
@@ -905,6 +1136,7 @@ def main(argv=None):
                 "per_shape": {f"{h}x{w}": {str(k): round(by_shape.get((k, (h, w)), {}).get("rel_mse", float("nan")), 6)
                                            for k in ks_eval}
                               for (h, w) in shape_keys},
+                "recovery": {str(k): round(err, 6) for k, err in rows},
                 "best_k1": best, "best_step": best_step, "gate_fired": gate_fired,
             })
 
@@ -934,6 +1166,9 @@ def main(argv=None):
               f"(ema {loss_ema:.5f})")
     if best is not None:
         print(f"  Best K1:      {best:.4f} @ step {best_step}")
+    if last_eval_rows:
+        for line2 in recovery_table_lines(last_eval_rows):
+            print(line2)
     print(f"  VRAM peak:    {torch.cuda.max_memory_allocated() / (1024 ** 3):.1f} GB")
     print(f"  Metrics:      {cfg['metrics']}")
     print(f"  Final checkpoint: {final}  (K_recommended=1)")

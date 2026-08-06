@@ -16,6 +16,7 @@ from typing import Dict, NamedTuple, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 
 def setup_comfy_path(comfy_dir: str) -> None:
@@ -705,6 +706,108 @@ def format_duration(seconds: float) -> str:
     if minutes < 60:
         return f"{minutes}m {int(seconds % 60):02d}s"
     return f"{minutes // 60}h {minutes % 60:02d}m"
+
+
+# ── Learnability stats (probe Task 3b; reused by train_corrector) ─────
+
+
+def svd_rank_95(delta_maps):
+    """SVD spectrum of Δ_MA (H·W, 16); rank for 95% variance (plan 3b)."""
+    m = torch.stack([d.float() for d in delta_maps])          # (N, C, H, W)
+    m = m.permute(0, 2, 3, 1).reshape(-1, m.shape[1])          # (N·H·W, 16)
+    m = m - m.mean(dim=0, keepdim=True)
+    try:
+        u, s, v = torch.svd(m)
+    except Exception:
+        return {"rank_95": None, "singular_values": None}
+    var = (s * s).cumsum(0)
+    var = var / var[-1].clamp_min(1e-12)
+    rank95 = int((var <= 0.95).sum().item()) + 1
+    return {"rank_95": rank95,
+            "singular_values": [round(float(x), 4) for x in s[:16].tolist()]}
+
+
+def per_channel_affine_ceiling(v_ma_maps, v_true_maps) -> float:
+    """Best per-channel affine v̂ = a_c·v_MA_c + b_c; 1 − R² (plan 3b)."""
+    x = torch.stack([v.float().flatten(1) for v in v_ma_maps]).reshape(-1, 16)
+    y = torch.stack([v.float().flatten(1) for v in v_true_maps]).reshape(-1, 16)
+    x_aug = torch.cat([x, torch.ones_like(x[:, :1])], dim=1)   # (N, 17)
+    coefs, _, _, _ = torch.linalg.lstsq(x_aug, y)              # (17, 16)
+    pred = x_aug @ coefs
+    ss_res = ((y - pred) ** 2).sum(dim=0)
+    ss_tot = ((y - y.mean(dim=0)) ** 2).sum(dim=0).clamp_min(1e-12)
+    r2 = (1 - ss_res / ss_tot).mean().item()
+    return max(0.0, 1.0 - r2)
+
+
+def pooled_feature_ceiling(x_t_maps, v_ma_maps, v_true_maps) -> float:
+    """Linear predictor from pooled features (per-channel mean/std + t) → 1−R²."""
+    feats, y = [], []
+    for xt, vm, vt in zip(x_t_maps, v_ma_maps, v_true_maps):
+        f = torch.cat([xt.float().mean(dim=(1, 2)), xt.float().std(dim=(1, 2)),
+                       vm.float().mean(dim=(1, 2)), vm.float().std(dim=(1, 2))])
+        feats.append(f)
+        y.append(vt.float().mean(dim=(1, 2)))
+    X = torch.stack(feats)                                      # (N, 64)
+    Y = torch.stack(y)                                          # (N, 16)
+    X = torch.cat([X, torch.ones(X.shape[0], 1)], dim=1)
+    coefs, _, _, _ = torch.linalg.lstsq(X, Y)
+    pred = X @ coefs
+    ss_res = ((Y - pred) ** 2).sum()
+    ss_tot = ((Y - Y.mean(dim=0)) ** 2).sum().clamp_min(1e-12)
+    return float(max(0.0, 1.0 - ss_res / ss_tot).item())
+
+
+def step_correlations(v_true_by_slot: dict) -> dict:
+    """Step-to-step correlation of v_true per region (early/mid/late)."""
+    out = {}
+    all_corrs = {"early": [], "mid": [], "late": []}
+    for slot, vts in v_true_by_slot.items():
+        n = len(vts)
+        if n < 3:
+            continue
+        thirds = [("early", slice(0, n // 3)), ("mid", slice(n // 3, 2 * n // 3)),
+                  ("late", slice(2 * n // 3, n))]
+        for name, sl in thirds:
+            for t in range(sl.start + 1, sl.stop):
+                a = vts[t].float().flatten()
+                b = vts[t - 1].float().flatten()
+                all_corrs[name].append(F.cosine_similarity(a[None], b[None]).item())
+    for name, corrs in all_corrs.items():
+        out[name] = round(float(np.mean(corrs)), 4) if corrs else None
+    return out
+
+
+def staleness_curve(delta_by_lag: dict, num_regions: int = 3) -> dict:
+    """mean|Δ_MA| vs lag per step region (early/mid/late); monotonicity per region."""
+    curve = {r: {} for r in range(num_regions)}
+    for lag, items in delta_by_lag.items():
+        for region, d in items:
+            curve[region].setdefault(lag, []).append(d.abs().mean().item())
+    out = {}
+    monotone = True
+    for r in range(num_regions):
+        lags = sorted(curve[r])
+        means = {lag: float(np.mean(curve[r][lag])) for lag in lags}
+        out[f"region_{r}"] = means
+        vals = [means[lag] for lag in lags]
+        if len(vals) > 1:
+            diffs = [vals[i + 1] - vals[i] for i in range(len(vals) - 1)]
+            if any(d < -1e-9 for d in diffs):
+                monotone = False
+    out["per_region_monotone"] = monotone
+    return out
+
+
+def delta_distribution(delta_maps: list) -> dict:
+    d = torch.stack([x.float() for x in delta_maps])
+    flat = d.flatten()
+    return {
+        "mean": round(float(flat.mean()), 6),
+        "std": round(float(flat.std()), 6),
+        "sparsity": round(float((flat.abs() < 1e-4).float().mean()), 4),
+        "per_channel_std": [round(float(s), 5) for s in d.std(dim=(0, 2, 3)).tolist()],
+    }
 
 
 class TrainTimer:
