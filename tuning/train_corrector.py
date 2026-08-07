@@ -598,13 +598,24 @@ def estimate_per_lag_base_rel(ds, n_per_lag: int = 128, seed: int = 42,
 
 # ── Eval (plan 6h) ────────────────────────────────────────────────────
 
+# Eval step-region slices: thirds of the schedule, mirroring the probe's
+# staleness regions (PROBE_GUIDE §7). region = min(R-1, int(R * t_frac)).
+EVAL_T_REGIONS = 3
+EVAL_T_REGION_NAMES = {0: "early", 1: "mid", 2: "late"}
+
 
 def eval_model(model, eval_loader, lags: List[int], ks: List[int],
                device, eps: float, show_progress: bool = False,
-               eval_map_batches: int = 64) -> Tuple[Dict, Dict, Dict]:
+               eval_map_batches: int = 64) -> Tuple[Dict, Dict, Dict, Dict]:
     """Per-lag, per-K rel-MSE (‖v̂−v_true‖₂/‖v_true‖₂) and cosine, plus the
     same metrics grouped per spatial shape ((k, (h, w))) for the per-resolution
     eval report (resolution-independence check).
+
+    Also slices every metric per schedule third ((k, region, …) with
+    region = early/mid/late by t_frac, mirroring the probe's staleness
+    regions) into ``by_t`` — "pooled" (all pairs), "lags" (per ladder lag,
+    excluding the d=0 anchor only when reporting), "shapes" (per latent
+    shape) — so where the corrector helps is visible instead of pooled away.
 
     Also collects the eval (v_ma, v_true) maps per latent shape (with per-pair
     d=0-anchor masks, capped at ``eval_map_batches`` batch tensors per shape)
@@ -614,6 +625,9 @@ def eval_model(model, eval_loader, lags: List[int], ks: List[int],
     model.eval()
     acc = {(k, lag): [0.0, 0.0, 0] for k in ks for lag in lags}
     acc_shape: Dict[Tuple[int, Tuple[int, int]], List[float]] = {}
+    acc_t: Dict[Tuple[int, int], List[float]] = {}
+    acc_t_lag: Dict[Tuple[int, int, int], List[float]] = {}
+    acc_t_shape: Dict[Tuple[int, Tuple[int, int], int], List[float]] = {}
     eval_maps: Dict[Tuple[int, int], dict] = {}
     batches = eval_loader
     if show_progress and tqdm is not None:
@@ -638,6 +652,7 @@ def eval_model(model, eval_loader, lags: List[int], ks: List[int],
             # metrics are computed on .float() tensors below, so rel-MSE and
             # cosine are unaffected by the autocast dtype.
             with torch.autocast(device.type, dtype=torch.float16):
+                t_fracs = t.tolist()
                 for k in ks:
                     v = v0
                     for _ in range(k):
@@ -649,11 +664,28 @@ def eval_model(model, eval_loader, lags: List[int], ks: List[int],
                     cos = F.cosine_similarity(v.float().flatten(1),
                                               vt.float().flatten(1), dim=1).tolist()
                     for j, lag in enumerate(lags_b):
+                        region = min(EVAL_T_REGIONS - 1,
+                                     int(EVAL_T_REGIONS * t_fracs[j]))
                         if lag in lags:
                             a = acc[(k, lag)]
                             a[0] += rel[j]
                             a[1] += cos[j]
                             a[2] += 1
+                        a = acc_t.setdefault((k, region), [0.0, 0.0, 0.0])
+                        a[0] += rel[j]
+                        a[1] += cos[j]
+                        a[2] += 1
+                        if lag in lags:
+                            a = acc_t_lag.setdefault((k, region, lag),
+                                                     [0.0, 0.0, 0.0])
+                            a[0] += rel[j]
+                            a[1] += cos[j]
+                            a[2] += 1
+                        a = acc_t_shape.setdefault((k, region, hw),
+                                                   [0.0, 0.0, 0.0])
+                        a[0] += rel[j]
+                        a[1] += cos[j]
+                        a[2] += 1
                     a = acc_shape.setdefault((k, hw), [0.0, 0.0, 0.0])
                     a[0] += sum(rel)
                     a[1] += sum(cos)
@@ -666,8 +698,21 @@ def eval_model(model, eval_loader, lags: List[int], ks: List[int],
     for (k, hw), (s_rel, s_cos, n) in acc_shape.items():
         if n:
             by_shape[(k, hw)] = {"rel_mse": s_rel / n, "cosine": s_cos / n, "n": n}
+    by_t = {"pooled": {}, "lags": {}, "shapes": {}}
+    for (k, region), (s_rel, s_cos, n) in acc_t.items():
+        if n:
+            by_t["pooled"][(region, k)] = {"rel_mse": s_rel / n,
+                                           "cosine": s_cos / n, "n": n}
+    for (k, region, lag), (s_rel, s_cos, n) in acc_t_lag.items():
+        if n:
+            by_t["lags"][(region, k, lag)] = {"rel_mse": s_rel / n,
+                                              "cosine": s_cos / n, "n": n}
+    for (k, region, hw), (s_rel, s_cos, n) in acc_t_shape.items():
+        if n:
+            by_t["shapes"][(region, k, hw)] = {"rel_mse": s_rel / n,
+                                               "cosine": s_cos / n, "n": n}
     model.train()
-    return out, by_shape, eval_maps
+    return out, by_shape, by_t, eval_maps
 
 
 def load_linear_ceiling(data_dir: Path) -> Optional[float]:
@@ -1469,7 +1514,7 @@ def main(argv=None):
             # best-checkpoint selection is based on (the online weights are
             # only training machinery).
             ema_model.load_state_dict(ema)
-            results, by_shape, eval_maps = eval_model(
+            results, by_shape, by_t, eval_maps = eval_model(
                 ema_model, eval_loader, lags, ks_eval, device,
                 eps, show_progress=(pbar is not None),
                 eval_map_batches=int(cfg.get("recovery_eval_batches", 64)))
@@ -1519,6 +1564,63 @@ def main(argv=None):
                     r = by_shape.get((k, hw))
                     parts.append(f"K{k}={r['rel_mse']:.4f}" if r is not None else f"K{k}=  -  ")
                 emit(f"      {hw[0]}x{hw[1]}: " + "  ".join(parts))
+            # Per-t step-region slices (early/mid/late thirds, probe §7):
+            # ladder-only recovery per region plus the K=1 t×lag and t×shape
+            # breakdowns (per-cell recovery % in parens) — where does the
+            # corrector help, instead of the pooled average hiding it.
+            t_regions = sorted({r for (r, _), _ in by_t["pooled"].items()})
+
+            def _t_lad_mean(reg: int, k: int):
+                tot = 0.0
+                n = 0
+                for (rr, kk, lag), st in by_t["lags"].items():
+                    if rr == reg and kk == k and lag != 0:
+                        tot += st["rel_mse"] * st["n"]
+                        n += st["n"]
+                return tot / n if n else None
+
+            per_t_rec = {}
+            for region in t_regions:
+                r0 = _t_lad_mean(region, 0)
+                r1 = _t_lad_mean(region, 1)
+                if r0 and r1 is not None and r1 == r1:
+                    per_t_rec[region] = 1.0 - r1 / r0
+            if per_t_rec:
+                emit("      recovery per t (ladder-only): " + "  ".join(
+                    f"{EVAL_T_REGION_NAMES.get(r, r)}={100 * rec:+.1f}%"
+                    for r, rec in sorted(per_t_rec.items())))
+            for region in t_regions:
+                parts = []
+                for lag in lags:
+                    if lag == 0:
+                        continue
+                    st1 = by_t["lags"].get((region, 1, lag))
+                    if st1 is None:
+                        continue
+                    rec = None
+                    st0 = by_t["lags"].get((region, 0, lag))
+                    if st0 and st0["rel_mse"]:
+                        rec = 1.0 - st1["rel_mse"] / st0["rel_mse"]
+                    parts.append(f"d{lag}={st1['rel_mse']:.4f}"
+                                 + (f"({100 * rec:+.1f}%)" if rec is not None else ""))
+                if parts:
+                    emit(f"      t {EVAL_T_REGION_NAMES.get(region, region)} × lag (K1): "
+                         + "  ".join(parts))
+            for region in t_regions:
+                parts = []
+                for hw in shape_keys:
+                    st1 = by_t["shapes"].get((region, 1, hw))
+                    if st1 is None:
+                        continue
+                    rec = None
+                    st0 = by_t["shapes"].get((region, 0, hw))
+                    if st0 and st0["rel_mse"]:
+                        rec = 1.0 - st1["rel_mse"] / st0["rel_mse"]
+                    parts.append(f"{hw[0]}x{hw[1]}={st1['rel_mse']:.4f}"
+                                 + (f"({100 * rec:+.1f}%)" if rec is not None else ""))
+                if parts:
+                    emit(f"      t {EVAL_T_REGION_NAMES.get(region, region)} × shape (K1): "
+                         + "  ".join(parts))
             rows = recovery_rows(results, ks_eval)
             last_eval_rows = rows
             last_affine = affine
@@ -1610,6 +1712,19 @@ def main(argv=None):
                 "per_shape": {f"{h}x{w}": {str(k): round(by_shape.get((k, (h, w)), {}).get("rel_mse", float("nan")), 6)
                                            for k in ks_eval}
                               for (h, w) in shape_keys},
+                "per_t": {str(r): {str(k): round(st["rel_mse"], 6)
+                                   for (rr, k), st in by_t["pooled"].items()
+                                   if rr == r} for r in t_regions},
+                "recovery_per_t": {str(r): round(rec, 4)
+                                   for r, rec in per_t_rec.items()},
+                "per_t_lag": {str(r): {str(lag): round(by_t["lags"][(r, 1, lag)]["rel_mse"], 6)
+                                       for lag in lags
+                                       if lag != 0 and (r, 1, lag) in by_t["lags"]}
+                              for r in t_regions},
+                "per_t_shape": {str(r): {f"{h}x{w}": round(by_t["shapes"][(r, 1, (h, w))]["rel_mse"], 6)
+                                         for (h, w) in shape_keys
+                                         if (r, 1, (h, w)) in by_t["shapes"]}
+                                for r in t_regions},
                 "recovery": {str(r["k"]): {"rel_mse": round(r["rel_mse"], 6),
                                            "ladder_only": round(r["ladder_only"], 6),
                                            "ladder_ratio_base": (round(r["ladder_only"] / bl, 4)

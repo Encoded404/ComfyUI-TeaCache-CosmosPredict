@@ -55,7 +55,7 @@ training. Its job is to answer, cheaply:
 4. Should we spend on the full corrector? *(decision gate + Day-1 verdict)*
 
 It is designed to catch hopeless ideas before ~60k training steps, and it costs
-~2 minutes of wall time and 0.3 GB of VRAM on a pre-recorded corpus.
+~3 minutes of wall time and 0.3 GB of VRAM on a pre-recorded corpus.
 
 ---
 
@@ -103,36 +103,58 @@ the only CUDA allocations.
 ============================================================
   Data: outputs/20260806-162941/refiner_data
   Loading generations and collecting tensors/stats (8 analysis thread(s))...
+  Codec/level:    blosc2-bitshuffle-zstd / clevel 9 (legacy default)
+  Analysis cache: 360/360 hit (0 decoded fully)
   Generations: 360  tensors: {'x_t': 12, 'v_true': 12, 'v_ma': 12, 'delta': 12}
 
   t-gap cancellation: |Δ_MA|=0.421336 vs |v_true(t)−v_true(t−1)|=0.269538 → ratio 1.563 (<1 confirms the t-gap cancels)
 
   SVD rank(95%): 128x128=16  64x128=16  64x64=16
-  Affine ceiling (1−R²): 128x128=0.5995  64x128=0.5213  64x64=0.6584
+  Affine ceiling (1−R²): 128x128=0.5953  64x128=0.5213  64x64=0.6568
   Staleness monotone: True
   Decision gate (64x64): RECONSIDER
       staleness region 0: d1=0.4984  d2=0.5933  d4=0.7398
       staleness region 1: d1=0.2903  d2=0.4153  d4=0.6438
 
   Day-1 experiment (MLP → tiny UNet, plan 3d)...
-  Day-1 MLP (pooled features) mean-Δ error: 0.13583
-  [day1] step    1/600  loss=0.76236 (ema 0.76236, min 0.76236)  it/s=1.32  elapsed=1s
-  [day1] step   50/600  loss=0.96917 (ema 0.75070, min 0.00108)  it/s=36.20  elapsed=2s
-  [day1] step  100/600  loss=0.53959 (ema 0.68741, min 0.00108)  it/s=37.43  elapsed=4s
-  [day1] step  150/600  loss=0.90354 (ema 0.63421, min 0.00108)  it/s=38.25  elapsed=6s
-  [day1] step  200/600  loss=0.18460 (ema 0.58980, min 0.00108)  it/s=39.03  elapsed=7s
-  [day1] step  250/600  loss=0.01028 (ema 0.40379, min 0.00108)  it/s=41.48  elapsed=9s
-  [day1] step  300/600  loss=0.03658 (ema 0.25665, min 0.00108)  it/s=41.83  elapsed=10s
-  [day1] step  350/600  loss=0.00179 (ema 0.16479, min 0.00105)  it/s=41.72  elapsed=12s
-  [day1] step  400/600  loss=0.00120 (ema 0.10871, min 0.00105)  it/s=40.42  elapsed=13s
-  [day1] step  450/600  loss=0.05514 (ema 0.07792, min 0.00105)  it/s=40.00  elapsed=15s
-  [day1] step  500/600  loss=0.44237 (ema 0.07269, min 0.00104)  it/s=40.08  elapsed=17s
-  [day1] step  550/600  loss=0.01978 (ema 0.07256, min 0.00104)  it/s=39.96  elapsed=18s
-  [day1] step  600/600  loss=0.01157 (ema 0.11877, min 0.00104)  it/s=39.55  elapsed=20s
-  Day-1 UNet rel-MSE: 0.4015 vs ceiling 0.6584 → build_full_corrector
+  Day-1 MLP (pooled features) mean-Δ error: 0.12661
+  [day1] step    1/600  loss=0.66388 (ema 0.66388, min 0.66388)  it/s=1.16  elapsed=1s
+  [day1] step   50/600  loss=0.62290 (ema 0.77941, min 0.35114)  it/s=40.40  elapsed=3s
+  [day1] step  100/600  loss=0.23721 (ema 0.76658, min 0.18911)  it/s=40.19  elapsed=4s
+  [day1] step  150/600  loss=0.69274 (ema 0.72080, min 0.18504)  it/s=39.73  elapsed=5s
+  [day1] step  200/600  loss=0.00396 (ema 0.51269, min 0.00396)  it/s=39.48  elapsed=7s
+  [day1] step  250/600  loss=0.20214 (ema 0.32487, min 0.00249)  it/s=39.50  elapsed=8s
+  [day1] step  300/600  loss=0.03515 (ema 0.20830, min 0.00249)  it/s=39.17  elapsed=10s
+  [day1] step  350/600  loss=0.03926 (ema 0.14821, min 0.00232)  it/s=37.75  elapsed=11s
+  [day1] step  400/600  loss=0.04125 (ema 0.11954, min 0.00232)  it/s=36.29  elapsed=13s
+  [day1] step  450/600  loss=0.18081 (ema 0.09998, min 0.00232)  it/s=37.57  elapsed=14s
+  [day1] step  500/600  loss=0.05949 (ema 0.17356, min 0.00232)  it/s=38.30  elapsed=16s
+  [day1] step  550/600  loss=0.45649 (ema 0.28188, min 0.00232)  it/s=39.27  elapsed=17s
+  [day1] step  600/600  loss=0.23978 (ema 0.34045, min 0.00232)  it/s=39.33  elapsed=19s
+  Day-1 UNet ladder rel-MSE: 0.4692 (pooled 0.4025) vs ceiling 0.6568 → build_full_corrector
+
+  v_t error recovery vs TeaCache base (rel-L2 ‖v̂−v_true‖₂/‖v_true‖₂, eval pairs)
+  ──────────────────────────────────────────────────────────────
+  method                     abs err   × base   recovered
+  ──────────────────────────────────────────────────────────────
+  TeaCache base (v_MA)       0.39202    1.000           —
+    ladder only             0.49057    1.000           —
+    d=0 anchors only        0.00000
+  Per-channel affine (OOD)   0.86896    2.217     -121.7%
+    ladder only             0.87626    1.786      -78.6%
+    d=0 anchors only        0.83824
+  Day-1 tiny UNet            0.40254    1.027       -2.7%
+    ladder only             0.46921    0.956        4.4%
+    d=0 anchors only        0.13734
+  Oracle (v_true)            0.00000    0.000      100.0%
+  ──────────────────────────────────────────────────────────────
+  affine per stratum (fit = train pairs, scored = eval pairs):
+    64x64:  rel 0.8993  (n=1024, fit 114 batches)  |a−1|≤0.9797  |b|≤0.0013
+    64x128:  rel 0.7746  (n=256, fit 123 batches)  |a−1|≤0.9623  |b|≤0.0028
+    128x128:  rel 0.8421  (n=256, fit 119 batches)  |a−1|≤0.9717  |b|≤0.0026
 
   ── Probe complete ──
-  Wall time:    2m 11s  (analysis 1m 05s | codec bench 1s | day1 train 20s | day1 eval 31s | lag-readability 2s)
+  Wall time:    2m 46s  (analysis 17s | codec bench 1s | day1 train 19s | day1 eval 1m 55s | lag-readability 2s)
   VRAM peak:    0.3 GB
   Metrics:      outputs/20260806-162941/probe_metrics.jsonl
   Report:       outputs/20260806-162941/refiner_probe_report.json
@@ -156,6 +178,14 @@ Every section is decoded below. The executive summary is at §9.
 - **`8 analysis thread(s)`** — the decode+stat walk runs over a thread pool
   (blosc2/numpy release the GIL). Torch's intra-op threads are pinned to 1 so
   results are bit-exact and reproducible across machines.
+- **`Codec/level`** — the codec the corpus was stored with (blosc2
+  bitshuffle+zstd at clevel 9, the `(legacy default)` fallback; raw/zfpy are
+  the other storage fallbacks, §2). Informational: the codec benchmark still
+  measures every candidate codec on the capped tensors regardless.
+- **`Analysis cache: 360/360 hit (0 decoded fully)`** — all 360
+  per-generation t-gap caches hit; "0 decoded fully" means no generation
+  needed a full tensor decode. This is why the analysis phase costs only 17 s
+  here.
 - **Analysis cache** — per-generation t-gap lists are cached in
   `refiner_data/.probe_cache/<gen>.gaps.json`, invalidated by `.bin` size+mtime.
   On a cache hit, only the first 8 steps per generation are decoded
@@ -246,10 +276,10 @@ ceiling = 1 − R²,   R² = 1 − Σ(v_true − v̂)² / Σ(v_true − mean)²
 **Example run:**
 
 ```
-128x128 = 0.5995    64x128 = 0.5213    64x64  = 0.6584
+128x128 = 0.5953    64x128 = 0.5213    64x64  = 0.6568
 ```
 
-The dominant stratum (64×64, where most lag-1 deltas live) shows **0.6584** —
+The dominant stratum (64×64, where most lag-1 deltas live) shows **0.6568** —
 even the *optimal* "multiply and shift every channel" correction leaves ~66%
 of the velocity variance unexplained. Interpretation: the staleness error is
 **nonlinear** — sometimes too big, sometimes too small, depending on local
@@ -319,7 +349,7 @@ proceed = (rank ≤ 8) AND (ceiling ≤ 0.60) AND (staleness per-region monotone
 | Criterion | Value | Verdict |
 |---|---|---|
 | effective rank ≤ 8 | 16 | ✗ |
-| ceiling ≤ 0.60 | 0.6584 | ✗ |
+| ceiling ≤ 0.60 | 0.6568 | ✗ |
 | staleness monotone | True | ✓ |
 
 1 of 3 → **`RECONSIDER`**, with the plan's fallback note: *larger model, or
@@ -335,7 +365,7 @@ timestep, no spatial layout*), predicting the per-channel *mean* of Δ. It sees
 global statistics only — "how big is the error on average per channel" — and
 can never fix *where* the error is.
 
-**Example run: `mean-Δ error 0.13583`** (velocity units). Against an average
+**Example run: `mean-Δ error 0.12661`** (velocity units). Against an average
 |Δ| of ~0.42, it captures a slice of the global correction — but the spatial
 residual is exactly what it cannot see. This is the "featureless" baseline; a
 useful corrector must beat it massively.
@@ -346,7 +376,7 @@ useful corrector must beat it massively.
 (`CorrectorUNet2D`, `CorrectorConfig.for_size("tiny")` = ~1.83 M params,
 bottleneck 112, depth 2, RepBlocks + DiT bottleneck with prompt cross-attention
 and timestep embedding; zero-init output head) for 600 steps, batch 8, Adam
-3e-4, fp16 autocast — ~20 s at ~40 it/s on a GPU.
+3e-4, fp16 autocast — ~19 s at ~39 it/s on a GPU.
 
 **Training loss** (identical to the real training's loss, `rel_mse`):
 
@@ -360,19 +390,21 @@ velocity's squared magnitude. 0 = perfect, 1 = error as big as the signal.
 **Example run trajectory:**
 
 ```
-step   1: 0.76236     step 300: 0.03658 (ema 0.25665)
-step  50: 0.96917     step 400: 0.00120 (ema 0.10871)
-step 100: 0.53959     step 450: 0.05514 (ema 0.07792)
-step 150: 0.90354     step 500: 0.44237 (ema 0.07269)
-step 200: 0.18460     step 550: 0.01978 (ema 0.07256)
-step 250: 0.01028     step 600: 0.01157 (ema 0.11877)
+step   1: 0.66388     step 300: 0.03515 (ema 0.20830)
+step  50: 0.62290     step 400: 0.04125 (ema 0.11954)
+step 100: 0.23721     step 450: 0.18081 (ema 0.09998)
+step 150: 0.69274     step 500: 0.05949 (ema 0.17356)
+step 200: 0.00396     step 550: 0.45649 (ema 0.28188)
+step 250: 0.20214     step 600: 0.23978 (ema 0.34045)
 ```
 
 How to read it:
 
 - **EMA (0.99 decay) is the signal**; raw per-batch loss is noisy (batch size
-  8, no schedule — see step 500's 0.44 spike). EMA falls 0.76 → ~0.07–0.12.
-- **`min` is a trap.** 0.00104 is the best *single batch* — the dataset
+  8, no schedule — see step 550's 0.46 spike and step 600's 0.24). EMA falls
+  0.66 → 0.10 by step 450, then drifts back up to 0.34 as the tail spikes —
+  the net is visibly under-trained at 600 steps.
+- **`min` is a trap.** 0.00232 is the best *single batch* — the dataset
   includes synthetic **d=0 anchor pairs** (v_MA = v_true, target Δ = 0), where
   the model trivially emits ~0 and the loss collapses. Not the model's floor.
 - The *honest* number is the held-out eval below.
@@ -395,19 +427,25 @@ so it is the apples-to-apples OOD view the verdict line is not:
 
 - **TeaCache base (v_MA)** — `‖v_MA − v_true‖/‖v_true‖`. Deflated by the
   ~20% d=0 anchor pairs (error exactly 0 by construction); the **ladder-only**
-  sub-row (≈0.49 on the example run) is the honest "doing nothing" baseline.
-  Each ladder-only sub-row carries its own `× base` / `recovered` columns
-  relative to the *ladder-only* base (the anchors sub-rows stay absolute —
-  their base error is exactly 0, so a ratio would be meaningless).
+  sub-row (0.49057 on the example run) is the honest "doing nothing"
+  baseline. Each ladder-only sub-row carries its own `× base` / `recovered`
+  columns relative to the *ladder-only* base (the anchors sub-rows stay
+  absolute — their base error is exactly 0, so a ratio would be meaningless).
 - **Per-channel affine (OOD)** — the per-stratum affine fit from §6.2, but
   now fit on **train pairs** and scored on the eval pairs (same distribution
   contract as the UNet: fit = train, scored = held-out). Fit and score are
   per resolution stratum; the `|a−1|` / `|b|` diagnostics report how far the
   fit sits from identity — near-zero means "nothing beyond scale+shift was
   learnable", large values are a red flag that the fit slice is
-  unrepresentative of the scored slice.
+  unrepresentative of the scored slice. On the example run it scores
+  **0.86896** pooled (2.2× the base, −121.7%) and **0.87626** ladder-only
+  (−78.6%), and the per-stratum block shows rel 0.8993 / 0.7746 / 0.8421
+  with `|a−1|` bounds of 0.96–0.98: the fit demands strong per-channel
+  rescaling that does not transfer to held-out pairs.
 - **Day-1 tiny UNet** — the held-out eval number, with the anchor/ladder
-  split.
+  split: pooled 0.40254 (−2.7% vs the pooled base — the anchors drag both,
+  and the net's anchors-only 0.13734 can't match the base's exact 0),
+  ladder-only 0.46921 (+4.4% recovered vs 0.49057).
 - **Oracle (v_true)** — the 0-error anchor of the scale.
 
 `recovered = 1 − err/base`; negative means "makes things worse than doing
@@ -417,9 +455,11 @@ in-sample fit can never beat identity on its own objective, so a blowup of
 that size is a diagnostic flag, not a finding) — hence the current OOD
 fit-on-train design.
 
-**Example run: `0.4015`** — the corrected velocity's leftover error has
-magnitude ≈ 40% of the true velocity's magnitude. Not "solved" (a 40% miss
-still distorts a video), but clearly better than the baselines.
+**Example run: pooled `0.4025`, ladder-only `0.4692`** — the corrected
+velocity's leftover error is ≈ 40% (pooled) / 47% (ladder-only) of the true
+velocity's magnitude. Not "solved" (a ~47% miss on stale pairs still distorts
+a video), and — as the recovery table below shows — only modestly better than
+doing nothing on the ladder-only view.
 
 ### 8.4 The verdict rule
 
@@ -440,19 +480,23 @@ inference cost. The margin also absorbs the metric mismatch (L2 norm vs R²).
 **Example run:**
 
 ```
-0.4015 ≤ 0.75 × 0.6584 = 0.4938  →  ✓ → build_full_corrector
+0.4692 ≤ 0.75 × 0.6568 = 0.4926  →  ✓ → build_full_corrector
 ```
 
 **How much did the tiny model actually do?** Three framings:
 
 - **vs. the ceiling:** reduced the linear baseline's error by
-  (0.6584 − 0.4015) / 0.6584 = **39%** (threshold was 25%).
-- **vs. doing nothing:** roughly halved the gap between the linear baseline
-  and zero error.
-- **vs. the blind MLP:** spatial structure is where the win is — 0.4015
-  (per-pixel UNet) vs a 0.1358 mean-error MLP that can't see pixels at all.
+  (0.6568 − 0.4692) / 0.6568 = **29%** (threshold was 25%).
+- **vs. doing nothing:** the honest ladder-only view is thin — **4.4%**
+  recovered (0.46921 vs 0.49057); pooled it is −2.7% (0.40254 vs 0.39202),
+  because the anchors' exact-zero baseline out-shoots the net's imperfect
+  anchor predictions (0.13734). The verdict passes on the ceiling margin,
+  not on an absolute win over v_MA.
+- **vs. the blind MLP:** spatial structure is where the win is — 0.4692
+  (per-pixel UNet, ladder) vs a 0.12661 mean-error MLP that can't see pixels
+  at all.
 
-And it did it in **20 s of training with 0.3 GB VRAM**. The full training
+And it did it in **19 s of training with 0.3 GB VRAM**. The full training
 (`refiner_training` in `config.json`: 20 M params, 60 k steps, Sophia, lr
 4e-4, batch 16, EMA 0.9999, resolution curriculum, multipass refinement)
 starts from a model that has *already* demonstrated it can see the structure.
@@ -472,11 +516,11 @@ report JSON (console shows only its 2 s timing).
 
 ```
 Skip error is real           (t-gap ratio 1.56 — reconstruction 1.5× worse than holding last velocity)
-Error is nonlinear           (affine ceiling 0.6584 — optimal scale+shift leaves ~66% unexplained)
+Error is nonlinear           (affine ceiling 0.6568 — optimal scale+shift leaves ~66% unexplained)
 No low-rank shortcut         (SVD rank 16 = all 16 channels independent)
 Staleness is readable        (error grows smoothly with lag in every phase; lag not needed as input)
 Linear analysis says:        RECONSIDER
-A tiny net proves otherwise  (0.4015 vs 0.6584 ceiling → 39% better after 20 s of training)
+A tiny net proves otherwise  (0.4692 ladder vs 0.6568 ceiling → 29% better after 19 s of training)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Verdict: build_full_corrector
 ```
@@ -486,13 +530,16 @@ screen (rank, affine fit) — the cheap veto. The Day-1 experiment is a
 *nonlinear/local* screen (a real conv net with spatial convolution, prompt
 conditioning, timestep embedding). The probe's logic is: **Day-1 evidence
 overrides the gate**. This run is the exact scenario that ordering exists for —
-the linear analysis said "reconsider", and 20 seconds of real training showed
-the structure is there.
+the linear analysis said "reconsider", and 19 seconds of real training showed
+the structure is there — though the win over doing nothing is modest (4.4%
+ladder-only), the 29% margin over the linear ceiling clears the 25% bar.
 
 **What the verdict does not say.** `build_full_corrector` certifies
-"worth building", not "problem solved". 0.4015 is a promising-but-unfinished
-number; the real corrector is judged later by `validate.py`'s A/B sanity and
-shipping gates (visual quality + speed), not by this probe.
+"worth building", not "problem solved". 0.4692 (ladder-only) is a
+promising-but-unfinished number — on this run the pass comes from the ceiling
+margin, not from a large absolute win over v_MA; the real corrector is judged
+later by `validate.py`'s A/B sanity and shipping gates (visual quality +
+speed), not by this probe.
 
 ---
 
@@ -528,7 +575,7 @@ day1
 ```
 
 `train_corrector.py` reads `learnability.predictability_ceiling.per_channel_affine[decision_gate.stratum]`
-(= 0.6584 in this run) via `load_linear_ceiling` and applies the **did-it-learn
+(= 0.6568 in this run) via `load_linear_ceiling` and applies the **did-it-learn
 gate** at the end of its own training: the trained corrector's held-out error
 must beat the same `0.75 × ceiling` bar, otherwise the training is flagged as
 not having learned (see `train_corrector.py` ~line 695). Its per-eval recovery
@@ -559,7 +606,7 @@ per-50-step Day-1 losses, phase timings, eval verdict.
 
 | Resource | Example run |
 |---|---|
-| Wall time | 2 m 11 s (analysis 1 m 05 s · codec 1 s · day1 train 20 s · eval 31 s · lag 2 s) |
+| Wall time | 2 m 46 s (analysis 17 s · codec 1 s · day1 train 19 s · eval 1 m 55 s · lag 2 s) |
 | VRAM peak | 0.3 GB (analysis-only run — no large model loaded) |
 | Disk | ≈ 27 MB/gen recorded; 360 gens ≈ 9.9 GB |
 | Threads | 8 (analysis walk; torch pinned to 1 for reproducibility) |
