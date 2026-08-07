@@ -1327,7 +1327,7 @@ def main(argv=None):
     pbar = None
     if tqdm is not None and not cfg["no_progress"]:
         pbar = tqdm(total=cfg["max_steps"], desc="train", unit="step",
-                    dynamic_ncols=True, mininterval=0.5)
+                    initial=step, dynamic_ncols=True, mininterval=0.5)
 
     def emit(line: str) -> None:
         """Print a log line above the progress bar (bar-safe)."""
