@@ -63,7 +63,9 @@ Usage:
 
 import argparse
 import json
+import queue
 import random
+import threading
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -123,6 +125,10 @@ LOSS_FNS = {
     "mse_l1": mse_l1_loss,
     "charbonnier": charbonnier_loss,
 }
+
+# Queue sentinel: the prefetch producer failed and consumers must fall back
+# to main-thread fetching (instead of blocking on an empty queue forever).
+_PREFETCH_FAILED = object()
 
 
 # ── Sophia (deep-dive §1.2, Gauss-Newton-Bartlett) ────────────────────
@@ -339,6 +345,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=None,
                         help="DataLoader worker processes (config: "
                              "refiner_training.num_workers)")
+    parser.add_argument("--prefetch-queue", type=int, default=None,
+                        help="Bounded prefetch queue depth for the "
+                             "producer-thread data path (0 = off, main-thread "
+                             "fetch; config: refiner_training.prefetch_queue)")
     parser.add_argument("--resume", type=str, default=None,
                         help="Resume from a full-state .pt checkpoint")
     parser.add_argument("--out", type=str, default=None,
@@ -392,7 +402,8 @@ def resolve_config(args: argparse.Namespace) -> dict:
         "cache_size": ("cache_size", 128),
         "recovery_fit_batches": ("recovery_fit_batches", 128),
         "recovery_eval_batches": ("recovery_eval_batches", 64),
-        "num_workers": ("num_workers", 0),
+        "num_workers": ("num_workers", 4),
+        "prefetch_queue": ("prefetch_queue", 0),
     }
     cfg = {}
     for flag, (key, default) in mapping.items():
@@ -469,6 +480,7 @@ def resolve_config(args: argparse.Namespace) -> dict:
     rc["resolution_weights"] = resolution_weights
     cfg["cache_size"] = max(1, int(cfg["cache_size"]))
     cfg["num_workers"] = max(0, int(cfg["num_workers"]))
+    cfg["prefetch_queue"] = max(0, int(cfg["prefetch_queue"]))
     cfg["eval_every"] = max(int(cfg["eval_every"]), 1)
     cfg["eval_schedule_growth"] = max(float(cfg["eval_schedule_growth"]), 1.0)
     cfg["eval_interval_cap"] = max(int(cfg["eval_interval_cap"]), 0)
@@ -1038,6 +1050,71 @@ def save_full_state(path, model, ema, opt, scaler, scheduler, step, cfg, best,
     }, path)
 
 
+def _snapshot_cpu(obj):
+    """Recursively detach + move tensors to CPU (checkpoint snapshot).
+
+    Must run on the main thread between steps: the training loop mutates the
+    live tensors every step, so a background save can never read them
+    directly — it only ever sees this frozen CPU copy.
+    """
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu()
+    if isinstance(obj, dict):
+        return {k: _snapshot_cpu(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_snapshot_cpu(v) for v in obj]
+    return obj
+
+
+def _start_async_save(job, pending: List[threading.Thread], emit) -> None:
+    """Run *job* (serialize + atomically write one checkpoint) in a daemon
+    thread so disk I/O overlaps training. *pending* accumulates the threads
+    for join-at-exit. A failed write is logged (the next eval retries) rather
+    than killing the run.
+    """
+    def wrapped():
+        try:
+            job()
+        except Exception as e:
+            emit(f"  ⚠ async checkpoint save failed: {type(e).__name__}: {e}")
+
+    t = threading.Thread(target=wrapped, daemon=True)
+    t.start()
+    pending.append(t)
+
+
+def _async_save_safetensors(cpu_state, path, ccfg, extra_metadata,
+                            pending: List[threading.Thread], emit) -> None:
+    """Background .safetensors write of a CPU fp16 snapshot (tmp+replace)."""
+    import safetensors.torch as st
+    meta = {"config": json.dumps(ccfg.to_dict(), default=str)}
+    if extra_metadata:
+        for k, v in extra_metadata.items():
+            meta[str(k)] = json.dumps(v, default=str) if not isinstance(v, str) else v
+
+    def job():
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(p.name + ".tmp")
+        st.save_file(cpu_state, str(tmp), metadata=meta)
+        tmp.replace(p)
+
+    _start_async_save(job, pending, emit)
+
+
+def _async_save_full_state(snapshot: dict, path, pending: List[threading.Thread],
+                           emit) -> None:
+    """Background full-state .pt write of a CPU snapshot (tmp+replace)."""
+    def job():
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(p.name + ".tmp")
+        torch.save(snapshot, tmp)
+        tmp.replace(p)
+
+    _start_async_save(job, pending, emit)
+
+
 def config_drift(snapshot: dict, cfg: dict) -> List[str]:
     keys = ["model_size", "depth", "optimizer", "lr", "batch_size", "loss",
             "max_steps", "refine_passes_max", "multipass",
@@ -1079,7 +1156,8 @@ def main(argv=None):
     print(f"  Loss:           {cfg['loss']}   batch={cfg['batch_size']}  "
           f"max_steps={cfg['max_steps']}")
     print(f"  Cache:          {cfg['cache_size']} generations   "
-          f"loader workers: {cfg['num_workers']}")
+          f"loader workers: {cfg['num_workers']}   "
+          f"prefetch queue: {cfg['prefetch_queue']}")
     print(f"  Device:         {device}")
 
     print("  Preparing dataset (pair index + normalization stats)...")
@@ -1381,6 +1459,55 @@ def main(argv=None):
         else:
             print(line)
 
+    # ── Data-path prefetch (--prefetch-queue N) ────────────────────────
+    # A daemon producer thread pulls batches from the active loader and pins
+    # them into a bounded queue, so decode/collate overlaps the GPU step. The
+    # dataset's generation LRU stays single-process (RAM-efficient); with
+    # num_workers > 0 the loader still does process-parallel decode and the
+    # producer only adds the pinned transfer buffer. 0 = today's main-thread
+    # fetch. On a producer failure a sentinel falls the loop back to
+    # main-thread fetching (never blocks forever).
+    producer_q: Optional[queue.Queue] = None
+    producer_ref: Optional[List] = None
+    pending_saves: List[threading.Thread] = []
+    if cfg["prefetch_queue"] > 0:
+        producer_ref = [active_loader]
+        producer_q = queue.Queue(maxsize=int(cfg["prefetch_queue"]))
+
+        def _produce():
+            cur_loader: Optional[DataLoader] = None
+            it = None
+            try:
+                while True:
+                    loader = producer_ref[0]
+                    if loader is not cur_loader:
+                        cur_loader = loader
+                        it = iter(loader)
+                    try:
+                        b = next(it)
+                    except StopIteration:
+                        it = iter(cur_loader)
+                        b = next(it)
+                    producer_q.put({k: v.pin_memory() for k, v in b.items()})
+            except Exception as e:
+                emit(f"  ⚠ prefetch producer failed "
+                     f"({type(e).__name__}: {e}) — falling back to "
+                     "main-thread fetch")
+                try:
+                    producer_q.put(_PREFETCH_FAILED)
+                except Exception:
+                    pass
+
+        threading.Thread(target=_produce, daemon=True).start()
+
+    # Per-step data-vs-GPU instrumentation (regime check): fetch+H2D wall on
+    # the CPU side vs CUDA-event GPU time for augment+compute+optimizer.
+    use_events = device.type == "cuda" and torch.cuda.is_available()
+    ev_gpu0 = torch.cuda.Event(True) if use_events else None
+    ev_gpu1 = torch.cuda.Event(True) if use_events else None
+    data_ms_acc = 0.0
+    gpu_ms_acc = 0.0
+
     cur_rng = random.Random(cfg["seed"] + 2000)
 
     def pick_loader(step: int):
@@ -1402,14 +1529,31 @@ def main(argv=None):
         if want is not active_loader:
             active_loader = want
             iter_loader = iter(active_loader)
+            if producer_ref is not None:
+                producer_ref[0] = active_loader
             if step == ramp_start + 1 and stage1_loader is not None:
                 emit(f"  [curriculum] ramp to full resolution mix from step {step}")
-        try:
-            batch = next(iter_loader)
-        except StopIteration:
-            iter_loader = iter(active_loader)
-            batch = next(iter_loader)
-        batch = {k: v.to(device) for k, v in batch.items()}
+        t_fetch0 = time.time()
+        if producer_q is not None:
+            batch = producer_q.get()
+            if batch is _PREFETCH_FAILED:
+                emit("  [prefetch] producer failed — continuing with "
+                     "main-thread fetch")
+                producer_q = None
+                iter_loader = iter(active_loader)
+                batch = next(iter_loader)
+        else:
+            try:
+                batch = next(iter_loader)
+            except StopIteration:
+                iter_loader = iter(active_loader)
+                batch = next(iter_loader)
+        t_fetch1 = time.time()
+        batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+        t_h2d1 = time.time()
+        data_ms_cur = (t_fetch1 - t_fetch0) * 1e3 + (t_h2d1 - t_fetch1) * 1e3
+        if ev_gpu0 is not None:
+            ev_gpu0.record()
         batch = to_cl(augment_batch(batch, aug_rng, scale_aug=cfg["scale_aug"]))
 
         k_max_cur = k_max_final
@@ -1445,12 +1589,25 @@ def main(argv=None):
         micro_losses: List[torch.Tensor] = []
         for m in range(n_micro):
             if m > 0:
-                try:
-                    batch = next(iter_loader)
-                except StopIteration:
-                    iter_loader = iter(active_loader)
-                    batch = next(iter_loader)
-                batch = {k: v.to(device) for k, v in batch.items()}
+                t_fetch0 = time.time()
+                if producer_q is not None:
+                    batch = producer_q.get()
+                    if batch is _PREFETCH_FAILED:
+                        emit("  [prefetch] producer failed — continuing with "
+                             "main-thread fetch")
+                        producer_q = None
+                        iter_loader = iter(active_loader)
+                        batch = next(iter_loader)
+                else:
+                    try:
+                        batch = next(iter_loader)
+                    except StopIteration:
+                        iter_loader = iter(active_loader)
+                        batch = next(iter_loader)
+                t_fetch1 = time.time()
+                batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+                data_ms_cur += (t_fetch1 - t_fetch0) * 1e3 \
+                    + (time.time() - t_fetch1) * 1e3
                 batch = to_cl(augment_batch(batch, aug_rng, scale_aug=cfg["scale_aug"]))
             Ks = torch.randint(1, k_max_cur + 1, (batch["x_t"].shape[0],),
                                device=device)
@@ -1467,9 +1624,16 @@ def main(argv=None):
         if scheduler is not None:
             scheduler.step()
         ema_update(model, ema, step, decay=cfg["ema_decay"])
+        if ev_gpu1 is not None:
+            ev_gpu1.record()
         timer.record_step(time.time() - t_step0)
 
         loss_v = float(sum(micro_losses) / max(len(micro_losses), 1))
+        # The .item() sync above completes the step's events — elapsed_time
+        # is only valid after that sync.
+        gpu_ms_cur = ev_gpu0.elapsed_time(ev_gpu1) if ev_gpu0 is not None else 0.0
+        data_ms_acc += data_ms_cur
+        gpu_ms_acc += gpu_ms_cur
         loss_ema = loss_v if loss_ema is None else 0.99 * loss_ema + 0.01 * loss_v
         min_loss = min(min_loss, loss_v)
         grad_norm_v = float(grad_norm) if grad_norm is not None else float("nan")
@@ -1495,7 +1659,8 @@ def main(argv=None):
                     f"lr={opt.param_groups[0]['lr']:.2e}  "
                     f"it/s={timer.steps_per_sec():.2f}  "
                     f"elapsed={format_duration(wall)}  "
-                    f"remaining~{format_duration(rem_s)}")
+                    f"remaining~{format_duration(rem_s)}  "
+                    f"data={data_ms_cur:.0f}ms gpu={gpu_ms_cur:.0f}ms")
             emit(line)
             metrics.write({
                 "type": "step", "step": step,
@@ -1503,6 +1668,8 @@ def main(argv=None):
                 "loss": loss_v, "loss_ema": loss_ema, "min_loss": min_loss,
                 "grad_norm": grad_norm_v, "lr": opt.param_groups[0]["lr"],
                 "k_max": k_max_cur, "wall_s": wall,
+                "data_ms": round(data_ms_cur, 1),
+                "gpu_ms": round(gpu_ms_cur, 1),
                 "vram_gb": torch.cuda.max_memory_allocated() / (1024 ** 3),
             })
 
@@ -1667,7 +1834,10 @@ def main(argv=None):
                          "per-lag coverage gate (plan 6h); extend record_lags "
                          "if superlinear")
 
-            # Checkpointing (plan 6i)
+            # Checkpointing (plan 6i). State is snapshotted to CPU on the main
+            # thread (between steps, so nothing mutates under us) and
+            # serialized/written by daemon threads that overlap the next
+            # training steps; writes are tmp+replace for crash-atomicity.
             ema_model.load_state_dict(ema)
             cfg_meta = {k: v for k, v in cfg.items()
                         if k not in ("data", "resume", "out", "compile",
@@ -1678,18 +1848,33 @@ def main(argv=None):
                     best is None or k1_lad < best):
                 best = k1_lad
                 best_step = step
-                save_corrector(ema_model, out_dir / f"corrector-{size}-best.safetensors",
-                               ccfg, extra_metadata={"config_snapshot": cfg_meta,
-                                                     "best_rel_mse_k1_ladder": k1_lad})
-            save_corrector(ema_model, out_dir / f"corrector-{size}-{step}.safetensors",
-                           ccfg, extra_metadata={"config_snapshot": cfg_meta})
+                best_state = {k: v.detach().to(torch.float16).contiguous().cpu()
+                              for k, v in ema_model.state_dict().items()}
+                _async_save_safetensors(
+                    best_state,
+                    out_dir / f"corrector-{size}-best.safetensors",
+                    ccfg, {"config_snapshot": cfg_meta,
+                           "best_rel_mse_k1_ladder": k1_lad},
+                    pending_saves, emit)
+            step_state = {k: v.detach().to(torch.float16).contiguous().cpu()
+                          for k, v in ema_model.state_dict().items()}
+            _async_save_safetensors(
+                step_state, out_dir / f"corrector-{size}-{step}.safetensors",
+                ccfg, {"config_snapshot": cfg_meta}, pending_saves, emit)
             for old in sorted(out_dir.glob(f"corrector-{size}-*.safetensors")):
                 if f"-{step}." in old.name or "-best." in old.name:
                     continue
                 old.unlink(missing_ok=True)
-            save_full_state(out_dir / f"corrector-{size}-train.pt", model, ema, opt,
-                            scaler, scheduler, step, cfg, best, best_step=best_step,
-                            wall_s=time.time() - t_start)
+            _async_save_full_state(
+                {"model": _snapshot_cpu(model.state_dict()),
+                 "ema": _snapshot_cpu(ema),
+                 "optimizer": _snapshot_cpu(opt.state_dict()),
+                 "scaler": _snapshot_cpu(scaler.state_dict()),
+                 "scheduler": _snapshot_cpu(scheduler.state_dict())
+                 if scheduler is not None else None,
+                 "step": step, "best": best, "best_step": best_step,
+                 "wall_s": time.time() - t_start, "config_snapshot": cfg},
+                out_dir / f"corrector-{size}-train.pt", pending_saves, emit)
             emit(f"      saved corrector-{size}-{step}.safetensors"
                  + (f" (best ladder K1={best:.4f} @ {best_step})"
                     if best is not None else ""))
@@ -1740,6 +1925,8 @@ def main(argv=None):
             })
 
     # ── Final (plan 6i) ────────────────────────────────────────────────
+    for t in pending_saves:
+        t.join()
     ema_model.load_state_dict(ema)
     final = out_dir / f"corrector-{size}.safetensors"
     cfg_meta = {k: v for k, v in cfg.items()
@@ -1762,6 +1949,14 @@ def main(argv=None):
           f"hessian {format_duration(timer.phase_seconds('hessian'))})")
     print(f"  Throughput:   {timer.steps_per_sec():.2f} it/s  "
           f"(median step {timer.step_time() * 1000:.0f} ms)")
+    if gpu_ms_acc > 0:
+        n = max(step, 1)
+        data_ms = data_ms_acc / n
+        gpu_ms = gpu_ms_acc / n
+        print(f"  Data path:    {data_ms:.1f} ms/step fetch+H2D, "
+              f"{gpu_ms:.1f} ms/step GPU  "
+              f"(data {100 * data_ms / max(data_ms + gpu_ms, 1e-9):.0f}% of "
+              f"data+GPU — 0% would be ideal)")
     if loss_ema is not None:
         print(f"  Loss:         final {loss_v:.5f}   min {min_loss:.5f}   "
               f"(ema {loss_ema:.5f})")

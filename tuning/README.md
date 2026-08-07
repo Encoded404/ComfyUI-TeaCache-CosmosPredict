@@ -181,6 +181,17 @@ python -m tuning.train_corrector --data outputs/<ts>/refiner_data \
   did-it-learn (ladder-only K=1 beats the probe ceiling by ≥20% within 6
   evals), K-robustness gap (ladder-only) and per-lag coverage warnings
   (growth measured from lag 1, not the d=0 anchors).
+- **Data path & GPU utilization**: generation decode/collate runs in
+  DataLoader worker processes (`refiner_training.num_workers`, default 4 —
+  each worker partitions the generation LRU, so the effective cache is
+  workers × `cache_size`) or, RAM-economically, in a single producer thread
+  (`--prefetch-queue N` — pinned bounded queue, one shared LRU; 0 = main
+  thread). Per-50-step log lines and `train_metrics.jsonl` step rows carry
+  `data_ms` (fetch+H2D) vs `gpu_ms` (CUDA-event measured), and the final
+  summary prints the data share of data+GPU — if data is a large fraction,
+  raise `num_workers` or `--prefetch-queue`. Checkpoint saves (.safetensors
+  + full-state .pt) snapshot on the main thread and write in background
+  threads (tmp+replace), so eval-time disk I/O doesn't idle the GPU.
 - **Progress & metrics**: live tqdm bar (EMA loss, lr, K, it/s, remaining),
   per-50-step log lines with ETA, and a per-eval timing report (train / eval /
   hessian phases; the ETA projects eval + checkpoint overhead). Step + eval

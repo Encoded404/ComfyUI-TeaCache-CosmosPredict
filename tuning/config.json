@@ -147,10 +147,11 @@
         },
         "accumulate_big_batches": true,
         "scale_aug": true,
-        "cache_size": 128,
+        "cache_size": 32,
         "recovery_fit_batches": 128,
         "recovery_eval_batches": 64,
-        "num_workers": 0,
+        "num_workers": 4,
+        "prefetch_queue": 0,
         "seed": 42
     },
 
