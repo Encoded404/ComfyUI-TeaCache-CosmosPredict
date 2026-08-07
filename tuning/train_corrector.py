@@ -550,6 +550,7 @@ def recovery_table_lines(rows: List[dict],
     "split" key with ladder/anchor means) for the OOD per-channel affine row.
     """
     base = next((r["rel_mse"] for r in rows if r["k"] == 0), None)
+    base_ladder = next((r["ladder_only"] for r in rows if r["k"] == 0), float("nan"))
     lines = [
         "  v_t error recovery vs TeaCache base "
         "(pooled rel-MSE ‖v̂−v_true‖₂/‖v_true‖₂)",
@@ -568,7 +569,14 @@ def recovery_table_lines(rows: List[dict],
         rec_str = "—" if rec is None else f"{100 * rec:>10.1f}%"
         lines.append(f"  {name:<24}{err:>10.5f}{ratio:>9.3f}{rec_str:>12}")
         if r["ladder_only"] == r["ladder_only"]:
-            lines.append(f"    ladder only          {r['ladder_only']:>10.5f}")
+            lad_ratio = lad_rec = None
+            if base_ladder == base_ladder and base_ladder > 0:
+                lad_ratio = r["ladder_only"] / base_ladder
+                lad_rec = None if r["k"] == 0 else 1.0 - lad_ratio
+            lad_rat_str = "—" if lad_ratio is None else f"{lad_ratio:>9.3f}"
+            lad_rec_str = "—" if lad_rec is None else f"{100 * lad_rec:>10.1f}%"
+            lines.append(f"    ladder only          {r['ladder_only']:>10.5f}"
+                         f"{lad_rat_str}{lad_rec_str:>12}")
         if r["anchors_only"] == r["anchors_only"]:
             lines.append(f"    d=0 anchors only     {r['anchors_only']:>10.5f}")
     if affine is not None:
@@ -585,7 +593,14 @@ def recovery_table_lines(rows: List[dict],
             lad = (affine.get("split") or {}).get("ladder")
             anc = (affine.get("split") or {}).get("anchor")
             if lad is not None:
-                lines.append(f"    ladder only          {lad:>10.5f}")
+                lad_ratio = lad_rec = None
+                if base_ladder == base_ladder and base_ladder > 0:
+                    lad_ratio = lad / base_ladder
+                    lad_rec = 1.0 - lad_ratio
+                lad_rat_str = "—" if lad_ratio is None else f"{lad_ratio:>9.3f}"
+                lad_rec_str = "—" if lad_rec is None else f"{100 * lad_rec:>10.1f}%"
+                lines.append(f"    ladder only          {lad:>10.5f}"
+                             f"{lad_rat_str}{lad_rec_str:>12}")
             if anc is not None:
                 lines.append(f"    d=0 anchors only     {anc:>10.5f}")
     lines.append("  " + "─" * 62)
@@ -1175,6 +1190,7 @@ def main(argv=None):
             rows = recovery_rows(results, ks_eval)
             last_eval_rows = rows
             last_affine = affine
+            bl = next((r["ladder_only"] for r in rows if r["k"] == 0), None)
             for line2 in recovery_table_lines(rows, affine):
                 emit(line2)
             if ceiling is not None and not gate_fired and step >= gate_deadline:
@@ -1240,6 +1256,10 @@ def main(argv=None):
                               for (h, w) in shape_keys},
                 "recovery": {str(r["k"]): {"rel_mse": round(r["rel_mse"], 6),
                                            "ladder_only": round(r["ladder_only"], 6),
+                                           "ladder_ratio_base": (round(r["ladder_only"] / bl, 4)
+                                                                 if bl and r["ladder_only"] == r["ladder_only"] else None),
+                                           "ladder_recovered": (round(1.0 - r["ladder_only"] / bl, 4)
+                                                                if bl and r["k"] != 0 and r["ladder_only"] == r["ladder_only"] else None),
                                            "anchors_only": round(r["anchors_only"], 6),
                                            "n_pairs": r["n_pairs"]}
                              for r in rows},

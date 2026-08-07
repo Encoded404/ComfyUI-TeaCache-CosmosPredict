@@ -396,6 +396,9 @@ so it is the apples-to-apples OOD view the verdict line is not:
 - **TeaCache base (v_MA)** — `‖v_MA − v_true‖/‖v_true‖`. Deflated by the
   ~20% d=0 anchor pairs (error exactly 0 by construction); the **ladder-only**
   sub-row (≈0.49 on the example run) is the honest "doing nothing" baseline.
+  Each ladder-only sub-row carries its own `× base` / `recovered` columns
+  relative to the *ladder-only* base (the anchors sub-rows stay absolute —
+  their base error is exactly 0, so a ratio would be meaningless).
 - **Per-channel affine (OOD)** — the per-stratum affine fit from §6.2, but
   now fit on **train pairs** and scored on the eval pairs (same distribution
   contract as the UNet: fit = train, scored = held-out). Fit and score are

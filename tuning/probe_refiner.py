@@ -1064,15 +1064,24 @@ def main(argv=None):
                 continue
             ratio = 0.0 if r.get("oracle") else err / base_rel
             rec = 1.0 if r.get("oracle") else (None if r.get("is_base") else 1.0 - ratio)
+            lad = r["ladder"]
+            lad_ratio = lad_rec = None
+            if lad is not None and b_lad is not None and b_lad > 0:
+                lad_ratio = 0.0 if r.get("oracle") else lad / b_lad
+                lad_rec = 1.0 if r.get("oracle") else (None if r.get("is_base") else 1.0 - lad_ratio)
             recovery[name] = {"abs_err": round(err, 5),
                               "ratio_base": round(ratio, 4),
                               "recovered": round(rec, 4) if rec is not None else None,
-                              "ladder_only": round(r["ladder"], 5) if r["ladder"] is not None else None,
+                              "ladder_only": round(lad, 5) if lad is not None else None,
+                              "ladder_ratio_base": round(lad_ratio, 4) if lad_ratio is not None else None,
+                              "ladder_recovered": round(lad_rec, 4) if lad_rec is not None else None,
                               "anchors_only": round(r["anchor"], 5) if r["anchor"] is not None else None}
             rec_str = "—" if rec is None else f"{100 * rec:>10.1f}%"
             print(f"  {name:<24}{err:>10.5f}{ratio:>9.3f}{rec_str:>12}")
-            if r["ladder"] is not None:
-                print(f"    ladder only          {r['ladder']:>10.5f}")
+            if lad is not None:
+                lad_rat_str = "—" if lad_ratio is None else f"{lad_ratio:>9.3f}"
+                lad_rec_str = "—" if lad_rec is None else f"{100 * lad_rec:>10.1f}%"
+                print(f"    ladder only          {lad:>10.5f}{lad_rat_str}{lad_rec_str:>12}")
             if r["anchor"] is not None:
                 print(f"    d=0 anchors only     {r['anchor']:>10.5f}")
         print("  " + "─" * 62)
