@@ -125,7 +125,7 @@
         "max_steps": 60000,
         "eval_every": 500,
         "eval_schedule_growth": 2.0,
-        "eval_interval_cap": 32000,
+        "eval_interval_cap": 16000,
         "eval_max_batches": 256,
         "eval_full_k_every": 5,
         "ema_decay": 0.9999,
