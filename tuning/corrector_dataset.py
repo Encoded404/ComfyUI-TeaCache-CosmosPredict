@@ -393,7 +393,8 @@ class CorrectorBatchSampler(Sampler):
 
 
 def collect_fit_maps(ds, shapes, batch_size: int = 16, seed: int = 0,
-                     cap_batches_per_shape: int = 128) -> dict:
+                     cap_batches_per_shape: int = 128,
+                     show_progress: bool = False, desc: str = "fit-maps") -> dict:
     """Per-stratum (v_ma, v_true) fit maps for the OOD affine recovery row.
 
     Drawn as a **seeded thin sample spread across every generation** of each
@@ -409,6 +410,9 @@ def collect_fit_maps(ds, shapes, batch_size: int = 16, seed: int = 0,
     (16 @ ≤64×64, ÷4 above), i.e. ≈ 8 MB per stored batch like the training
     loader. Returns the :func:`~tuning.utils.affine_oob_eval`-compatible
     ``{shape: {"vm": [batched], "vt": [batched]}}`` dict (CPU float32).
+
+    ``show_progress`` surfaces a tqdm bar over the pair loads (one generation
+    decode per stratum generation; the rest are LRU-cache hits).
     """
     shape_set = set(tuple(s) for s in shapes)
     # Pair indices per stratum, grouped into per-generation runs (the pairs
@@ -426,7 +430,7 @@ def collect_fit_maps(ds, shapes, batch_size: int = 16, seed: int = 0,
             runs.setdefault(s, []).append([i])
         prev = key
     rng = random.Random(seed)
-    out = {}
+    plans: List[Tuple[Tuple[int, int], int, List[int]]] = []
     for s, s_runs in runs.items():
         h, w = s
         bs = max(1, batch_size // 4) if h * w > 64 * 64 else batch_size
@@ -440,16 +444,29 @@ def collect_fit_maps(ds, shapes, batch_size: int = 16, seed: int = 0,
             sub = list(run)
             rng.shuffle(sub)
             picked.extend(sub[:min(quota, len(sub))])
+        if picked:
+            plans.append((s, bs, picked))
+    total = sum(len(p) for _, _, p in plans)
+    pbar = None
+    if show_progress and tqdm is not None and total > 0:
+        pbar = tqdm(total=total, desc=desc, unit="pair", leave=False,
+                    dynamic_ncols=True, mininterval=0.5)
+    out = {}
+    for s, bs, picked in plans:
         vms, vts = [], []
-        for i in picked[:budget]:
+        for i in picked:
             try:
                 _, vm, vt, _ = ds._load_pair(i)   # KeyError: ring-availability drift
             except KeyError:
-                continue
-            vms.append(vm.float().cpu())
-            vts.append(vt.float().cpu())
-        if not vms:
-            continue
-        out[s] = {"vm": [torch.stack(vms[k:k + bs]) for k in range(0, len(vms), bs)],
-                  "vt": [torch.stack(vts[k:k + bs]) for k in range(0, len(vts), bs)]}
+                pass
+            else:
+                vms.append(vm.float().cpu())
+                vts.append(vt.float().cpu())
+            if pbar is not None:
+                pbar.update(1)
+        if vms:
+            out[s] = {"vm": [torch.stack(vms[k:k + bs]) for k in range(0, len(vms), bs)],
+                      "vt": [torch.stack(vts[k:k + bs]) for k in range(0, len(vts), bs)]}
+    if pbar is not None:
+        pbar.close()
     return out

@@ -704,7 +704,8 @@ def day1_unet(data_dir: Path, device, max_steps: int = 600, batch_size: int = 8,
         # strata without fit pairs).
         eval_shapes = set(eval_ds.pair_shapes())
         fit_maps = collect_fit_maps(train_ds, eval_shapes, seed=seed + 5,
-                                    cap_batches_per_shape=recovery_fit_batches)
+                                    cap_batches_per_shape=recovery_fit_batches,
+                                    show_progress=show_progress, desc="day1-fit")
         ev = eval_pairs(eval_ds, fit_maps, recovery_eval_batches)
         del fit_maps
     day1_eval = ev["rel_mse"] if ev is not None else None

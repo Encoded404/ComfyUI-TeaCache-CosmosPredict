@@ -1146,7 +1146,8 @@ def main(argv=None):
             if affine_fit_maps is None and eval_shapes:
                 affine_fit_maps = collect_fit_maps(
                     ds, eval_shapes, seed=cfg["seed"] + 6,
-                    cap_batches_per_shape=int(cfg.get("recovery_fit_batches", 128)))
+                    cap_batches_per_shape=int(cfg.get("recovery_fit_batches", 128)),
+                    show_progress=(pbar is not None), desc="affine-fit")
             if affine_fit_maps and eval_maps:
                 aff = affine_oob_eval(affine_fit_maps, eval_maps)
                 lad, anc = split_affine_per_pair(aff, eval_maps)
