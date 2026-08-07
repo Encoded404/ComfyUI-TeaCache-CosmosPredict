@@ -1081,6 +1081,265 @@ class TrainTimer:
         return lines
 
 
+class StepProfiler:
+    """Per-interval (since-last-eval) training-step phase breakdown.
+
+    Accumulates per-phase wall/GPU time, counts and data-path signals over a
+    block of training steps. On CUDA the GPU time is measured with event pairs
+    recorded on the default stream: the phases are enqueued sequentially with
+    data dependencies (augment → fwd → bwd → opt → ema), so each event span
+    measures that phase's GPU execution. On CPU the wall time stands in for
+    the GPU column (``wall_only=True`` in the snapshot).
+
+    One ``begin``/``end`` pair per phase occurrence (fwd/bwd/aug repeat per
+    micro-batch; their event pairs are accumulated until ``finish_step``,
+    which reads them after the step's sync point). Cache hit/miss counters
+    are read-and-reset from the attached datasets, so each interval report
+    covers exactly the training data path since the previous eval. Run-level
+    totals accumulate independently of the interval resets for the final
+    summary.
+    """
+
+    # Display order for the per-phase rows of the breakdown.
+    PHASE_ORDER = ("aug", "fwd", "bwd", "hessian", "opt", "ema")
+
+    def __init__(self, device, step_window: int = 256):
+        self._cuda = getattr(device, "type", None) == "cuda" and torch.cuda.is_available()
+        self._datasets: List = []
+        self._pend: Dict[str, Tuple[float, Optional[torch.cuda.Event]]] = {}
+        self._done: List[Tuple[str, float, float, Optional[torch.cuda.Event],
+                               Optional[torch.cuda.Event]]] = []
+        self._step_walls = deque(maxlen=max(step_window, 1))
+        self.reset()
+        self._run = self._new_interval()
+
+    def attach_datasets(self, datasets: List) -> None:
+        """Datasets whose GenCacheStats feed the cache rows of the report."""
+        self._datasets = list(datasets)
+
+    def reset_cache_stats(self) -> None:
+        """Read-and-discard the attached datasets' cache counters (called
+        once after attach, so pre-training loads — dataset stats, per-lag
+        base estimation — don't pollute the first interval's cache row)."""
+        for d in self._datasets:
+            s = getattr(d, "cache_stats", None)
+            if s is not None:
+                s.snapshot()
+
+    @staticmethod
+    def _new_interval() -> dict:
+        return {
+            "n_steps": 0,
+            "n_micro": 0,
+            "k_max_sum": 0.0,
+            "n_hessian": 0,
+            "fetch_wait_ms": 0.0,
+            "h2d_ms": 0.0,
+            "wall_sum": 0.0,
+            "phase_wall": {},     # phase -> total wall ms
+            "phase_gpu": {},      # phase -> total GPU ms
+            "phase_n": {},        # phase -> occurrences
+            "phase_max_gpu": {},  # phase -> max GPU ms (single occurrence)
+            "shape_gpu_ms": {},   # "HxW" -> total GPU ms
+            "shape_n": {},        # "HxW" -> steps
+            "q_depth_sum": 0.0,
+            "q_depth_n": 0,
+        }
+
+    def reset(self) -> None:
+        """Start a new interval (called at each eval)."""
+        self._cur = self._new_interval()
+        self._step_walls.clear()
+
+    # ── phase timing ───────────────────────────────────────────────────
+
+    def begin(self, phase: str) -> None:
+        ev = torch.cuda.Event(True) if self._cuda else None
+        if ev is not None:
+            ev.record()
+        self._pend[phase] = (time.time(), ev)
+
+    def end(self, phase: str) -> None:
+        pend = self._pend.pop(phase, None)
+        if pend is None:
+            return
+        t0, ev0 = pend
+        ev1 = torch.cuda.Event(True) if self._cuda else None
+        if ev1 is not None:
+            ev1.record()
+        self._done.append((phase, t0, time.time(), ev0, ev1))
+
+    def finish_step(self, hw: Optional[Tuple[int, int]] = None,
+                    n_micro: int = 1, k_max: int = 1, hessian_step: bool = False,
+                    fetch_wait_ms: float = 0.0, h2d_ms: float = 0.0,
+                    q_depth: Optional[float] = None,
+                    wall_ms: Optional[float] = None) -> float:
+        """Close the step: read the phase event spans (valid after the step's
+        sync) into the interval and run accumulators. Returns total GPU ms."""
+        gpu_total = 0.0
+        phase_wall_sum = 0.0
+        for phase, t0, t1, ev0, ev1 in self._done:
+            wall = (t1 - t0) * 1e3
+            phase_wall_sum += wall
+            gpu = ev0.elapsed_time(ev1) if ev0 is not None else wall
+            for acc in (self._cur, self._run):
+                acc["phase_wall"][phase] = acc["phase_wall"].get(phase, 0.0) + wall
+                acc["phase_gpu"][phase] = acc["phase_gpu"].get(phase, 0.0) + gpu
+                acc["phase_n"][phase] = acc["phase_n"].get(phase, 0) + 1
+                acc["phase_max_gpu"][phase] = max(
+                    acc["phase_max_gpu"].get(phase, 0.0), gpu)
+            gpu_total += gpu
+        self._done.clear()
+        self._pend.clear()
+        wall = wall_ms if wall_ms is not None else phase_wall_sum
+        shape = f"{hw[0]}x{hw[1]}" if hw is not None else None
+        for acc in (self._cur, self._run):
+            acc["n_steps"] += 1
+            acc["n_micro"] += int(n_micro)
+            acc["k_max_sum"] += float(k_max)
+            acc["n_hessian"] += int(hessian_step)
+            acc["fetch_wait_ms"] += fetch_wait_ms
+            acc["h2d_ms"] += h2d_ms
+            acc["wall_sum"] += wall
+            if shape is not None:
+                acc["shape_gpu_ms"][shape] = acc["shape_gpu_ms"].get(shape, 0.0) + gpu_total
+                acc["shape_n"][shape] = acc["shape_n"].get(shape, 0) + 1
+            if q_depth is not None:
+                acc["q_depth_sum"] += float(q_depth)
+                acc["q_depth_n"] += 1
+        self._step_walls.append(wall)
+        return gpu_total
+
+    # ── reporting ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _cache_row(datasets) -> dict:
+        h = m = miss_ms = 0
+        for d in datasets:
+            s = getattr(d, "cache_stats", None)
+            if s is None:
+                continue
+            r = s.snapshot()
+            h += r["hits"]
+            m += r["misses"]
+            miss_ms += r["miss_ms"]
+        return {"hits": h, "misses": m, "miss_ms": miss_ms}
+
+    @staticmethod
+    def _finish(acc: dict, wall_only: bool, datasets,
+                step_walls: Optional[deque] = None) -> dict:
+        n = max(acc["n_steps"], 1)
+        wall_mean = acc["wall_sum"] / n
+        gpu_mean = sum(acc["phase_gpu"].values()) / n
+        fetch_mean = acc["fetch_wait_ms"] / n
+        h2d_mean = acc["h2d_ms"] / n
+        other = max(0.0, wall_mean - fetch_mean - h2d_mean
+                    - sum(acc["phase_wall"].values()) / n)
+        if step_walls and len(step_walls) >= 3:
+            ts = sorted(step_walls)
+            wall_median = ts[len(ts) // 2]
+        else:
+            wall_median = wall_mean
+        cache = StepProfiler._cache_row(datasets)
+        total = cache["hits"] + cache["misses"]
+        return {
+            "steps": acc["n_steps"],
+            "it_per_s": round(1000.0 / wall_mean, 3) if wall_mean > 0 else 0.0,
+            "step_wall_ms": round(wall_mean, 2),
+            "step_wall_median_ms": round(wall_median, 2),
+            "gpu_ms": round(gpu_mean, 2),
+            "gpu_busy_pct": round(100.0 * gpu_mean / wall_mean, 1)
+            if wall_mean > 0 else 0.0,
+            "fetch_wait_ms": round(fetch_mean, 2),
+            "h2d_ms": round(h2d_mean, 2),
+            "other_ms": round(other, 2),
+            "wall_only": wall_only,
+            "phases": {
+                ph: {"wall_ms": round(acc["phase_wall"].get(ph, 0.0) / n, 2),
+                     "gpu_ms": round(acc["phase_gpu"].get(ph, 0.0) / n, 2),
+                     "max_gpu_ms": round(acc["phase_max_gpu"].get(ph, 0.0), 2),
+                     "n": acc["phase_n"].get(ph, 0)}
+                for ph in StepProfiler.PHASE_ORDER
+                if acc["phase_n"].get(ph, 0)
+            },
+            "shape_gpu_ms": {sh: round(acc["shape_gpu_ms"][sh] / acc["shape_n"][sh], 2)
+                             for sh in sorted(acc["shape_gpu_ms"],
+                                              key=lambda s: (int(s.split("x")[0]) * int(s.split("x")[1])))},
+            "k_max_avg": round(acc["k_max_sum"] / n, 2),
+            "n_micro_avg": round(acc["n_micro"] / n, 2),
+            "hessian_steps": acc["n_hessian"],
+            "cache_hit_pct": round(100.0 * cache["hits"] / total, 1) if total else None,
+            "cache_hits": cache["hits"],
+            "cache_misses": cache["misses"],
+            "cache_miss_load_ms": round(cache["miss_ms"] / cache["misses"], 1)
+            if cache["misses"] else None,
+            "producer_q_depth_avg": round(acc["q_depth_sum"] / acc["q_depth_n"], 2)
+            if acc["q_depth_n"] else None,
+        }
+
+    def snapshot(self) -> dict:
+        """Interval summary (reads + resets the datasets' cache counters)."""
+        return self._finish(self._cur, not self._cuda, self._datasets,
+                            self._step_walls)
+
+    def run_snapshot(self) -> dict:
+        """Run-level summary (never reset by evals)."""
+        return self._finish(self._run, not self._cuda, [])
+
+
+def format_breakdown_lines(t: dict, title: Optional[str] = None) -> List[str]:
+    """Human-readable per-eval step-time breakdown block from a StepProfiler
+    snapshot (printed above the eval's summary lines)."""
+    W = 58
+    head = f"── step time breakdown ({title or 'interval'})"
+    lines = [f"  {head} " + "─" * max(2, W - len(head) - 1)]
+    n = t.get("steps", 0)
+    if not n:
+        lines.append("  no steps in interval")
+        return lines
+    tag = " (wall; no CUDA events)" if t.get("wall_only") else ""
+    lines.append(f"  step wall: {t['step_wall_ms']:>8.1f} ms/step{tag}"
+                 f"  → {t['it_per_s']:.2f} it/s  (n={n})")
+    lines.append(f"  gpu busy:  {t['gpu_busy_pct']:>8.1f}%  "
+                 f"(gpu {t['gpu_ms']} ms vs wall)")
+    lines.append(f"  data path: fetch-wait {t['fetch_wait_ms']:>6.2f} ms  "
+                 f"h2d {t['h2d_ms']:>6.2f} ms  other {t['other_ms']:>6.2f} ms")
+    phases = t.get("phases") or {}
+    if phases:
+        parts = []
+        for ph, st in phases.items():
+            parts.append(f"{ph} {st['gpu_ms']:.1f}ms"
+                         + (f"×{st['n']}" if st["n"] > 1 else ""))
+        lines.append("  gpu phases: " + "  ".join(parts))
+        worst = max(phases.items(), key=lambda kv: kv[1]["max_gpu_ms"])
+        if worst[1]["max_gpu_ms"] > 0:
+            lines.append(f"  worst phase: {worst[0]} {worst[1]['max_gpu_ms']:.1f} ms"
+                         f" (peak over occurrences)")
+    shapes = t.get("shape_gpu_ms") or {}
+    if shapes:
+        lines.append("  gpu by shape: " + "  ".join(
+            f"{sh} {v:.1f}ms" for sh, v in shapes.items()))
+    parts = [f"K_max avg {t['k_max_avg']}"]
+    if t.get("n_micro_avg", 1) != 1:
+        parts.append(f"micro avg {t['n_micro_avg']}")
+    if t.get("hessian_steps"):
+        parts.append(f"hessian {t['hessian_steps']}/{n}")
+    if parts:
+        lines.append("  schedule:  " + "  ".join(parts))
+    ch = t.get("cache_hit_pct")
+    if ch is not None:
+        miss_load = t.get("cache_miss_load_ms")
+        miss_txt = f", miss load {miss_load} ms avg" if miss_load is not None else ""
+        lines.append(f"  data cache: {ch:.1f}% hit "
+                     f"({t['cache_hits']} hits / {t['cache_misses']} misses)"
+                     f"{miss_txt}")
+    q = t.get("producer_q_depth_avg")
+    if q is not None:
+        lines.append(f"  producer q: avg depth {q} at get")
+    lines.append("  " + "─" * W)
+    return lines
+
+
 def estimate_calibration_time(
     total_runs: int,
     step_variants: list,

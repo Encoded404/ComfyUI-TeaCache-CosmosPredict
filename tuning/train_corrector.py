@@ -81,7 +81,7 @@ from .corrector import (CorrectorConfig, CorrectorUNet2D, FULL_STEP_FLOP_512,
 from .corrector_dataset import (CorrectorBatchSampler, CorrectorDataset,
                                 FixedBatchListSampler, augment_batch,
                                 collect_fit_maps, collate_corrector)
-from .utils import MetricsLog, TrainTimer, format_duration
+from .utils import MetricsLog, TrainTimer, StepProfiler, format_breakdown_lines, format_duration
 from .utils import (affine_oob_eval, affine_oob_json, affine_shape_area,
                     affine_shape_label, split_affine_per_pair)
 from .utils import (delta_distribution, per_channel_affine_ceiling,
@@ -1500,13 +1500,16 @@ def main(argv=None):
 
         threading.Thread(target=_produce, daemon=True).start()
 
-    # Per-step data-vs-GPU instrumentation (regime check): fetch+H2D wall on
-    # the CPU side vs CUDA-event GPU time for augment+compute+optimizer.
-    use_events = device.type == "cuda" and torch.cuda.is_available()
-    ev_gpu0 = torch.cuda.Event(True) if use_events else None
-    ev_gpu1 = torch.cuda.Event(True) if use_events else None
+    # Per-step phase instrumentation (since-last-eval breakdown): CUDA-event
+    # GPU time per phase (augment/forward/backward/hessian/opt/EMA) + wall
+    # fetch-wait/H2D split, generation-cache hit %, per-shape GPU split and
+    # producer-queue depth. Snapshot + reset at every eval.
+    profiler = StepProfiler(device)
+    profiler.attach_datasets([ds] + ([eval_ds] if eval_ds is not None else []))
+    profiler.reset_cache_stats()
     data_ms_acc = 0.0
     gpu_ms_acc = 0.0
+    last_eval_step = step  # resumed runs start their first interval here
 
     cur_rng = random.Random(cfg["seed"] + 2000)
 
@@ -1533,8 +1536,12 @@ def main(argv=None):
                 producer_ref[0] = active_loader
             if step == ramp_start + 1 and stage1_loader is not None:
                 emit(f"  [curriculum] ramp to full resolution mix from step {step}")
+        fetch_wait_ms = 0.0
+        h2d_ms = 0.0
+        q_depth = None
         t_fetch0 = time.time()
         if producer_q is not None:
+            q_depth = float(producer_q.qsize())
             batch = producer_q.get()
             if batch is _PREFETCH_FAILED:
                 emit("  [prefetch] producer failed — continuing with "
@@ -1551,10 +1558,12 @@ def main(argv=None):
         t_fetch1 = time.time()
         batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
         t_h2d1 = time.time()
-        data_ms_cur = (t_fetch1 - t_fetch0) * 1e3 + (t_h2d1 - t_fetch1) * 1e3
-        if ev_gpu0 is not None:
-            ev_gpu0.record()
+        fetch_wait_ms += (t_fetch1 - t_fetch0) * 1e3
+        h2d_ms += (t_h2d1 - t_fetch1) * 1e3
+        hw0 = tuple(batch["x_t"].shape[-2:])
+        profiler.begin("aug")
         batch = to_cl(augment_batch(batch, aug_rng, scale_aug=cfg["scale_aug"]))
+        profiler.end("aug")
 
         k_max_cur = k_max_final
         if cfg["k_curriculum"] and cfg["multipass"]:
@@ -1562,6 +1571,7 @@ def main(argv=None):
 
         if isinstance(opt, SophiaG) and step % cfg["hessian_every"] == 0:
             t_h0 = time.time()
+            profiler.begin("hessian")
             # update_hessian double-backpropagates (gradient of the gradient);
             # the fused SDPA backends (flash / memory-efficient) have no
             # second-order derivative, so build the graph on the math backend
@@ -1579,6 +1589,7 @@ def main(argv=None):
                 loss_h = per_s.mean()
             opt.update_hessian(loss_h)
             timer.add("hessian", time.time() - t_h0)
+            profiler.end("hessian")
 
         # Gradient accumulation: ÷4 buckets (128² / 1024×512) are accumulated
         # up to a full batch so every optimizer step sees ~batch_size samples
@@ -1591,6 +1602,7 @@ def main(argv=None):
             if m > 0:
                 t_fetch0 = time.time()
                 if producer_q is not None:
+                    q_depth = float(producer_q.qsize())
                     batch = producer_q.get()
                     if batch is _PREFETCH_FAILED:
                         emit("  [prefetch] producer failed — continuing with "
@@ -1606,32 +1618,46 @@ def main(argv=None):
                         batch = next(iter_loader)
                 t_fetch1 = time.time()
                 batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-                data_ms_cur += (t_fetch1 - t_fetch0) * 1e3 \
-                    + (time.time() - t_fetch1) * 1e3
+                fetch_wait_ms += (t_fetch1 - t_fetch0) * 1e3
+                h2d_ms += (time.time() - t_fetch1) * 1e3
+                profiler.begin("aug")
                 batch = to_cl(augment_batch(batch, aug_rng, scale_aug=cfg["scale_aug"]))
+                profiler.end("aug")
             Ks = torch.randint(1, k_max_cur + 1, (batch["x_t"].shape[0],),
                                device=device)
+            profiler.begin("fwd")
             with torch.autocast("cuda", dtype=torch.float16):
                 loss = compute_train_loss(model, batch, Ks, loss_fn, eps,
                                           cfg["stop_grad"], cfg["multipass"],
                                           k_max_cur, lag_scale=lag_scale_t)
+            profiler.end("fwd")
             micro_losses.append(loss.detach())
+            profiler.begin("bwd")
             scaler.scale(loss).backward()
+            profiler.end("bwd")
+        profiler.begin("opt")
         scaler.unscale_(opt)
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         scaler.step(opt)
         scaler.update()
         if scheduler is not None:
             scheduler.step()
+        profiler.end("opt")
+        profiler.begin("ema")
         ema_update(model, ema, step, decay=cfg["ema_decay"])
-        if ev_gpu1 is not None:
-            ev_gpu1.record()
+        profiler.end("ema")
         timer.record_step(time.time() - t_step0)
 
         loss_v = float(sum(micro_losses) / max(len(micro_losses), 1))
-        # The .item() sync above completes the step's events — elapsed_time
-        # is only valid after that sync.
-        gpu_ms_cur = ev_gpu0.elapsed_time(ev_gpu1) if ev_gpu0 is not None else 0.0
+        # The .item() sync above completes the step's events — the phase
+        # elapsed_times are only valid after that sync (finish_step reads them).
+        gpu_ms_cur = profiler.finish_step(
+            hw=hw0, n_micro=n_micro, k_max=k_max_cur,
+            hessian_step=(isinstance(opt, SophiaG)
+                          and step % cfg["hessian_every"] == 0),
+            fetch_wait_ms=fetch_wait_ms, h2d_ms=h2d_ms, q_depth=q_depth,
+            wall_ms=(time.time() - t_step0) * 1e3)
+        data_ms_cur = fetch_wait_ms + h2d_ms
         data_ms_acc += data_ms_cur
         gpu_ms_acc += gpu_ms_cur
         loss_ema = loss_v if loss_ema is None else 0.99 * loss_ema + 0.01 * loss_v
@@ -1674,6 +1700,12 @@ def main(argv=None):
             })
 
         if step == next_eval and eval_loader is not None:
+            # Since-last-eval step-time breakdown: snapshot the interval and
+            # the datasets' cache counters BEFORE the eval runs, so the eval's
+            # own data loads land in the next interval (this row reports the
+            # training data path).
+            timing = profiler.snapshot()
+            profiler.reset()
             t_e0 = time.time()
             ks_eval = (ks_eval_full if n_evals_done % cfg["eval_full_k_every"] == 0
                        else ks_eval_light)
@@ -1880,13 +1912,19 @@ def main(argv=None):
                     if best is not None else ""))
             timer.record_eval(time.time() - t_e0)
             n_evals_done += 1
+            last_eval_step = step
             next_eval = (eval_plan[n_evals_done]
                          if n_evals_done < len(eval_plan) else None)
+            for line2 in format_breakdown_lines(
+                    timing,
+                    title=f"since last eval (steps {last_eval_step - timing['steps'] + 1}..{last_eval_step})"):
+                emit(line2)
             for line2 in timer.summary_lines(time.time() - t_start, step,
                                              cfg["max_steps"], eval_plan):
                 emit(line2)
             metrics.write({
                 "type": "eval", "step": step, "k1": k1,
+                "timing": timing,
                 "k_avg": {str(k): round(sum(r["rel_mse"] for (kk, _), r in results.items()
                                             if kk == k) / max(sum(1 for (kk, _) in results if kk == k), 1), 6)
                           for k in ks_eval},
@@ -1957,6 +1995,8 @@ def main(argv=None):
               f"{gpu_ms:.1f} ms/step GPU  "
               f"(data {100 * data_ms / max(data_ms + gpu_ms, 1e-9):.0f}% of "
               f"data+GPU — 0% would be ideal)")
+    for line2 in format_breakdown_lines(profiler.run_snapshot(), title="run"):
+        print(line2)
     if loss_ema is not None:
         print(f"  Loss:         final {loss_v:.5f}   min {min_loss:.5f}   "
               f"(ema {loss_ema:.5f})")

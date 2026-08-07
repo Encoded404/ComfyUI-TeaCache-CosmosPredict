@@ -189,7 +189,19 @@ python -m tuning.train_corrector --data outputs/<ts>/refiner_data \
   thread). Per-50-step log lines and `train_metrics.jsonl` step rows carry
   `data_ms` (fetch+H2D) vs `gpu_ms` (CUDA-event measured), and the final
   summary prints the data share of data+GPU — if data is a large fraction,
-  raise `num_workers` or `--prefetch-queue`. Checkpoint saves (.safetensors
+  raise `num_workers` or `--prefetch-queue`. Every eval also prints a
+  **step-time breakdown since the last eval** (and writes it as the `timing`
+  key of the eval row): per-phase GPU time (augment / forward / backward /
+  Sophia hessian / optimizer / EMA — CUDA events around each phase), the
+  fetch-wait vs H2D vs other CPU split, GPU-busy %, GPU time per resolution
+  bucket, average K_max / micro-batches / hessian steps, the generation-LRU
+  cache hit % (shared counters, worker-safe) with the mean miss-decode cost,
+  and the average producer-queue depth at `--prefetch-queue` gets. This is
+  the debugging view for "what is slowing training down" — a low hit % means
+  `cache_size` too small for the de-burst window, a high fetch-wait with
+  `--prefetch-queue` means the producer can't keep up, a high `other` means
+  CPU-side bookkeeping (`.item()` syncs, scheduler, python overhead).
+  Checkpoint saves (.safetensors
   + full-state .pt) snapshot on the main thread and write in background
   threads (tmp+replace), so eval-time disk I/O doesn't idle the GPU.
 - **Progress & metrics**: live tqdm bar (EMA loss, lr, K, it/s, remaining),

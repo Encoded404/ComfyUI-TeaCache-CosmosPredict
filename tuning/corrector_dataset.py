@@ -29,7 +29,9 @@ per-lag weighting (plan Task 6e, deep-dive §7).
 
 from __future__ import annotations
 
+import multiprocessing
 import random
+import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
@@ -46,6 +48,51 @@ except ImportError:  # progress bars are optional (requirements: tqdm)
     tqdm = None
 
 DEFAULT_GEN_CACHE_SIZE = 64
+
+
+class GenCacheStats:
+    """Shared generation-LRU hit/miss counters + miss load time (worker-safe).
+
+    DataLoader workers each hold a pickled copy of the dataset, so plain ints
+    would only count that process's traffic. The ``multiprocessing.Value``
+    counters point at the same shared memory in every process (inherited via
+    fork, re-attached via pickle on spawn), so the training loop can read and
+    reset them from the main process — that is what the per-eval "data cache"
+    row of the step-time breakdown reports (train_corrector, StepProfiler).
+    """
+
+    def __init__(self):
+        self.hits = multiprocessing.Value("Q", 0)
+        self.misses = multiprocessing.Value("Q", 0)
+        self.miss_ms = multiprocessing.Value("d", 0.0)
+
+    def record_hit(self) -> None:
+        with self.hits.get_lock():
+            self.hits.value += 1
+
+    def record_miss(self, load_ms: float) -> None:
+        with self.misses.get_lock():
+            self.misses.value += 1
+        with self.miss_ms.get_lock():
+            self.miss_ms.value += load_ms
+
+    def snapshot(self) -> dict:
+        """Read-and-reset (a snapshot belongs to exactly one eval interval).
+
+        Racy against in-flight worker loads — at worst a couple of samples
+        shift into the next interval, harmless for a diagnostic.
+        """
+        with self.hits.get_lock():
+            h = self.hits.value
+            self.hits.value = 0
+        with self.misses.get_lock():
+            m = self.misses.value
+            self.misses.value = 0
+        with self.miss_ms.get_lock():
+            ms = self.miss_ms.value
+            self.miss_ms.value = 0.0
+        return {"hits": int(h), "misses": int(m),
+                "miss_ms": round(float(ms), 3)}
 
 
 def _lag_index(lag: int, lags: List[int]) -> int:
@@ -119,6 +166,7 @@ class CorrectorDataset(Dataset):
         self.rng = random.Random(seed)
         self._gen_cache: "OrderedDict[str, refiner_data.RefinerGeneration]" = OrderedDict()
         self._gen_cache_max = max(1, int(gen_cache_size))
+        self.cache_stats = GenCacheStats()
 
         self.entries = refiner_data.iter_generations(data_dir, manifest=manifest)
         if only_eval:
@@ -174,8 +222,11 @@ class CorrectorDataset(Dataset):
         if name in self._gen_cache:
             gen = self._gen_cache.pop(name)
             self._gen_cache[name] = gen  # LRU refresh
+            self.cache_stats.record_hit()
             return gen
+        t0 = time.time()
         gen = refiner_data.load_generation(self.data_dir / self.entries[idx]["bin"])
+        self.cache_stats.record_miss((time.time() - t0) * 1e3)
         self._gen_cache[name] = gen
         while len(self._gen_cache) > self._gen_cache_max:
             self._gen_cache.popitem(last=False)
