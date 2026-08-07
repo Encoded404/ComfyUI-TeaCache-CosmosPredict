@@ -427,14 +427,32 @@ class CorrectorBatchSampler(Sampler):
 
     def __len__(self) -> int:
         if self.max_batches is None:
+            # Estimate of the training-path yield count, matching __iter__'s
+            # run-level upsampling: __iter__ duplicates whole runs to
+            # round(n_runs * w) runs per shape, so weight the run-built batch
+            # count by that ratio. Run rounding makes this an approximation
+            # (off by at most one run's batches per shape).
             total = 0
-            for shape, idxs in self.buckets.items():
-                bs = self._bucket_batch_size(idxs)
-                n = (len(idxs) + bs - 1) // bs
+            for shape, runs in self.bucket_runs.items():
+                if not runs:
+                    continue
+                bs = self._bucket_batch_size(self.buckets[shape])
+                counts = []
+                carry = 0
+                for run in runs:
+                    counts.append((carry + len(run)) // bs)
+                    carry = (carry + len(run)) % bs
+                if carry:
+                    counts[-1] += 1
+                n_batches = sum(counts)
+                n_runs = sum(1 for c in counts if c > 0)
+                if not n_runs:
+                    continue
                 w = 1.0
                 if self.bucket_weights is not None:
                     w = float(self.bucket_weights.get(shape, 1.0))
-                total += int(round(n * w))
+                target_runs = int(round(n_runs * w))
+                total += int(round(n_batches * target_runs / n_runs))
             return total
         total = 0
         n_pairs = max(len(self.dataset.pairs), 1)
