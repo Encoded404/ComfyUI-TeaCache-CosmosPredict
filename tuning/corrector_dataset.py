@@ -56,6 +56,48 @@ def _lag_index(lag: int, lags: List[int]) -> int:
         return -1
 
 
+def _round_robin(batch_lists: List[List[List[int]]]) -> List[List[int]]:
+    """Merge per-run batch lists round-robin (one batch per run per cycle).
+
+    De-bursts the training stream: consecutive batches come from different
+    generations instead of one generation's whole run. Callers keep the
+    active window of runs within the dataset's generation LRU cache, so the
+    cache-hit pattern that made per-run ordering desirable is preserved.
+    """
+    iters = [iter(bl) for bl in batch_lists if bl]
+    out: List[List[int]] = []
+    while iters:
+        alive = []
+        for it in iters:
+            try:
+                out.append(next(it))
+            except StopIteration:
+                pass
+            else:
+                alive.append(it)
+        iters = alive
+    return out
+
+
+class FixedBatchListSampler(Sampler):
+    """Replays a precomputed batch-index list (used for the eval set).
+
+    The eval loader must see the *same* pairs at every evaluation, otherwise
+    the K=0 base and the per-shape slices drift between evals and recovery
+    numbers are read against a moving ruler. Build the list once
+    (``list(eval_sampler)``) and hand it to this sampler.
+    """
+
+    def __init__(self, batches: List[List[int]]):
+        self.batches = list(batches)
+
+    def __iter__(self) -> Iterator[List[int]]:
+        return iter(self.batches)
+
+    def __len__(self) -> int:
+        return len(self.batches)
+
+
 class CorrectorDataset(Dataset):
     """i.i.d. per-step (x_t, v_MA, v_true, t, lag, slot) pairs from refiner_data."""
 
@@ -327,17 +369,29 @@ class CorrectorBatchSampler(Sampler):
 
     def __init__(self, dataset: CorrectorDataset, batch_size: int, seed: int = 42,
                  include_areas: Optional[List[int]] = None,
-                 max_batches: Optional[int] = None):
+                 max_batches: Optional[int] = None,
+                 bucket_weights: Optional[Dict[Tuple[int, int], float]] = None,
+                 min_batches_per_shape: int = 0,
+                 deburst_windows: bool = False,
+                 deburst_window_runs: int = 64):
         """``include_areas`` restricts sampling to pairs whose latent spatial
         area (H·W) is in the given list — used by the resolution curriculum's
         stage 1 (e.g. only 64×64 pairs); None = all resolutions.
 
         ``max_batches`` caps the epoch's total batch count (used by the eval
         loader): each shape bucket gets a budget proportional to its pair
-        share, and every generation run within a bucket keeps a seeded thin
-        sample of its batches (same "every generation" contract as
-        :func:`collect_fit_maps`), so per-lag/per-shape coverage survives the
-        cap. None = full sweep (training loaders).
+        share, floored at ``min_batches_per_shape``, and every generation run
+        within a bucket keeps a seeded thin sample of its batches (same
+        "every generation" contract as :func:`collect_fit_maps`), so
+        per-lag/per-shape coverage survives the cap. None = full sweep
+        (training loaders).
+
+        Training-only knobs: ``bucket_weights`` (per-shape ``(h, w)`` →
+        multiplier on that bucket's batch count — upweights the 1024² strata)
+        and ``deburst_windows`` (partition the epoch's runs into windows of
+        ``deburst_window_runs`` runs and round-robin-merge each window, so
+        consecutive batches come from different generations while the active
+        window stays inside the dataset's generation LRU).
         """
         self.dataset = dataset
         self.batch_size = batch_size
@@ -345,6 +399,10 @@ class CorrectorBatchSampler(Sampler):
         self._epoch = 0
         self.max_batches = int(max_batches) if max_batches else None
         self.include_areas = set(int(a) for a in include_areas) if include_areas else None
+        self.bucket_weights = dict(bucket_weights) if bucket_weights else None
+        self.min_batches_per_shape = max(0, int(min_batches_per_shape))
+        self.deburst_windows = bool(deburst_windows)
+        self.deburst_window_runs = max(2, int(deburst_window_runs))
         self.buckets: Dict[Tuple[int, int], List[int]] = {}
         for i, (h, w) in enumerate(dataset.pair_shapes()):
             if self.include_areas is None or h * w in self.include_areas:
@@ -370,9 +428,13 @@ class CorrectorBatchSampler(Sampler):
     def __len__(self) -> int:
         if self.max_batches is None:
             total = 0
-            for idxs in self.buckets.values():
+            for shape, idxs in self.buckets.items():
                 bs = self._bucket_batch_size(idxs)
-                total += (len(idxs) + bs - 1) // bs
+                n = (len(idxs) + bs - 1) // bs
+                w = 1.0
+                if self.bucket_weights is not None:
+                    w = float(self.bucket_weights.get(shape, 1.0))
+                total += int(round(n * w))
             return total
         total = 0
         n_pairs = max(len(self.dataset.pairs), 1)
@@ -380,6 +442,8 @@ class CorrectorBatchSampler(Sampler):
             bs = self._bucket_batch_size(idxs)
             full = (len(idxs) + bs - 1) // bs
             budget = max(1, int(round(self.max_batches * len(idxs) / n_pairs)))
+            if self.min_batches_per_shape:
+                budget = max(budget, self.min_batches_per_shape)
             total += min(full, budget)
         return total
 
@@ -394,13 +458,63 @@ class CorrectorBatchSampler(Sampler):
         gen = torch.Generator().manual_seed(self.seed + epoch)
         epoch_batches = []
         n_pairs = max(len(self.dataset.pairs), 1)
+        if self.max_batches is not None:
+            for shape, runs in self.bucket_runs.items():
+                if not runs:
+                    continue
+                bs = self._bucket_batch_size(self.buckets[shape])
+                rng.shuffle(runs)
+                # Per-generation run batch lists (batches stay generation-local so
+                # the dataset's generation LRU hits).
+                run_batches: List[List[List[int]]] = []
+                carry: List[int] = []
+                for run in runs:
+                    w = self.dataset.weights[torch.tensor(run, dtype=torch.long)]
+                    sub = torch.multinomial(w, num_samples=len(run), replacement=False,
+                                            generator=gen).tolist()
+                    full = carry + [run[j] for j in sub]
+                    batches: List[List[int]] = []
+                    k = 0
+                    n = len(full)
+                    while k + bs <= n:
+                        batches.append(full[k:k + bs])
+                        k += bs
+                    carry = full[k:]
+                    run_batches.append(batches)
+                if carry:
+                    if run_batches:
+                        run_batches[-1].append(carry)
+                    else:
+                        run_batches.append([carry])
+                # Bucket budget proportional to its pair share (floored at
+                # min_batches_per_shape); each run keeps a seeded thin sample
+                # of its batches so every generation still contributes
+                # (per-lag/per-shape coverage).
+                budget = max(1, int(round(self.max_batches * len(self.buckets[shape]) / n_pairs)))
+                if self.min_batches_per_shape:
+                    budget = max(budget, self.min_batches_per_shape)
+                total_b = sum(len(rb) for rb in run_batches)
+                for rb in run_batches:
+                    if not rb:
+                        continue
+                    if total_b <= budget:
+                        epoch_batches.extend(rb)
+                        continue
+                    q = max(1, int(round(budget * len(rb) / total_b)))
+                    if len(rb) <= q:
+                        epoch_batches.extend(rb)
+                    else:
+                        picked = rng.sample(range(len(rb)), q)
+                        epoch_batches.extend(rb[i] for i in sorted(picked))
+            yield from epoch_batches
+            return
+        # ── Training path: full sweep, windowed de-burst ──
+        runs_meta: List[Tuple[Tuple[int, int], List[List[int]]]] = []
         for shape, runs in self.bucket_runs.items():
             if not runs:
                 continue
             bs = self._bucket_batch_size(self.buckets[shape])
             rng.shuffle(runs)
-            # Per-generation run batch lists (batches stay generation-local so
-            # the dataset's generation LRU hits).
             run_batches: List[List[List[int]]] = []
             carry: List[int] = []
             for run in runs:
@@ -421,31 +535,34 @@ class CorrectorBatchSampler(Sampler):
                     run_batches[-1].append(carry)
                 else:
                     run_batches.append([carry])
-            if self.max_batches is not None:
-                # Bucket budget proportional to its pair share; each run keeps
-                # a seeded thin sample of its batches so every generation
-                # still contributes (per-lag/per-shape coverage).
-                budget = max(1, int(round(self.max_batches * len(self.buckets[shape]) / n_pairs)))
-                total_b = sum(len(rb) for rb in run_batches)
-                for rb in run_batches:
-                    if not rb:
-                        continue
-                    if total_b <= budget:
-                        epoch_batches.extend(rb)
-                        continue
-                    q = max(1, int(round(budget * len(rb) / total_b)))
-                    if len(rb) <= q:
-                        epoch_batches.extend(rb)
-                    else:
-                        picked = rng.sample(range(len(rb)), q)
-                        epoch_batches.extend(rb[i] for i in sorted(picked))
-            else:
-                for rb in run_batches:
-                    epoch_batches.extend(rb)
-        # NOTE: no final shuffle of the batch list — the per-generation run
-        # order above keeps consecutive batches inside the same generation so
-        # the dataset's generation LRU hits; the generation-order shuffle
-        # (rng.shuffle(runs)) already provides epoch-to-epoch randomness.
+            runs_meta.extend((shape, rb) for rb in run_batches if rb)
+        if self.bucket_weights:
+            # Per-shape run-list expansion (duplicate runs to upweight a
+            # bucket's share of optimizer steps; run-level so the LRU-locality
+            # contract is untouched).
+            by_shape: Dict[Tuple[int, int], List[List[List[int]]]] = {}
+            for shape, rb in runs_meta:
+                by_shape.setdefault(shape, []).append(rb)
+            runs_meta = []
+            for shape, rbs in by_shape.items():
+                w = float(self.bucket_weights.get(shape, 1.0))
+                target = int(round(len(rbs) * w))
+                if target > len(rbs):
+                    rbs = rbs + rng.sample(rbs, target - len(rbs))
+                elif target < len(rbs):
+                    rbs = rng.sample(rbs, target)
+                runs_meta.extend((shape, rb) for rb in rbs)
+        if self.deburst_windows and len(runs_meta) > 1:
+            rng.shuffle(runs_meta)
+            windows = [runs_meta[i:i + self.deburst_window_runs]
+                       for i in range(0, len(runs_meta), self.deburst_window_runs)]
+            rng.shuffle(windows)
+            for win in windows:
+                rng.shuffle(win)
+                epoch_batches.extend(_round_robin([rb for _, rb in win]))
+        else:
+            for _, rb in runs_meta:
+                epoch_batches.extend(rb)
         yield from epoch_batches
 
 

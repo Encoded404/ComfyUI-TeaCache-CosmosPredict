@@ -100,6 +100,9 @@ def main(argv=None):
         raise SystemExit(f"[distill_corrector] {e}")
     ccfg.normalization = teacher.cfg.normalization
     ccfg.normalization_stats = teacher.cfg.normalization_stats
+    # Match the teacher's conditioning configuration (lag/res embedders).
+    ccfg.lag_cond = teacher.cfg.lag_cond
+    ccfg.res_cond = teacher.cfg.res_cond
     student = CorrectorUNet2D(ccfg)
     # Warm start from the teacher where shapes match (deep-dive §4.1).
     tsd = teacher.state_dict()
@@ -124,10 +127,10 @@ def main(argv=None):
         student = torch.compile(student, mode="reduce-overhead")
     aug_rng = random.Random(seed + 7)
 
-    def teacher_rollout(x, v, prompt, t, pmask):
+    def teacher_rollout(x, v, prompt, t, pmask, lag):
         v_t = v
         for _ in range(args.teacher_passes):
-            v_t = v_t + teacher(x, v_t, prompt, t, pmask)
+            v_t = v_t + teacher(x, v_t, prompt, t, pmask, lag=lag)
         return v_t
 
     it = iter(loader)
@@ -142,16 +145,17 @@ def main(argv=None):
         batch = augment_batch(batch, aug_rng)
         x, v0 = batch["x_t"], batch["v_ma"]
         prompt, pmask, t = batch["prompt"], batch["prompt_mask"], batch["t_frac"]
+        lag = batch["lag"].float()
 
         opt.zero_grad(set_to_none=True)
         with torch.autocast("cuda", dtype=torch.float16):
             v_s = v0
             if args.mode == "gkd" and args.on_policy:
                 with torch.no_grad():
-                    v_s = (v_s + student(x, v_s, prompt, t, pmask)).detach()
+                    v_s = (v_s + student(x, v_s, prompt, t, pmask, lag=lag)).detach()
             with torch.no_grad():
-                target = teacher_rollout(x, v_s, prompt, t, pmask)
-            pred = v_s + student(x, v_s, prompt, t, pmask)
+                target = teacher_rollout(x, v_s, prompt, t, pmask, lag)
+            pred = v_s + student(x, v_s, prompt, t, pmask, lag=lag)
             loss = F.mse_loss(pred.float(), target.float())
         scaler.scale(loss).backward()
         scaler.unscale_(opt)

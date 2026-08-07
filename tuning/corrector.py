@@ -271,6 +271,10 @@ class CorrectorConfig:
     in_channels: int = IN_CHANNELS
     out_channels: int = OUT_CHANNELS
     k_recommended: int = 1
+    # Conditioning (prototype defaults ON): lag = steps since the last full
+    # run (known at inference); res = bottleneck grid dims (from x shape).
+    lag_cond: bool = True
+    res_cond: bool = True
     normalization: str = "none"          # "none" | "perchannel"
     # {"areas": [...], "mean": [[32ch]×S], "std": [[32ch]×S]} (per-stratum,
     # sorted by area) or legacy flat {"mean": [...], "std": [...]} (S=1)
@@ -306,6 +310,7 @@ class CorrectorConfig:
             "mlp_ratio": self.mlp_ratio, "prompt_dim": self.prompt_dim,
             "in_channels": self.in_channels, "out_channels": self.out_channels,
             "k_recommended": self.k_recommended,
+            "lag_cond": self.lag_cond, "res_cond": self.res_cond,
             "normalization": self.normalization,
             "normalization_stats": self.normalization_stats,
             "folded": self.folded,
@@ -376,6 +381,28 @@ class TimestepEmbedder(nn.Module):
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         return self.mlp(timestep_embedding(t, self.mlp[0].in_features))
+
+
+class ScalarEmbedder(nn.Module):
+    """MLP embedding for scalar conditioning: in → cond_dim → cond_dim.
+
+    Same shape as the TimestepEmbedder MLP tail, so its output can be summed
+    into the adaLN conditioning vector ``c``. Used for the lag (1-dim input,
+    ``log2(lag+1)``) and the resolution (2-dim input, ``[log H, log W]`` of the
+    bottleneck grid). Not zero-initialized — the zero-init output head and the
+    zero-init adaLN gates keep the block identity at init regardless.
+    """
+
+    def __init__(self, in_dim: int, cond_dim: int):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, cond_dim, bias=True),
+            nn.SiLU(),
+            nn.Linear(cond_dim, cond_dim, bias=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.mlp(x.float())
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -559,6 +586,12 @@ class CorrectorUNet2D(nn.Module):
         # Bottleneck
         self.prompt_proj = nn.Linear(prompt_proj_dim, cfg.cond_dim, bias=True)
         self.t_embedder = TimestepEmbedder(cfg.cond_dim)
+        # Conditioning embedders are built only when enabled: pre-conditioning
+        # checkpoints then lack these keys, which load_corrector detects and
+        # reconciles (zero-init + flag downgrade) instead of misloading random
+        # conditioning weights.
+        self.lag_embedder = ScalarEmbedder(1, cfg.cond_dim) if cfg.lag_cond else None
+        self.res_embedder = ScalarEmbedder(2, cfg.cond_dim) if cfg.res_cond else None
         self.blocks = nn.ModuleList([
             DiTBlock(cfg.bottleneck_dim, cfg.heads, cfg.cond_dim, cfg.mlp_ratio,
                      kv_dim=cfg.cond_dim)
@@ -645,13 +678,17 @@ class CorrectorUNet2D(nn.Module):
 
     def forward(self, x_t: torch.Tensor, v_prev: torch.Tensor,
                 prompt: torch.Tensor, t: torch.Tensor,
-                prompt_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+                prompt_mask: Optional[torch.Tensor] = None,
+                lag: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Args:
             x_t: (B, 16, H, W) raw pre-pad latent (current timestep)
             v_prev: (B, 16, H, W) timestep-aware Mode-A velocity (v_MA)
             prompt: (B, N, 1024) cross-attn embeddings (N=0 → identity)
             t: (B,) or (B, 1) step fraction
             prompt_mask: optional (B, N) bool — True = real token
+            lag: optional (B,) steps since the last full run (skip age; ≥1
+                 in deployment; 0 only in the eval anchors diagnostic). The
+                 conditioning is skipped when None (probe/legacy callers).
         Returns Δv̂ (B, 16, H, W) in real velocity units.
         """
         if t.ndim == 2:
@@ -668,6 +705,13 @@ class CorrectorUNet2D(nn.Module):
 
         B, _, H, W = x.shape
         c = self.t_embedder(t.to(x.device))
+        if self.cfg.lag_cond and lag is not None and self.lag_embedder is not None:
+            c = c + self.lag_embedder(
+                torch.log2(lag.float().to(x.device) + 1.0).unsqueeze(-1))
+        if self.cfg.res_cond and self.res_embedder is not None:
+            hw = torch.tensor([math.log(H), math.log(W)], dtype=torch.float32,
+                              device=x.device)
+            c = c + self.res_embedder(hw.unsqueeze(0).expand(B, 2))
         p = self.prompt_proj(prompt.float().to(x.device)) if prompt.numel() else None
         if p is not None and prompt_mask is not None:
             p = p * prompt_mask.unsqueeze(-1).to(p.dtype)
@@ -694,7 +738,7 @@ class CorrectorUNet2D(nn.Module):
 
     # ── K-pass refinement ─────────────────────────────────────────────
 
-    def refine(self, x_t, v_prev, prompt, t, K: int, prompt_mask=None):
+    def refine(self, x_t, v_prev, prompt, t, K: int, prompt_mask=None, lag=None):
         """Weight-shared K-pass refinement: v ← v + model(x_t, v, prompt, t).
 
         Passes are trained on-policy with deep supervision (plan 4b/6f);
@@ -702,7 +746,7 @@ class CorrectorUNet2D(nn.Module):
         """
         v = v_prev
         for _ in range(K):
-            v = v + self(x_t, v, prompt, t, prompt_mask)
+            v = v + self(x_t, v, prompt, t, prompt_mask, lag=lag)
         return v
 
     # ── Export ─────────────────────────────────────────────────────────
@@ -772,7 +816,13 @@ def prepare_corrector(path, device) -> nn.Module:
 
 
 def load_corrector(path) -> CorrectorUNet2D:
-    """Load a corrector checkpoint, cached by (path, mtime). Returns eval model."""
+    """Load a corrector checkpoint, cached by (path, mtime). Returns eval model.
+
+    Pre-conditioning checkpoints (no ``lag_cond``/``res_cond`` metadata) are
+    accepted: the conditioning embedders are zero-initialized and the flags
+    downgraded, so an old artifact behaves exactly as trained (conditioning
+    contributes nothing) and a warning is printed.
+    """
     import safetensors.torch as st
     path = str(Path(path).expanduser())
     mtime = Path(path).stat().st_mtime
@@ -789,7 +839,31 @@ def load_corrector(path) -> CorrectorUNet2D:
     model = CorrectorUNet2D(cfg)
     if cfg.folded:
         model.fold_reparam()
-    model.load_state_dict(data)
+    missing, unexpected = model.load_state_dict(data, strict=False)
+    if missing:
+        cond_keys = {k for k in missing
+                     if "lag_embedder" in k or "res_embedder" in k}
+        if set(missing) == cond_keys and cfg.lag_cond:
+            # pre-conditioning checkpoint: zero-init the embedders and disable
+            # conditioning so the artifact's behavior is unchanged.
+            with torch.no_grad():
+                for k in cond_keys:
+                    p = dict(model.named_parameters())[k]
+                    p.zero_()
+            cfg.lag_cond = False
+            cfg.res_cond = False
+            model.cfg.lag_cond = False
+            model.cfg.res_cond = False
+            print(f"  [corrector] ⚠ {Path(path).name}: pre-conditioning "
+                  f"checkpoint (no lag/res conditioning) — embedders "
+                  f"zero-initialized, conditioning disabled")
+        elif missing:
+            raise RuntimeError(
+                f"[corrector] {Path(path).name}: missing keys {sorted(missing)}"
+            )
+    if unexpected:
+        print(f"  [corrector] ⚠ {Path(path).name}: unexpected keys "
+              f"{sorted(unexpected)} ignored")
     model.eval()
     _CORRECTOR_CACHE[key] = model
     return model

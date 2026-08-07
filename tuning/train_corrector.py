@@ -30,6 +30,27 @@ pairs from a refiner recording run (``outputs/<ts>/refiner_data``). Supports:
   pair subsample) and per-eval v_t error recovery tables vs the K=0 TeaCache
   base (abs err, ×base, % recovered), also mirrored into the metrics JSONL.
 
+Prototype upgrades (v2 training):
+
+- lag conditioning: the corrector receives the skip age (steps since the
+  last full run) as an adaLN-conditioning input (``--lag-cond``, default
+  on) — the deployment lag counter lives in ``teacache_state["lag"]``;
+- resolution conditioning: the bottleneck grid dims are embedded into the
+  conditioning (``--res-cond``, default on) — resolution independence;
+- per-lag loss normalization (``--lag-loss-normalize``, default on): each
+  sample's rel-MSE is scaled by mean_base_err(lag)/base_err(lag) so no lag
+  hogs the gradient by difficulty;
+- fixed eval set: the eval sampler's batches are built once at startup and
+  replayed at every eval (identical K=0 base across evals), and the EMA
+  model is what gets evaluated / best-selected (it is what ships);
+- resolution curriculum ramp: stage 1 → full mix interpolates over
+  ``stage2_ramp_fraction`` of the run instead of a hard switch, and
+  ``resolution_weights`` upweight the 1024² buckets;
+- de-bursted training batches: the epoch's generation runs are merged
+  round-robin in windows (``--deburst-windows``, default on) so consecutive
+  batches come from different generations while the active window stays in
+  the generation LRU.
+
 Every flag defaults to the ``refiner_training`` config section
 (config.json); CLI flags override config (calibrate.py precedence pattern).
 The effective post-override config is snapshotted into checkpoint metadata.
@@ -56,7 +77,8 @@ from . import refiner_data
 from .corrector import (CorrectorConfig, CorrectorUNet2D, FULL_STEP_FLOP_512,
                         estimate_corrector_flops, save_corrector)
 from .corrector_dataset import (CorrectorBatchSampler, CorrectorDataset,
-                                augment_batch, collect_fit_maps, collate_corrector)
+                                FixedBatchListSampler, augment_batch,
+                                collect_fit_maps, collate_corrector)
 from .utils import MetricsLog, TrainTimer, format_duration
 from .utils import (affine_oob_eval, affine_oob_json, affine_shape_area,
                     affine_shape_label, split_affine_per_pair)
@@ -232,6 +254,20 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="Path to config.json (default: tuning/config.json)")
     parser.add_argument("--multipass", type=int, default=None,
                         help="K>1 on-policy training (config: refiner_training.multipass)")
+    parser.add_argument("--lag-cond", type=int, default=None,
+                        help="Lag (skip-age) conditioning (config: lag_cond)")
+    parser.add_argument("--res-cond", type=int, default=None,
+                        help="Resolution conditioning (config: res_cond)")
+    parser.add_argument("--lag-loss-normalize", type=int, default=None,
+                        help="Per-lag loss normalization (config: lag_loss_normalize)")
+    parser.add_argument("--deburst-windows", type=int, default=None,
+                        help="Windowed round-robin de-burst batching "
+                             "(config: deburst_windows)")
+    parser.add_argument("--deburst-window-runs", type=int, default=None,
+                        help="Runs per de-burst window (config: deburst_window_runs)")
+    parser.add_argument("--eval-min-batches-per-shape", type=int, default=None,
+                        help="Eval budget floor per shape bucket "
+                             "(config: eval_min_batches_per_shape)")
     parser.add_argument("--refine-passes-max", type=int, default=None,
                         help="K ceiling 1-4 (config: refine_passes_max)")
     parser.add_argument("--k-curriculum", type=int, default=None,
@@ -322,6 +358,12 @@ def resolve_config(args: argparse.Namespace) -> dict:
     rt = dict(tcfg.refiner_training or {})
     mapping = {
         "multipass": ("multipass", True),
+        "lag_cond": ("lag_cond", True),
+        "res_cond": ("res_cond", True),
+        "lag_loss_normalize": ("lag_loss_normalize", True),
+        "deburst_windows": ("deburst_windows", True),
+        "deburst_window_runs": ("deburst_window_runs", 64),
+        "eval_min_batches_per_shape": ("eval_min_batches_per_shape", 40),
         "refine_passes_max": ("refine_passes_max", 3),
         "k_curriculum": ("k_curriculum", True),
         "stop_grad": ("stop_grad", True),
@@ -332,10 +374,10 @@ def resolve_config(args: argparse.Namespace) -> dict:
         "rho": ("rho", 0.04),
         "hessian_every": ("hessian_every", 10),
         "wd": ("wd", 0.05),
-        "batch_size": ("batch_size", 16),
+        "batch_size": ("batch_size", 32),
         "ema_decay": ("ema_decay", 0.9999),
         "loss": ("loss", "rel_mse"),
-        "lag_weights": ("lag_weights", [1, 1, 1, 1, 1]),
+        "lag_weights": ("lag_weights", [2.0, 1.5, 1.25, 1.0, 0.5, 0.25]),
         "normalization": ("normalization", "none"),
         "normalization_samples": ("normalization_samples", 128),
         "accumulate_big_batches": ("accumulate_big_batches", True),
@@ -344,10 +386,10 @@ def resolve_config(args: argparse.Namespace) -> dict:
         "eval_every": ("eval_every", 500),
         "eval_schedule_growth": ("eval_schedule_growth", 2.0),
         "eval_interval_cap": ("eval_interval_cap", 32000),
-        "eval_max_batches": ("eval_max_batches", 256),
+        "eval_max_batches": ("eval_max_batches", 512),
         "eval_full_k_every": ("eval_full_k_every", 5),
         "seed": ("seed", 42),
-        "cache_size": ("cache_size", 64),
+        "cache_size": ("cache_size", 128),
         "recovery_fit_batches": ("recovery_fit_batches", 128),
         "recovery_eval_batches": ("recovery_eval_batches", 64),
         "num_workers": ("num_workers", 0),
@@ -364,6 +406,12 @@ def resolve_config(args: argparse.Namespace) -> dict:
         except ValueError:
             raise SystemExit(f"[train_corrector] invalid --lag-weights {cfg['lag_weights']!r}")
     cfg["multipass"] = bool(cfg["multipass"])
+    cfg["lag_cond"] = bool(cfg["lag_cond"])
+    cfg["res_cond"] = bool(cfg["res_cond"])
+    cfg["lag_loss_normalize"] = bool(cfg["lag_loss_normalize"])
+    cfg["deburst_windows"] = bool(cfg["deburst_windows"])
+    cfg["deburst_window_runs"] = max(2, int(cfg["deburst_window_runs"]))
+    cfg["eval_min_batches_per_shape"] = max(0, int(cfg["eval_min_batches_per_shape"]))
     cfg["k_curriculum"] = bool(cfg["k_curriculum"])
     cfg["stop_grad"] = bool(cfg["stop_grad"])
     cfg["accumulate_big_batches"] = bool(cfg["accumulate_big_batches"])
@@ -395,8 +443,10 @@ def resolve_config(args: argparse.Namespace) -> dict:
     rc.setdefault("enabled", False)
     rc.setdefault("stage1_fraction", 0.6)
     rc.setdefault("stage1_shapes", ["64x64"])
+    rc.setdefault("stage2_ramp_fraction", 0.15)
     rc["enabled"] = bool(rc["enabled"])
     rc["stage1_fraction"] = max(0.0, min(float(rc["stage1_fraction"]), 1.0))
+    rc["stage2_ramp_fraction"] = max(0.0, min(float(rc["stage2_ramp_fraction"]), 1.0))
     stage1_areas = []
     for spec in rc.get("stage1_shapes") or ["64x64"]:
         if isinstance(spec, (list, tuple)) and len(spec) == 2:
@@ -405,6 +455,18 @@ def resolve_config(args: argparse.Namespace) -> dict:
             w, h = refiner_data.parse_resolution(str(spec))
         stage1_areas.append(w * h)
     rc["stage1_areas"] = sorted(set(stage1_areas))
+    # Per-shape bucket upweights ("HxW" → multiplier) for the training
+    # sampler. Kept as string keys in the config dict (JSON-serializable for
+    # the checkpoint snapshot); converted to (h, w) tuples at sampler build.
+    resolution_weights = {}
+    for key, value in (rc.get("resolution_weights") or {}).items():
+        try:
+            h, w = (int(x) for x in str(key).split("x"))
+        except ValueError:
+            raise SystemExit(f"[train_corrector] invalid resolution_weights key "
+                             f"{key!r} (expected 'HxW')")
+        resolution_weights[str(key)] = max(0.0, float(value))
+    rc["resolution_weights"] = resolution_weights
     cfg["cache_size"] = max(1, int(cfg["cache_size"]))
     cfg["num_workers"] = max(0, int(cfg["num_workers"]))
     cfg["eval_every"] = max(int(cfg["eval_every"]), 1)
@@ -458,24 +520,32 @@ def build_eval_plan(cfg: dict) -> List[int]:
 
 def compute_train_loss(model, batch, Ks: torch.Tensor, loss_fn, eps: float,
                        stop_grad: bool, multipass: bool,
-                       k_max: int) -> torch.Tensor:
+                       k_max: int,
+                       lag_scale: Optional[torch.Tensor] = None) -> torch.Tensor:
     """Masked-K on-policy deep-supervised loss (plan 6f, deep-dive §5.4/§6.1).
 
     Pass i supervises the model's own i-th pass output against v_true with
     weight w_i = i / Σ_{j=1}^{K_s} j per sample; pass inputs are detached
     between passes when ``stop_grad``.
+
+    ``lag_scale`` (optional, indexed by lag value) multiplies each sample's
+    loss so per-lag gradient mass is not dominated by the hardest lags.
     """
     x, v, vt = batch["x_t"], batch["v_ma"].clone(), batch["v_true"]
     prompt, pmask, t = batch["prompt"], batch["prompt_mask"], batch["t_frac"]
+    lag = batch["lag"]
     total = torch.zeros((), device=x.device, dtype=torch.float32)
     n_active = torch.zeros((), device=x.device)
     for i in range(1, k_max + 1):
         mask = Ks >= i
         if not mask.any():
             continue
-        dv = model(x[mask], v[mask], prompt[mask], t[mask], pmask[mask])
+        dv = model(x[mask], v[mask], prompt[mask], t[mask], pmask[mask],
+                   lag=lag[mask].float())
         v_new = v[mask] + dv
         per_sample = loss_fn(v_new, vt[mask], eps)
+        if lag_scale is not None:
+            per_sample = per_sample * lag_scale[lag[mask]]
         # deep-supervision weight: i / Σ_{j=1}^{K_s} j per sample
         k_s = Ks[mask].float()
         w = i / (k_s * (k_s + 1) / 2)
@@ -488,6 +558,42 @@ def compute_train_loss(model, batch, Ks: torch.Tensor, loss_fn, eps: float,
     if n_active == 0:
         return torch.zeros((), device=x.device, requires_grad=True)
     return total
+
+
+def estimate_per_lag_base_rel(ds, n_per_lag: int = 128, seed: int = 42,
+                              min_samples: int = 8) -> Dict[int, float]:
+    """Mean base (K=0) rel-MSE per lag from a seeded subsample of train pairs.
+
+    Used to normalize the per-lag loss contribution (``lag_loss_normalize``):
+    w_lag = mean(e)/e_lag, so lags whose base error is large (hard lags) stop
+    hogging the gradient. Loads via the dataset's generation LRU (a few
+    decodes total). Lags with fewer than ``min_samples`` valid loads are
+    skipped.
+    """
+    lags_present = sorted({lag for _, _, _, lag in ds.pairs if lag != 0})
+    by_lag: Dict[int, List[float]] = {}
+    idxs = list(range(len(ds.pairs)))
+    rng = random.Random(seed)
+    rng.shuffle(idxs)
+    for i in idxs:
+        lag = ds.pairs[i][3]
+        if lag == 0 or len(by_lag.get(lag, [])) >= n_per_lag:
+            continue
+        if len(by_lag) >= len(lags_present) and all(
+                len(v) >= n_per_lag for v in by_lag.values()):
+            break
+        try:
+            _, v_ma, v_true, _ = ds._load_pair(i)
+        except KeyError:  # ring-availability drift
+            continue
+        e = per_sample_rel_mse(v_ma.unsqueeze(0), v_true.unsqueeze(0),
+                               ds.rel_mse_eps).item()
+        by_lag.setdefault(lag, []).append(e)
+    out = {}
+    for lag, es in by_lag.items():
+        if len(es) >= min_samples:
+            out[lag] = sum(es) / len(es)
+    return out
 
 
 # ── Eval (plan 6h) ────────────────────────────────────────────────────
@@ -535,7 +641,8 @@ def eval_model(model, eval_loader, lags: List[int], ks: List[int],
                 for k in ks:
                     v = v0
                     for _ in range(k):
-                        v = v + model(x, v, prompt, t, pmask)
+                        v = v + model(x, v, prompt, t, pmask,
+                                      lag=batch["lag"].to(device).float())
                     err = (v - vt).float().flatten(1).norm(dim=1)
                     den = vt.float().flatten(1).norm(dim=1) + 1e-8
                     rel = (err / den).tolist()
@@ -922,6 +1029,8 @@ def main(argv=None):
     print(f"  Size:           {size} (depth {cfg['depth']})   optimizer: {cfg['optimizer']}  lr={cfg['lr']}")
     print(f"  Multipass:      {cfg['multipass']} (K_max={1 if not cfg['multipass'] else cfg['refine_passes_max']}, "
           f"curriculum={cfg['k_curriculum']}, stop_grad={cfg['stop_grad']})")
+    print(f"  Conditioning:   lag={cfg['lag_cond']}  res={cfg['res_cond']}  "
+          f"lag-loss-norm={cfg['lag_loss_normalize']}  de-burst={cfg['deburst_windows']}")
     print(f"  Loss:           {cfg['loss']}   batch={cfg['batch_size']}  "
           f"max_steps={cfg['max_steps']}")
     print(f"  Cache:          {cfg['cache_size']} generations   "
@@ -950,7 +1059,23 @@ def main(argv=None):
     except Exception as e:
         print(f"  ⚠ corpus diagnostics unavailable: {e}")
 
-    sampler = CorrectorBatchSampler(ds, batch_size=cfg["batch_size"], seed=cfg["seed"])
+    # Resolution curriculum (stage 1 = cheap stratum only, then a ramped mix
+    # to full): the stage-1 sampler filters the pair buckets by latent area,
+    # so its batches are ~4× cheaper while the model builds scale-invariant
+    # features; the ramp interpolates stage1 → full mix over
+    # stage2_ramp_fraction of the run (no hard switch — hard switches let the
+    # 64×64-learned field degrade the 1024² strata it never trained on).
+    curriculum = cfg["resolution_curriculum"]
+    # Tuple-keyed view for the sampler (bucket keys are (h, w) tuples).
+    res_weights = {}
+    for key, value in (curriculum.get("resolution_weights") or {}).items():
+        h, w = (int(x) for x in key.split("x"))
+        res_weights[(h, w)] = value
+    sampler = CorrectorBatchSampler(
+        ds, batch_size=cfg["batch_size"], seed=cfg["seed"],
+        bucket_weights=res_weights or None,
+        deburst_windows=cfg["deburst_windows"],
+        deburst_window_runs=cfg["deburst_window_runs"])
     loader = DataLoader(ds, batch_sampler=sampler, collate_fn=collate_corrector,
                         num_workers=cfg["num_workers"],
                         pin_memory=cfg["num_workers"] > 0)
@@ -958,24 +1083,29 @@ def main(argv=None):
     print(f"  Batches/epoch:  {steps_per_epoch}   "
           f"(~{cfg['max_steps'] / steps_per_epoch:.1f} epochs over {cfg['max_steps']} steps)")
 
-    # Resolution curriculum (stage 1 = cheap stratum only, then full mix):
-    # the stage-1 sampler filters the pair buckets by latent area, so its
-    # batches are ~4× cheaper while the model builds scale-invariant features.
-    curriculum = cfg["resolution_curriculum"]
     stage1_loader = None
     stage1_until = 0
+    ramp_start = 0
+    ramp_end = 0
     if curriculum.get("enabled"):
         s1_sampler = CorrectorBatchSampler(
             ds, batch_size=cfg["batch_size"], seed=cfg["seed"] + 7,
-            include_areas=curriculum["stage1_areas"])
+            include_areas=curriculum["stage1_areas"],
+            bucket_weights=res_weights or None,
+            deburst_windows=cfg["deburst_windows"],
+            deburst_window_runs=cfg["deburst_window_runs"])
         if s1_sampler.buckets:
             stage1_loader = DataLoader(ds, batch_sampler=s1_sampler,
                                        collate_fn=collate_corrector,
                                        num_workers=cfg["num_workers"],
                                        pin_memory=cfg["num_workers"] > 0)
             stage1_until = int(cfg["max_steps"] * curriculum["stage1_fraction"])
-            print(f"  Curriculum:     stage 1 (steps ≤ {stage1_until}) → "
-                  f"areas {curriculum['stage1_areas']}; then full mix")
+            ramp_steps = int(cfg["max_steps"] * curriculum["stage2_ramp_fraction"])
+            ramp_start = stage1_until
+            ramp_end = min(ramp_start + ramp_steps, cfg["max_steps"])
+            print(f"  Curriculum:     stage 1 (steps ≤ {ramp_start}) → ramp over "
+                  f"{ramp_end - ramp_start} steps → full mix; areas "
+                  f"{curriculum['stage1_areas']}")
         else:
             print(f"  ⚠ resolution curriculum enabled but no pairs at "
                   f"{curriculum['stage1_areas']} — training full mix only")
@@ -989,8 +1119,16 @@ def main(argv=None):
         eval_max_batches = cfg["eval_max_batches"] or None
         eval_sampler = CorrectorBatchSampler(eval_ds, batch_size=16,
                                              seed=cfg["seed"] + 1,
-                                             max_batches=eval_max_batches)
-        eval_loader = DataLoader(eval_ds, batch_sampler=eval_sampler,
+                                             max_batches=eval_max_batches,
+                                             min_batches_per_shape=cfg[
+                                                 "eval_min_batches_per_shape"])
+        # Fixed eval set: the batch index list is built once and replayed at
+        # every eval, so the K=0 base and the per-shape slices are identical
+        # across evals (the sampler's epoch counter would otherwise resample
+        # each evaluation, making the recovery curve a moving target).
+        eval_batches = list(eval_sampler)
+        eval_loader = DataLoader(eval_ds,
+                                 batch_sampler=FixedBatchListSampler(eval_batches),
                                  collate_fn=collate_corrector,
                                  num_workers=cfg["num_workers"],
                                  pin_memory=cfg["num_workers"] > 0)
@@ -1007,7 +1145,9 @@ def main(argv=None):
 
     # ── Model ─────────────────────────────────────────────────────────
     try:
-        ccfg = CorrectorConfig.for_size(size, depth=cfg["depth"])
+        ccfg = CorrectorConfig.for_size(size, depth=cfg["depth"],
+                                        lag_cond=cfg["lag_cond"],
+                                        res_cond=cfg["res_cond"])
     except ValueError as e:
         raise SystemExit(f"[train_corrector] {e}")
     if cfg["normalization"] == "perchannel":
@@ -1021,6 +1161,50 @@ def main(argv=None):
     opt = None
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
     scheduler = None
+    sd = None
+
+    # ── Resume (plan 6i): model state loads BEFORE the optimizer is built, so
+    # a pre-conditioning checkpoint (no lag/res embedders) can downgrade the
+    # model's config first and the optimizer's parameter groups stay in sync.
+    if cfg["resume"]:
+        sd = torch.load(cfg["resume"], map_location=device, weights_only=False)
+        missing, unexpected = model.load_state_dict(sd["model"], strict=False)
+        if missing:
+            cond_keys = {k for k in missing
+                         if "lag_embedder" in k or "res_embedder" in k}
+            if set(missing) == cond_keys and model.cfg.lag_cond:
+                # Pre-conditioning checkpoint: rebuild the model without the
+                # embedder modules so the optimizer's parameter groups (built
+                # below from this model) match the checkpoint's.
+                print("  ⚠ resume: pre-conditioning checkpoint — embedders "
+                      "dropped, conditioning disabled")
+                model.cfg.lag_cond = False
+                model.cfg.res_cond = False
+                model = CorrectorUNet2D(model.cfg)
+                missing2, unexpected2 = model.load_state_dict(
+                    sd["model"], strict=False)
+                if missing2:
+                    raise RuntimeError(f"[train_corrector] resume: missing keys "
+                                       f"{sorted(missing2)}")
+                unexpected = unexpected2
+            else:
+                raise RuntimeError(f"[train_corrector] resume: missing keys "
+                                   f"{sorted(missing)}")
+        if unexpected:
+            print(f"  ⚠ resume: unexpected keys {sorted(unexpected)} ignored")
+        ema = {k: v.to(device) for k, v in sd["ema"].items()}
+        step = int(sd["step"])
+        best = sd.get("best")
+        best_step = sd.get("best_step")
+        snapshot = sd.get("config_snapshot") or {}
+        drift = config_drift(snapshot, cfg)
+        if drift:
+            print("  ⚠ config drift vs checkpoint snapshot (resume):")
+            print("\n".join(drift))
+        else:
+            print(f"  Resumed from {cfg['resume']} at step {step}")
+        if sd.get("wall_s") is not None:
+            print(f"  Previously elapsed: {format_duration(sd['wall_s'])}")
 
     if cfg["optimizer"] == "sophia":
         opt = SophiaG(model.parameters(), lr=cfg["lr"], rho=cfg["rho"],
@@ -1061,27 +1245,13 @@ def main(argv=None):
     print(f"  FLOPs/pass @512²: {flops/1e9:.1f} GFLOP "
           f"({flops/FULL_STEP_FLOP_512:.2%} of a full model step)")
 
-    # ── Resume (plan 6i) ──────────────────────────────────────────────
-    if cfg["resume"]:
-        sd = torch.load(cfg["resume"], map_location=device, weights_only=False)
-        model.load_state_dict(sd["model"])
-        ema = {k: v.to(device) for k, v in sd["ema"].items()}
+    # Optimizer state loads after construction (the parameter groups were
+    # built from the reconciled model above).
+    if sd is not None:
         opt.load_state_dict(sd["optimizer"])
         scaler.load_state_dict(sd["scaler"])
         if scheduler is not None and sd.get("scheduler"):
             scheduler.load_state_dict(sd["scheduler"])
-        step = int(sd["step"])
-        best = sd.get("best")
-        best_step = sd.get("best_step")
-        snapshot = sd.get("config_snapshot") or {}
-        drift = config_drift(snapshot, cfg)
-        if drift:
-            print("  ⚠ config drift vs checkpoint snapshot (resume):")
-            print("\n".join(drift))
-        else:
-            print(f"  Resumed from {cfg['resume']} at step {step}")
-        if sd.get("wall_s") is not None:
-            print(f"  Previously elapsed: {format_duration(sd['wall_s'])}")
     ema_model = CorrectorUNet2D(ccfg).to(device)
     if cfg["compile"]:
         model = torch.compile(model, mode="reduce-overhead")
@@ -1089,6 +1259,27 @@ def main(argv=None):
 
     loss_fn = LOSS_FNS[cfg["loss"]]
     eps = ds.rel_mse_eps
+    # Per-lag loss normalization (R5): w_lag = mean(e)/e_lag so each lag
+    # contributes ~equal gradient mass regardless of difficulty. Estimated
+    # once from a seeded train-pair subsample; lags without estimates get 1.0.
+    lag_scale_t: Optional[torch.Tensor] = None
+    if cfg["lag_loss_normalize"]:
+        base_err = estimate_per_lag_base_rel(ds, seed=cfg["seed"] + 3)
+        if base_err:
+            lags_sorted = sorted(base_err)
+            es = torch.tensor([base_err[l] for l in lags_sorted],
+                              dtype=torch.float32)
+            w = (es.mean() / es.clamp_min(1e-6)).clamp(0.2, 5.0)
+            w = w / w.mean()
+            lag_scale_t = torch.ones(max(lags_sorted) + 1, dtype=torch.float32)
+            for lag, wv in zip(lags_sorted, w.tolist()):
+                lag_scale_t[lag] = wv
+            lag_scale_t = lag_scale_t.to(device)
+            print("  Lag loss norm:  " + "  ".join(
+                f"lag{l}={wv:.2f}" for l, wv in zip(lags_sorted, w.tolist())))
+        else:
+            print("  ⚠ lag_loss_normalize enabled but no per-lag estimates "
+                  "could be computed — training unweighted")
     k_max_final = cfg["refine_passes_max"] if cfg["multipass"] else 1
     # K=0 is the TeaCache base (v = v_MA, zero passes) — the recovery-table
     # baseline; K>=1 are the corrector passes. The eval ladder alternates
@@ -1145,13 +1336,29 @@ def main(argv=None):
         else:
             print(line)
 
+    cur_rng = random.Random(cfg["seed"] + 2000)
+
+    def pick_loader(step: int):
+        """Curriculum schedule: stage-1 loader until ramp_start, then a
+        probabilistic ramp to the full-mix loader over [ramp_start, ramp_end]."""
+        if stage1_loader is None:
+            return loader
+        if step <= ramp_start:
+            return stage1_loader
+        if step >= ramp_end:
+            return loader
+        p = (step - ramp_start) / max(ramp_end - ramp_start, 1)
+        return loader if cur_rng.random() < p else stage1_loader
+
     while step < cfg["max_steps"]:
         step += 1
         t_step0 = time.time()
-        if stage1_until and step == stage1_until + 1:
-            active_loader = loader
-            iter_loader = iter(loader)
-            emit(f"  [curriculum] stage 2: full resolution mix from step {step}")
+        want = pick_loader(step)
+        if want is not active_loader:
+            active_loader = want
+            iter_loader = iter(active_loader)
+            if step == ramp_start + 1 and stage1_loader is not None:
+                emit(f"  [curriculum] ramp to full resolution mix from step {step}")
         try:
             batch = next(iter_loader)
         except StopIteration:
@@ -1175,9 +1382,12 @@ def main(argv=None):
                         torch.nn.attention.SDPBackend.MATH):
                 dv = model(batch["x_t"].float(), batch["v_ma"].float(),
                            batch["prompt"].float(), batch["t_frac"].float(),
-                           batch["prompt_mask"])
-                loss_h = per_sample_rel_mse(batch["v_ma"].float() + dv,
-                                            batch["v_true"].float(), eps).mean()
+                           batch["prompt_mask"], lag=batch["lag"].float())
+                per_s = per_sample_rel_mse(batch["v_ma"].float() + dv,
+                                           batch["v_true"].float(), eps)
+                if lag_scale_t is not None:
+                    per_s = per_s * lag_scale_t[batch["lag"]]
+                loss_h = per_s.mean()
             opt.update_hessian(loss_h)
             timer.add("hessian", time.time() - t_h0)
 
@@ -1201,7 +1411,8 @@ def main(argv=None):
                                device=device)
             with torch.autocast("cuda", dtype=torch.float16):
                 loss = compute_train_loss(model, batch, Ks, loss_fn, eps,
-                                          cfg["stop_grad"], cfg["multipass"], k_max_cur)
+                                          cfg["stop_grad"], cfg["multipass"],
+                                          k_max_cur, lag_scale=lag_scale_t)
             micro_losses.append(loss.detach())
             scaler.scale(loss).backward()
         scaler.unscale_(opt)
@@ -1254,8 +1465,12 @@ def main(argv=None):
             t_e0 = time.time()
             ks_eval = (ks_eval_full if n_evals_done % cfg["eval_full_k_every"] == 0
                        else ks_eval_light)
+            # Eval the EMA model — it is the artifact that ships and the one
+            # best-checkpoint selection is based on (the online weights are
+            # only training machinery).
+            ema_model.load_state_dict(ema)
             results, by_shape, eval_maps = eval_model(
-                model, eval_loader, lags, ks_eval, device,
+                ema_model, eval_loader, lags, ks_eval, device,
                 eps, show_progress=(pbar is not None),
                 eval_map_batches=int(cfg.get("recovery_eval_batches", 64)))
             k1_pairs = [r["rel_mse"] for (kk, _), r in results.items() if kk == 1]
@@ -1283,6 +1498,20 @@ def main(argv=None):
                 parts = [f"K{k}={results.get((k, lag), {}).get('rel_mse', float('nan')):.4f}"
                          for k in ks_eval]
                 emit(f"      lag {lag:>2d}: " + "  ".join(parts))
+            # Per-lag recovery vs the K=0 base (K=0 per-lag is in `results`):
+            # makes the lag-1 over-correction / lag-16 under-correction
+            # visible instead of hiding it in the pooled number.
+            per_lag_rec = {}
+            for lag in lags:
+                if lag == 0:
+                    continue
+                r0 = results.get((0, lag), {}).get("rel_mse")
+                r1 = results.get((1, lag), {}).get("rel_mse")
+                if r0 and r1 is not None and r1 == r1:
+                    per_lag_rec[lag] = 1.0 - r1 / r0
+            if per_lag_rec:
+                emit("      recovery per lag: " + "  ".join(
+                    f"lag{lag}={100 * rec:+.1f}%" for lag, rec in per_lag_rec.items()))
             shape_keys = sorted({hw for (_, hw) in by_shape}, key=lambda hw: hw[0] * hw[1])
             for hw in shape_keys:
                 parts = []
@@ -1341,6 +1570,8 @@ def main(argv=None):
             cfg_meta = {k: v for k, v in cfg.items()
                         if k not in ("data", "resume", "out", "compile",
                                      "channels_last", "metrics", "no_progress")}
+            cfg_meta["lag_cond"] = ccfg.lag_cond
+            cfg_meta["res_cond"] = ccfg.res_cond
             if k1_lad is not None and k1_lad == k1_lad and (
                     best is None or k1_lad < best):
                 best = k1_lad
@@ -1374,6 +1605,8 @@ def main(argv=None):
                           for k in ks_eval},
                 "per_lag": {str(lag): results.get((1, lag), {}).get("rel_mse")
                             for lag in lags},
+                "recovery_per_lag": {str(lag): round(rec, 4)
+                                     for lag, rec in per_lag_rec.items()},
                 "per_shape": {f"{h}x{w}": {str(k): round(by_shape.get((k, (h, w)), {}).get("rel_mse", float("nan")), 6)
                                            for k in ks_eval}
                               for (h, w) in shape_keys},
@@ -1397,6 +1630,8 @@ def main(argv=None):
     cfg_meta = {k: v for k, v in cfg.items()
                 if k not in ("data", "resume", "out", "compile",
                              "channels_last", "metrics", "no_progress")}
+    cfg_meta["lag_cond"] = ccfg.lag_cond
+    cfg_meta["res_cond"] = ccfg.res_cond
     save_corrector(ema_model, final, ccfg,
                    extra_metadata={"config_snapshot": cfg_meta})
     if pbar is not None:

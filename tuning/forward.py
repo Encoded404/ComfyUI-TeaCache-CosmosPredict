@@ -407,10 +407,12 @@ def _apply_corrector(self, out, x_orig, crossattn_emb, cond_or_uncond, b,
     """Mode B′ post-hook (plan Task 5b): correct the skip-step velocity per slot.
 
     Runs after the final layer + unpatchify on skip steps only. The corrector
-    (set on the diffusion model by the node) maps (x_t, v_MA) → Δv̂; the blend
-    ``v_final = v_MA + trust·(v̂ − v_MA)`` defaults to full correction (trust=1).
-    No new state, no feedback loop — the input is always the deterministic
-    Mode-A output.
+    (set on the diffusion model by the node) maps (x_t, v_MA, lag) → Δv̂; the
+    blend ``v_final = v_MA + trust·(v̂ − v_MA)`` defaults to full correction
+    (trust=1). No new state, no feedback loop — the input is always the
+    deterministic Mode-A output. The per-slot lag (steps since the last full
+    run) is read from ``teacache_state[k]["lag"]`` — exactly the skip age the
+    corrector was trained on (lag ≥ 1 whenever this hook runs).
     """
     corr = getattr(self, "_tc_corrector", None)
     if corr is None:
@@ -426,7 +428,10 @@ def _apply_corrector(self, out, x_orig, crossattn_emb, cond_or_uncond, b,
         x_slot = x_orig[i * b : (i + 1) * b, :, 0]       # (B', 16, H, W), T=1
         v_slot = out[i * b : (i + 1) * b, :, 0]          # (B', 16, H, W)
         p = crossattn_emb[i * b : (i + 1) * b]           # (B', N, 1024)
-        v_hat = corr.refine(x_slot, v_slot, p, t.expand(x_slot.shape[0]), K)
+        lag = float(self.teacache_state.get(k, {}).get("lag", 0))
+        lag_t = torch.tensor([lag], dtype=torch.float32, device=out.device)
+        v_hat = corr.refine(x_slot, v_slot, p, t.expand(x_slot.shape[0]), K,
+                            lag=lag_t.expand(x_slot.shape[0]))
         v_final = v_slot + trust * (v_hat - v_slot)
         out[i * b : (i + 1) * b, :, 0] = v_final.to(out.dtype)
         if collect:
@@ -558,6 +563,7 @@ def teacache_anima_forward(
                 "prev_mod": None,
                 "prev_residual": None,
                 "prev_residual_late": None,
+                "lag": 0,
                 "accum_state": {},
                 "per_group": None,
             }
@@ -719,6 +725,11 @@ def teacache_anima_forward(
 
         for i, k in enumerate(cond_or_uncond):
             state = self.teacache_state[k]
+            # Skip age for the Mode B′ corrector: steps since this slot's
+            # last full run (reset in the full-run branch below). Exact for
+            # all_or_nothing block mode; an approximation for split/dynamic
+            # modes whose residuals mix ages.
+            state["lag"] = state.get("lag", 0) + 1
 
             if cfg.block_mode == "all_or_nothing":
                 resid = state.get("prev_residual")
@@ -767,6 +778,9 @@ def teacache_anima_forward(
     else:
         # ── Knob 8: Run blocks (with optional splitting for residuals) ──
         ori_x = x_B_T_H_W_D.to(cache_device)
+
+        for k in cond_or_uncond:
+            self.teacache_state[k]["lag"] = 0
 
         if cfg.block_mode == "all_or_nothing":
             for block in self.blocks:
