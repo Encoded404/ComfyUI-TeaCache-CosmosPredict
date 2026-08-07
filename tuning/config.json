@@ -140,10 +140,10 @@
         "lag_weights": [2.0, 1.5, 1.25, 1.0, 0.5, 0.25],
         "resolution_curriculum": {
             "enabled": true,
-            "stage1_fraction": 0.6,
+            "stage1_fraction": 0.4,
             "stage1_shapes": ["64x64"],
-            "stage2_ramp_fraction": 0.15,
-            "resolution_weights": {"64x64": 1.0, "64x128": 1.5, "128x128": 2.5}
+            "stage2_ramp_fraction": 0.25,
+            "resolution_weights": {"64x64": 1.0, "64x128": 1.25, "128x128": 2.0}
         },
         "accumulate_big_batches": true,
         "scale_aug": true,
