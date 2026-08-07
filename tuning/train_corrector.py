@@ -123,6 +123,10 @@ class SophiaG(torch.optim.Optimizer):
         if "m" not in state:
             state["m"] = torch.zeros_like(p)
             state["h"] = torch.zeros_like(p)
+            state["h_est"] = torch.zeros_like(p)
+        elif "h_est" not in state:
+            # state restored from a pre-h_est checkpoint
+            state["h_est"] = torch.zeros_like(p)
         return state
 
     def update_hessian(self, loss: torch.Tensor) -> None:
@@ -133,6 +137,13 @@ class SophiaG(torch.optim.Optimizer):
         used in the graph (e.g. the prompt layers on an all-uncond 0-token
         batch) are skipped — their Hessian is undefined that step and their
         stored h stays stale until a batch that exercises them.
+
+        This is a double-backward estimate (gradient of the gradient), so the
+        loss graph must be built without the fused SDPA backends (flash /
+        memory-efficient): they implement no second-order derivative. Callers
+        should build ``loss`` under
+        ``torch.nn.attention.sdpa_kernel(SDPBackend.MATH)`` so attention runs
+        as bmm/softmax/matmul, which are double-backwardable.
         """
         self._hessian_steps += 1
         params = [p for g in self.param_groups for p in g["params"] if p.requires_grad]
@@ -151,7 +162,7 @@ class SophiaG(torch.optim.Optimizer):
         )
         with torch.no_grad():
             for p, u, gu_i in zip(used_params, us, gu):
-                self._state(p)["h"].copy_((u * gu_i).detach().clamp_min(0))
+                self._state(p)["h_est"].copy_((u * gu_i).detach().clamp_min(0))
         self._hessian_pending = True
 
     @torch.no_grad()
@@ -174,7 +185,7 @@ class SophiaG(torch.optim.Optimizer):
                 m, h = state["m"], state["h"]
                 m.mul_(b1).add_(g, alpha=1 - b1)
                 if hessian_this_step:
-                    h.mul_(b2).add_(state["h"], alpha=1 - b2)
+                    h.mul_(b2).add_(state["h_est"], alpha=1 - b2)
                 update = (m / h.clamp_min(eps)).clamp(-rho, rho)
                 p.add_(update, alpha=-lr)
                 if wd:
@@ -1076,7 +1087,13 @@ def main(argv=None):
 
         if isinstance(opt, SophiaG) and step % cfg["hessian_every"] == 0:
             t_h0 = time.time()
-            with torch.autocast("cuda", enabled=False):
+            # update_hessian double-backpropagates (gradient of the gradient);
+            # the fused SDPA backends (flash / memory-efficient) have no
+            # second-order derivative, so build the graph on the math backend
+            # (bmm/softmax/matmul — see SophiaG.update_hessian docstring).
+            with torch.autocast("cuda", enabled=False), \
+                    torch.nn.attention.sdpa_kernel(
+                        torch.nn.attention.SDPBackend.MATH):
                 dv = model(batch["x_t"].float(), batch["v_ma"].float(),
                            batch["prompt"].float(), batch["t_frac"].float(),
                            batch["prompt_mask"])
