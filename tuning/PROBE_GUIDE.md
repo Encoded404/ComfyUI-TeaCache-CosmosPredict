@@ -424,9 +424,14 @@ still distorts a video), but clearly better than the baselines.
 ### 8.4 The verdict rule
 
 ```
-beats_linear_ceiling_by_25pct  ⇔  rel_mse ≤ 0.75 × ceiling
+beats_linear_ceiling_by_25pct  ⇔  ladder_rel_mse ≤ 0.75 × ceiling
 verdict = build_full_corrector | reconsider_before_full_training
 ```
+
+The comparison uses the **ladder-only** rel-MSE (`recovery_split.model.ladder`,
+lag ≥ 1): the tiny UNet trains on stale pairs only, and the ceiling is fit on
+recorded lags, so the d=0 anchors would dilute the model side but not the
+ceiling. Legacy reports without the split fall back to the pooled rel-MSE.
 
 Why 25%? The ceiling is the *free* baseline — a corrector that can't clearly
 beat per-channel scale+shift doesn't justify its complexity, VRAM, and

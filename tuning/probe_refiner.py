@@ -573,7 +573,8 @@ def day1_unet(data_dir: Path, device, max_steps: int = 600, batch_size: int = 8,
     torch.manual_seed(seed)
     train_ds = CorrectorDataset(data_dir, seed=seed, show_progress=show_progress,
                                 normalization_samples=0, manifest=manifest,
-                                gen_cache_size=cache_size)
+                                gen_cache_size=cache_size,
+                                synthesize_anchors=False)
     train_loader = DataLoader(train_ds, batch_sampler=CorrectorBatchSampler(
         train_ds, batch_size=batch_size, seed=seed), collate_fn=collate_corrector,
         num_workers=0)
@@ -1012,18 +1013,31 @@ def main(argv=None):
                      recovery_eval_batches=int((tcfg.refiner_training or {}).get("recovery_eval_batches", 64)))
     day1["mlp_pooled_mean_error"] = round(float(mlp_err), 5)
     day1["linear_ceiling"] = ceiling
-    if day1["day1_unet_rel_mse"] is not None:
+    # Verdict on the LADDER-ONLY rel-MSE: the Day-1 UNet (like the full
+    # corrector) trains on stale pairs only, and the ceiling is fit on
+    # recorded lags — d=0 anchors would dilute both sides unevenly. Falls
+    # back to the pooled rel-MSE for legacy reports without the split.
+    split = day1.get("recovery_split") or {}
+    m_lad = (split.get("model") or {}).get("ladder")
+    day1["ladder_rel_mse"] = (round(float(np.mean(m_lad)), 5)
+                              if m_lad else None)
+    gate_err = day1["ladder_rel_mse"] or day1["day1_unet_rel_mse"]
+    if gate_err is not None:
         day1["beats_linear_ceiling_by_25pct"] = bool(
-            day1["day1_unet_rel_mse"] <= 0.75 * max(ceiling, 1e-9))
+            gate_err <= 0.75 * max(ceiling, 1e-9))
         day1["verdict"] = ("build_full_corrector" if day1["beats_linear_ceiling_by_25pct"]
                            else "reconsider_before_full_training")
-        print(f"  Day-1 UNet rel-MSE: {day1['day1_unet_rel_mse']:.4f} vs ceiling "
+        lad_s = (f"{day1['ladder_rel_mse']:.4f}"
+                 if day1["ladder_rel_mse"] is not None else "n/a")
+        print(f"  Day-1 UNet ladder rel-MSE: {lad_s} "
+              f"(pooled {day1['day1_unet_rel_mse']:.4f}) vs ceiling "
               f"{ceiling:.4f} → {day1['verdict']}")
     else:
         day1["verdict"] = "no_eval_pairs"
     report["day1"] = day1
     metrics.write({
         "type": "day1_eval", "rel_mse": day1.get("day1_unet_rel_mse"),
+        "ladder_rel_mse": day1.get("ladder_rel_mse"),
         "base_rel_mse": day1.get("base_rel_mse"),
         "affine_rel_mse": (day1.get("affine_oob") or {}).get("overall"),
         "verdict": day1["verdict"], "wall_s": round(timer.phase_seconds("train"), 2),

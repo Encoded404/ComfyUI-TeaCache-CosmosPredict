@@ -6,7 +6,12 @@ from the recorded generations:
 - eval-prompt generations are excluded from training indexing (they exist only
   for the eval loop; ``only_eval=True`` selects them exclusively);
 - the d=0 anchor pair (``v_MA = v_true``, ``Δ_MA = 0``) is synthesized at load
-  (``iter_pairs`` semantics — zero storage);
+  (``iter_pairs`` semantics — zero storage). Training sets pass
+  ``synthesize_anchors=False``: the corrector only ever post-processes
+  skip-step (stale) velocities, so the fresh-cache case is off-manifold and
+  would dilute the loss and bias the correction field at low staleness. The
+  eval set keeps the d=0 anchors as a diagnostic (``per_lag[0]``,
+  ``anchors_only``);
 - per-lag resampling weights (``lag_weights``, in ``record_lags`` order) feed a
   weighted batch sampler; the d=0 pair takes weight 1.0;
 - resolution-grouped batches (512² and 1024² separate; 1024² batches ÷4);
@@ -61,11 +66,13 @@ class CorrectorDataset(Dataset):
                  compute_normalization: bool = False,
                  show_progress: bool = True,
                  manifest: Optional[dict] = None,
-                 gen_cache_size: int = DEFAULT_GEN_CACHE_SIZE):
+                 gen_cache_size: int = DEFAULT_GEN_CACHE_SIZE,
+                 synthesize_anchors: bool = True):
         data_dir = Path(data_dir)
         self.data_dir = data_dir
         self.seed = seed
         self.lag_weights = lag_weights or [1.0] * 5
+        self.synthesize_anchors = bool(synthesize_anchors)
         self.rel_mse_eps_scale = rel_mse_eps_scale
         self.rng = random.Random(seed)
         self._gen_cache: "OrderedDict[str, refiner_data.RefinerGeneration]" = OrderedDict()
@@ -101,9 +108,10 @@ class CorrectorDataset(Dataset):
                             w = float(self.lag_weights[li]) if 0 <= li < len(self.lag_weights) else 1.0
                             self.pair_weights.append(w)
                             self.pair_shape.append(shape)
-                    self.pairs.append((gi, int(slot), t, 0))
-                    self.pair_weights.append(1.0)
-                    self.pair_shape.append(shape)
+                    if self.synthesize_anchors:
+                        self.pairs.append((gi, int(slot), t, 0))
+                        self.pair_weights.append(1.0)
+                        self.pair_shape.append(shape)
 
         self.weights = torch.tensor(self.pair_weights, dtype=torch.float64)
 

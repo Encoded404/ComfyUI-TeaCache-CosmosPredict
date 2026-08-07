@@ -113,7 +113,7 @@ def main(argv=None):
     print(f"  Warm-start keys: {loaded}/{len(ssd)} (same-size: all; cross-size: subset)")
     student = student.to(device)
 
-    ds = CorrectorDataset(Path(args.data), seed=seed)
+    ds = CorrectorDataset(Path(args.data), seed=seed, synthesize_anchors=False)
     sampler = CorrectorBatchSampler(ds, batch_size=batch_size, seed=seed)
     loader = DataLoader(ds, batch_sampler=sampler, collate_fn=collate_corrector,
                         num_workers=0)

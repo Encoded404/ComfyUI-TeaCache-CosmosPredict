@@ -170,9 +170,17 @@ python -m tuning.train_corrector --data outputs/<ts>/refiner_data \
 - **Optimizers**: `sophia` (Gauss-Newton-Bartlett, lr 4e-4, ρ=0.04, k=10 —
   implemented in `train_corrector.py` per the plan deep-dive), `adamw`,
   `ademamix`, `schedulefree`. fp16 autocast + GradScaler throughout.
+- **Stale-only training**: the corrector post-processes skip-step (stale)
+  v_MA only, so training pairs are the recorded ladder lags (1,2,4,8,16) —
+  the synthesized d=0 anchors (v_MA = v_true) are **excluded** from training
+  (off-manifold: the model is never queried on a fresh cache). The eval set
+  keeps them as a diagnostic (`per_lag[0]`, `anchors_only` — a rise there is
+  expected and harmless; never gated on). The did-it-learn gate and the
+  best-checkpoint selection use the ladder-only K=1 error.
 - **Eval every 500 steps**: per-lag rel-MSE slices at K=1,2,3, plus the gates —
-  did-it-learn (beats the probe ceiling by ≥20% within 6 evals), K-robustness
-  gap and per-lag coverage warnings.
+  did-it-learn (ladder-only K=1 beats the probe ceiling by ≥20% within 6
+  evals), K-robustness gap (ladder-only) and per-lag coverage warnings
+  (growth measured from lag 1, not the d=0 anchors).
 - **Progress & metrics**: live tqdm bar (EMA loss, lr, K, it/s, remaining),
   per-50-step log lines with ETA, and a per-eval timing report (train / eval /
   hessian phases; the ETA projects eval + checkpoint overhead). Step + eval
@@ -180,8 +188,9 @@ python -m tuning.train_corrector --data outputs/<ts>/refiner_data \
   (`--no-progress` disables the bar; `--metrics PATH` relocates the log;
   `--resume` reports the previously elapsed wall time).
 - **Outputs** (`models/`): `corrector-{size}-{step}.safetensors` per eval,
-  `corrector-{size}-best.safetensors`, `corrector-{size}-train.pt` (resume
-  state), final `corrector-{size}.safetensors` (EMA, fp16, K_recommended=1).
+  `corrector-{size}-best.safetensors` (best ladder-only K=1),
+  `corrector-{size}-train.pt` (resume state), final `corrector-{size}.safetensors`
+  (EMA, fp16, K_recommended=1).
 
 Distillation (optional, plan Task 6l):
 

@@ -11,10 +11,14 @@ pairs from a refiner recording run (``outputs/<ts>/refiner_data``). Supports:
   AdEMAMix, Schedule-Free AdamW (plan 6g);
 - EMA with ramp (deep-dive §2.3), fp16 autocast + GradScaler (deep-dive §2.2);
 - eval loop with the K-robustness curve (K=1,2,3), per-lag rel-MSE slices and
-  the plan's gates (did-it-learn vs the probe's linear ceiling, per-lag
-  coverage, K-robustness gap) — plan 6h;
-- checkpointing: EMA .safetensors per eval + best-by-eval + full-state .pt
-  resume with config-drift warning (plan 6i);
+  the plan's gates (did-it-learn on the ladder-only K=1 error vs the probe's
+  linear ceiling, per-lag coverage, K-robustness gap) — plan 6h;
+- stale-only training: the synthesized d=0 anchor pairs (v_MA = v_true) are
+  excluded from the training set — the corrector post-processes skip-step
+  (stale) velocities only — and kept in the eval set as a diagnostic
+  (per_lag[0], anchors_only);
+- checkpointing: EMA .safetensors per eval + best-by-eval (ladder-only K=1)
+  + full-state .pt resume with config-drift warning (plan 6i);
 - live reporting: tqdm progress bar (EMA loss, lr, K, it/s, remaining),
   per-50-step durable log lines, per-eval timing reports (train/eval/hessian
   phases; the ETA projects eval + checkpoint overhead), VRAM peak, and a
@@ -935,10 +939,11 @@ def main(argv=None):
         show_progress=not cfg["no_progress"],
         manifest=manifest,
         gen_cache_size=cfg["cache_size"],
+        synthesize_anchors=False,
     )
     if not len(ds):
         raise SystemExit("[train_corrector] no training pairs (all generations eval?)")
-    print(f"  Training pairs: {len(ds)}   eval pairs: "
+    print(f"  Training pairs: {len(ds)} (stale-only, no d=0 anchors)   eval pairs: "
           f"{len(CorrectorDataset(data_dir, only_eval=True, normalization_samples=0, manifest=manifest))}")
     try:
         print_corpus_diagnostics(corpus_diagnostics(data_dir, ds))
@@ -1103,7 +1108,7 @@ def main(argv=None):
     ceiling = load_linear_ceiling(data_dir)
     if ceiling is not None:
         print(f"  Linear ceiling: {ceiling:.4f} (1−R², probe) — did-it-learn target "
-              f"≤ {0.8 * ceiling:.4f}")
+              f"(ladder-only K=1) ≤ {0.8 * ceiling:.4f}")
     else:
         print("  Linear ceiling: not found (no probe report) — did-it-learn gate skipped")
     gate_deadline = 6 * cfg["eval_every"]
@@ -1203,6 +1208,8 @@ def main(argv=None):
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         scaler.step(opt)
         scaler.update()
+        if scheduler is not None:
+            scheduler.step()
         ema_update(model, ema, step, decay=cfg["ema_decay"])
         timer.record_step(time.time() - t_step0)
 
@@ -1287,45 +1294,60 @@ def main(argv=None):
             last_eval_rows = rows
             last_affine = affine
             bl = next((r["ladder_only"] for r in rows if r["k"] == 0), None)
+            # Ladder-only K=1 error (lag ≥ 1, excluding the synthesized d=0
+            # anchors): the anchor-diluted pooled k1 lets a no-op corrector
+            # pass trivially, so gates and best-checkpoint selection use this
+            # split (plan 6h).
+            k1_lad = next((r["ladder_only"] for r in rows if r["k"] == 1),
+                          None)
             for line2 in recovery_table_lines(rows, affine):
                 emit(line2)
             if ceiling is not None and not gate_fired and step >= gate_deadline:
-                if k1 is None or k1 > 0.8 * ceiling:
-                    emit("  ✗ BELOW LINEAR CEILING — did-it-learn gate fired; "
-                         "stopping per plan 6h")
+                if (k1_lad is None or k1_lad != k1_lad
+                        or k1_lad > 0.8 * ceiling):
+                    emit("  ✗ BELOW LINEAR CEILING (ladder-only K=1) — "
+                         "did-it-learn gate fired; stopping per plan 6h")
                     step = cfg["max_steps"]
                     gate_fired = True
             # K-robustness + per-lag coverage (report-only warnings; needs the
-            # full ladder, so light [0,1] evals skip it)
+            # full ladder, so light [0,1] evals skip it). Both compare on the
+            # ladder-only split: d=0 anchors score ≈0 for every K and would
+            # compress the pooled gap / inflate the per-lag growth from lag 0.
             if ks_eval[-1] > 1:
-                r1 = sum(v["rel_mse"] for (kk, _), v in results.items() if kk == 1)
-                r3 = sum(v["rel_mse"] for (kk, _), v in results.items() if kk == max(ks_eval))
-                nk = max(1, sum(1 for (kk, _) in results if kk == 1))
-                if r3 > 0 and (r1 - r3) / r3 > 0.2:
-                    emit("  ⚠ K-robustness gap large (K=1 ≫ K=K_max) — consider "
-                         "strengthening the K curriculum (plan 6h)")
-            per_lag_k1 = [results.get((1, lag), {}).get("rel_mse", float("nan"))
-                          for lag in lags]
-            finite = [x for x in per_lag_k1 if x == x]
-            if len(finite) >= 3 and finite[0] > 0:
-                growth = (finite[-1] - finite[0]) / finite[0]
+                r1_lad = next((r["ladder_only"] for r in rows if r["k"] == 1),
+                              None)
+                r3_lad = next((r["ladder_only"] for r in rows
+                               if r["k"] == max(ks_eval)), None)
+                if (r1_lad is not None and r3_lad is not None
+                        and r1_lad == r1_lad and r3_lad == r3_lad
+                        and r3_lad > 0 and (r1_lad - r3_lad) / r3_lad > 0.2):
+                    emit("  ⚠ K-robustness gap large (K=1 ≫ K=K_max, "
+                         "ladder-only) — consider strengthening the K "
+                         "curriculum (plan 6h)")
+            per_lag_k1 = [(lag, results.get((1, lag), {}).get("rel_mse",
+                                                             float("nan")))
+                          for lag in lags if lag != 0]
+            finite = [(lag, x) for lag, x in per_lag_k1 if x == x]
+            if len(finite) >= 3 and finite[0][1] > 0:
+                growth = (finite[-1][1] - finite[0][1]) / finite[0][1]
                 if growth > 1.5:
                     emit(f"  ⚠ Per-lag rel-MSE grows {growth:.2f}× from lag "
-                         f"{lags[0]} to lag {lags[-1]} — check the per-lag "
-                         "coverage gate (plan 6h); extend record_lags if "
-                         "superlinear")
+                         f"{finite[0][0]} to lag {finite[-1][0]} — check the "
+                         "per-lag coverage gate (plan 6h); extend record_lags "
+                         "if superlinear")
 
             # Checkpointing (plan 6i)
             ema_model.load_state_dict(ema)
             cfg_meta = {k: v for k, v in cfg.items()
                         if k not in ("data", "resume", "out", "compile",
                                      "channels_last", "metrics", "no_progress")}
-            if k1 is not None and (best is None or k1 < best):
-                best = k1
+            if k1_lad is not None and k1_lad == k1_lad and (
+                    best is None or k1_lad < best):
+                best = k1_lad
                 best_step = step
                 save_corrector(ema_model, out_dir / f"corrector-{size}-best.safetensors",
                                ccfg, extra_metadata={"config_snapshot": cfg_meta,
-                                                     "best_rel_mse_k1": k1})
+                                                     "best_rel_mse_k1_ladder": k1_lad})
             save_corrector(ema_model, out_dir / f"corrector-{size}-{step}.safetensors",
                            ccfg, extra_metadata={"config_snapshot": cfg_meta})
             for old in sorted(out_dir.glob(f"corrector-{size}-*.safetensors")):
@@ -1336,7 +1358,8 @@ def main(argv=None):
                             scaler, scheduler, step, cfg, best, best_step=best_step,
                             wall_s=time.time() - t_start)
             emit(f"      saved corrector-{size}-{step}.safetensors"
-                 + (f" (best K1={best:.4f} @ {best_step})" if best is not None else ""))
+                 + (f" (best ladder K1={best:.4f} @ {best_step})"
+                    if best is not None else ""))
             timer.record_eval(time.time() - t_e0)
             n_evals_done += 1
             next_eval = (eval_plan[n_evals_done]
@@ -1364,7 +1387,8 @@ def main(argv=None):
                                            "n_pairs": r["n_pairs"]}
                              for r in rows},
                 "affine_oob": affine_oob_json(affine) if affine is not None else None,
-                "best_k1": best, "best_step": best_step, "gate_fired": gate_fired,
+                "best_k1_ladder": best, "best_step": best_step,
+                "gate_fired": gate_fired,
             })
 
     # ── Final (plan 6i) ────────────────────────────────────────────────
@@ -1392,7 +1416,7 @@ def main(argv=None):
         print(f"  Loss:         final {loss_v:.5f}   min {min_loss:.5f}   "
               f"(ema {loss_ema:.5f})")
     if best is not None:
-        print(f"  Best K1:      {best:.4f} @ step {best_step}")
+        print(f"  Best ladder K1: {best:.4f} @ step {best_step}")
     if last_eval_rows:
         for line2 in recovery_table_lines(last_eval_rows, last_affine):
             print(line2)
