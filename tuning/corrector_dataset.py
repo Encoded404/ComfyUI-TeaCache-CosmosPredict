@@ -318,14 +318,24 @@ class CorrectorBatchSampler(Sampler):
     """
 
     def __init__(self, dataset: CorrectorDataset, batch_size: int, seed: int = 42,
-                 include_areas: Optional[List[int]] = None):
+                 include_areas: Optional[List[int]] = None,
+                 max_batches: Optional[int] = None):
         """``include_areas`` restricts sampling to pairs whose latent spatial
         area (H·W) is in the given list — used by the resolution curriculum's
-        stage 1 (e.g. only 64×64 pairs); None = all resolutions."""
+        stage 1 (e.g. only 64×64 pairs); None = all resolutions.
+
+        ``max_batches`` caps the epoch's total batch count (used by the eval
+        loader): each shape bucket gets a budget proportional to its pair
+        share, and every generation run within a bucket keeps a seeded thin
+        sample of its batches (same "every generation" contract as
+        :func:`collect_fit_maps`), so per-lag/per-shape coverage survives the
+        cap. None = full sweep (training loaders).
+        """
         self.dataset = dataset
         self.batch_size = batch_size
         self.seed = seed
         self._epoch = 0
+        self.max_batches = int(max_batches) if max_batches else None
         self.include_areas = set(int(a) for a in include_areas) if include_areas else None
         self.buckets: Dict[Tuple[int, int], List[int]] = {}
         for i, (h, w) in enumerate(dataset.pair_shapes()):
@@ -350,10 +360,19 @@ class CorrectorBatchSampler(Sampler):
             self.bucket_runs[shape] = runs
 
     def __len__(self) -> int:
+        if self.max_batches is None:
+            total = 0
+            for idxs in self.buckets.values():
+                bs = self._bucket_batch_size(idxs)
+                total += (len(idxs) + bs - 1) // bs
+            return total
         total = 0
+        n_pairs = max(len(self.dataset.pairs), 1)
         for idxs in self.buckets.values():
             bs = self._bucket_batch_size(idxs)
-            total += (len(idxs) + bs - 1) // bs
+            full = (len(idxs) + bs - 1) // bs
+            budget = max(1, int(round(self.max_batches * len(idxs) / n_pairs)))
+            total += min(full, budget)
         return total
 
     def _bucket_batch_size(self, idxs: List[int]) -> int:
@@ -366,25 +385,55 @@ class CorrectorBatchSampler(Sampler):
         self._epoch += 1
         gen = torch.Generator().manual_seed(self.seed + epoch)
         epoch_batches = []
+        n_pairs = max(len(self.dataset.pairs), 1)
         for shape, runs in self.bucket_runs.items():
             if not runs:
                 continue
             bs = self._bucket_batch_size(self.buckets[shape])
             rng.shuffle(runs)
+            # Per-generation run batch lists (batches stay generation-local so
+            # the dataset's generation LRU hits).
+            run_batches: List[List[List[int]]] = []
             carry: List[int] = []
             for run in runs:
                 w = self.dataset.weights[torch.tensor(run, dtype=torch.long)]
                 sub = torch.multinomial(w, num_samples=len(run), replacement=False,
                                         generator=gen).tolist()
                 full = carry + [run[j] for j in sub]
+                batches: List[List[int]] = []
                 k = 0
                 n = len(full)
                 while k + bs <= n:
-                    epoch_batches.append(full[k:k + bs])
+                    batches.append(full[k:k + bs])
                     k += bs
                 carry = full[k:]
+                run_batches.append(batches)
             if carry:
-                epoch_batches.append(carry)
+                if run_batches:
+                    run_batches[-1].append(carry)
+                else:
+                    run_batches.append([carry])
+            if self.max_batches is not None:
+                # Bucket budget proportional to its pair share; each run keeps
+                # a seeded thin sample of its batches so every generation
+                # still contributes (per-lag/per-shape coverage).
+                budget = max(1, int(round(self.max_batches * len(self.buckets[shape]) / n_pairs)))
+                total_b = sum(len(rb) for rb in run_batches)
+                for rb in run_batches:
+                    if not rb:
+                        continue
+                    if total_b <= budget:
+                        epoch_batches.extend(rb)
+                        continue
+                    q = max(1, int(round(budget * len(rb) / total_b)))
+                    if len(rb) <= q:
+                        epoch_batches.extend(rb)
+                    else:
+                        picked = rng.sample(range(len(rb)), q)
+                        epoch_batches.extend(rb[i] for i in sorted(picked))
+            else:
+                for rb in run_batches:
+                    epoch_batches.extend(rb)
         # NOTE: no final shuffle of the batch list — the per-generation run
         # order above keeps consecutive batches inside the same generation so
         # the dataset's generation LRU hits; the generation-order shuffle

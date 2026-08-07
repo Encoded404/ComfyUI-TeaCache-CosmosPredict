@@ -12,7 +12,7 @@ from collections import deque
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, NamedTuple, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 import torch
@@ -987,10 +987,10 @@ class TrainTimer:
 
     Mirrors the ScheduleEstimator pattern used by calibrate.py: train / eval /
     hessian / checkpoint phases are accumulated separately, and the projected
-    remaining time includes the eval + checkpoint overhead at every
-    ``eval_every`` boundary. The per-step rate is a median over a sliding
-    window — robust to Sophia hessian steps and lazy-decompression cache
-    misses (train_corrector.py, plan 6f/6h).
+    remaining time includes the eval + checkpoint overhead for each remaining
+    eval-plan entry (see ``train_corrector.build_eval_plan``). The per-step
+    rate is a median over a sliding window — robust to Sophia hessian steps
+    and lazy-decompression cache misses (train_corrector.py, plan 6f/6h).
     """
 
     def __init__(self, window: int = 100):
@@ -998,12 +998,19 @@ class TrainTimer:
         self._step_times = deque(maxlen=self._window)
         self._phases: dict = {}
         self._n_steps = 0
+        self._n_evals = 0
 
     def record_step(self, dt: float) -> None:
         """One completed training step (data fetch → backward → EMA)."""
         self._n_steps += 1
         self._step_times.append(dt)
         self._phases["train"] = self._phases.get("train", 0.0) + dt
+
+    def record_eval(self, dt: float) -> None:
+        """One completed eval phase (loop + checkpoints); tracks the count so
+        the per-eval cost feeds ETA projections regardless of the schedule."""
+        self._n_evals += 1
+        self.add("eval", dt)
 
     def add(self, phase: str, dt: float) -> None:
         """Accumulate a non-train phase (hessian, eval, checkpoint, ...)."""
@@ -1023,24 +1030,33 @@ class TrainTimer:
     def phase_seconds(self, phase: str) -> float:
         return self._phases.get(phase, 0.0)
 
-    def remaining_seconds(self, steps_left: int, eval_every: int) -> float:
-        """Projected wall time for ``steps_left`` steps, incl. eval phases."""
+    def remaining_seconds(self, steps_left: int, n_future_evals: int) -> float:
+        """Projected wall time for ``steps_left`` steps, incl. eval phases.
+
+        ``n_future_evals`` is the number of eval-plan entries still ahead of
+        the current step (computed by the caller from the plan); the per-eval
+        cost is the measured mean over evals run so far.
+        """
         st = self.step_time()
         if st <= 0 or steps_left <= 0:
             return 0.0
         total = st * steps_left
-        n_evals = steps_left // max(eval_every, 1)
-        per_eval = self._phases.get("eval", 0.0) / max(
-            self._n_steps // max(eval_every, 1), 1)
-        return total + n_evals * per_eval
+        per_eval = self._phases.get("eval", 0.0) / max(self._n_evals, 1)
+        return total + max(n_future_evals, 0) * per_eval
 
     def summary_lines(self, elapsed: float, done: int, total: int,
-                      eval_every: int) -> list[str]:
-        """Periodic report block (mirrors ScheduleEstimator.summary_lines)."""
+                      eval_plan: Optional[list] = None) -> list[str]:
+        """Periodic report block (mirrors ScheduleEstimator.summary_lines).
+
+        ``eval_plan`` is the sorted list of eval step numbers; the remaining
+        ETA and the "next eval" line are derived from it.
+        """
         W = 58
         pct = done / total * 100.0 if total else 100.0
         fmt = format_duration
-        eta = self.remaining_seconds(total - done, eval_every)
+        plan = eval_plan or []
+        n_future = sum(1 for s in plan if s > done)
+        eta = self.remaining_seconds(total - done, n_future)
         head = f"── timing report ({done} steps, {pct:.1f}%)"
         lines = [f"  {head} " + "─" * max(2, W - len(head) - 1)]
         lines.append(f"  {'elapsed':<12}{fmt(elapsed)}")
@@ -1057,9 +1073,11 @@ class TrainTimer:
                 parts.append(f"{label} {fmt(s)}")
         if parts:
             lines.append(f"  {'phases':<12}" + "  |  ".join(parts))
-        if eval_every > 0 and st > 0:
-            to_next = (eval_every - done % eval_every) * st
-            lines.append(f"  {'next eval':<12}~{fmt(to_next)}")
+        if plan and st > 0:
+            nxt = next((s for s in plan if s > done), None)
+            if nxt is not None:
+                to_next = (nxt - done) * st
+                lines.append(f"  {'next eval':<12}~{fmt(to_next)}")
         return lines
 
 

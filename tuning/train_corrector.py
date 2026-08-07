@@ -269,7 +269,20 @@ def parse_args(argv=None) -> argparse.Namespace:
                         help="Round-trip 0.75× random-scale augmentation "
                              "(config: scale_aug)")
     parser.add_argument("--max-steps", type=int, default=None)
-    parser.add_argument("--eval-every", type=int, default=None)
+    parser.add_argument("--eval-every", type=int, default=None,
+                        help="Initial eval interval (config: eval_every)")
+    parser.add_argument("--eval-schedule-growth", type=float, default=None,
+                        help="Geometric eval-interval growth factor per eval "
+                             "(1.0 = constant; config: eval_schedule_growth)")
+    parser.add_argument("--eval-interval-cap", type=int, default=None,
+                        help="Max eval interval after growth "
+                             "(config: eval_interval_cap)")
+    parser.add_argument("--eval-max-batches", type=int, default=None,
+                        help="Cap on eval batches per eval (0 = full eval set; "
+                             "config: eval_max_batches)")
+    parser.add_argument("--eval-full-k-every", type=int, default=None,
+                        help="Every N-th eval runs the full K ladder (1 = "
+                             "always; config: eval_full_k_every)")
     parser.add_argument("--compile", type=int, default=None,
                         help="torch.compile the corrector")
     parser.add_argument("--channels-last", type=int, default=None)
@@ -325,6 +338,10 @@ def resolve_config(args: argparse.Namespace) -> dict:
         "scale_aug": ("scale_aug", True),
         "max_steps": ("max_steps", 60000),
         "eval_every": ("eval_every", 500),
+        "eval_schedule_growth": ("eval_schedule_growth", 2.0),
+        "eval_interval_cap": ("eval_interval_cap", 32000),
+        "eval_max_batches": ("eval_max_batches", 256),
+        "eval_full_k_every": ("eval_full_k_every", 5),
         "seed": ("seed", 42),
         "cache_size": ("cache_size", 64),
         "recovery_fit_batches": ("recovery_fit_batches", 128),
@@ -386,12 +403,50 @@ def resolve_config(args: argparse.Namespace) -> dict:
     rc["stage1_areas"] = sorted(set(stage1_areas))
     cfg["cache_size"] = max(1, int(cfg["cache_size"]))
     cfg["num_workers"] = max(0, int(cfg["num_workers"]))
+    cfg["eval_every"] = max(int(cfg["eval_every"]), 1)
+    cfg["eval_schedule_growth"] = max(float(cfg["eval_schedule_growth"]), 1.0)
+    cfg["eval_interval_cap"] = max(int(cfg["eval_interval_cap"]), 0)
+    cfg["eval_max_batches"] = max(int(cfg["eval_max_batches"]), 0)
+    cfg["eval_full_k_every"] = max(int(cfg["eval_full_k_every"]), 1)
     cfg["out"] = args.out or str(Path(__file__).resolve().parent.parent / "models")
     cfg["data"] = args.data
     cfg["resume"] = args.resume
     cfg["metrics"] = args.metrics or str(Path(cfg["out"]) / "train_metrics.jsonl")
     cfg["no_progress"] = bool(args.no_progress) if args.no_progress is not None else False
     return cfg
+
+
+def build_eval_plan(cfg: dict) -> List[int]:
+    """Eval step numbers for the run: geometric schedule with eval points at
+    ``eval_every × eval_schedule_growth``^k (500, 1000, 2000, 4000, ...),
+    spacing capped at ``eval_interval_cap`` once the geometric step exceeds
+    it, and never beyond ``max_steps``.
+
+    Pure function of the config, so resume re-derives the same plan from the
+    checkpoint step — no schedule state to persist. ``growth <= 1.0`` keeps a
+    constant interval (legacy behavior).
+    """
+    max_steps = int(cfg["max_steps"])
+    first = max(int(cfg.get("eval_every", 500)), 1)
+    growth = float(cfg.get("eval_schedule_growth", 1.0))
+    cap = max(int(cfg.get("eval_interval_cap", 0)), 0)
+    plan: List[int] = []
+    step = 0
+    k = 0
+    while True:
+        if growth > 1.0:
+            nxt_geom = int(first * growth ** k)
+            if cap > 0 and nxt_geom > cap:
+                step += cap
+            else:
+                step = nxt_geom
+                k += 1
+        else:
+            step += first
+        if step > max_steps:
+            break
+        plan.append(step)
+    return plan
 
 
 # ── Training step (plan 6f) ───────────────────────────────────────────
@@ -469,25 +524,29 @@ def eval_model(model, eval_loader, lags: List[int], ks: List[int],
                 em["vm"].append(batch["v_ma"].float().cpu())
                 em["vt"].append(batch["v_true"].float().cpu())
                 em["anchor"].extend([lag == 0 for lag in lags_b])
-            for k in ks:
-                v = v0
-                for _ in range(k):
-                    v = v + model(x, v, prompt, t, pmask)
-                err = (v - vt).float().flatten(1).norm(dim=1)
-                den = vt.float().flatten(1).norm(dim=1) + 1e-8
-                rel = (err / den).tolist()
-                cos = F.cosine_similarity(v.float().flatten(1),
-                                          vt.float().flatten(1), dim=1).tolist()
-                for j, lag in enumerate(lags_b):
-                    if lag in lags:
-                        a = acc[(k, lag)]
-                        a[0] += rel[j]
-                        a[1] += cos[j]
-                        a[2] += 1
-                a = acc_shape.setdefault((k, hw), [0.0, 0.0, 0.0])
-                a[0] += sum(rel)
-                a[1] += sum(cos)
-                a[2] += len(rel)
+            # fp16 autocast, same precision path as the training step; the
+            # metrics are computed on .float() tensors below, so rel-MSE and
+            # cosine are unaffected by the autocast dtype.
+            with torch.autocast(device.type, dtype=torch.float16):
+                for k in ks:
+                    v = v0
+                    for _ in range(k):
+                        v = v + model(x, v, prompt, t, pmask)
+                    err = (v - vt).float().flatten(1).norm(dim=1)
+                    den = vt.float().flatten(1).norm(dim=1) + 1e-8
+                    rel = (err / den).tolist()
+                    cos = F.cosine_similarity(v.float().flatten(1),
+                                              vt.float().flatten(1), dim=1).tolist()
+                    for j, lag in enumerate(lags_b):
+                        if lag in lags:
+                            a = acc[(k, lag)]
+                            a[0] += rel[j]
+                            a[1] += cos[j]
+                            a[2] += 1
+                    a = acc_shape.setdefault((k, hw), [0.0, 0.0, 0.0])
+                    a[0] += sum(rel)
+                    a[1] += sum(cos)
+                    a[2] += len(rel)
     out = {}
     for (k, lag), (s_rel, s_cos, n) in acc.items():
         if n:
@@ -922,7 +981,10 @@ def main(argv=None):
     try:
         eval_ds = CorrectorDataset(data_dir, only_eval=True, seed=cfg["seed"],
                                    normalization_samples=0, manifest=manifest)
-        eval_sampler = CorrectorBatchSampler(eval_ds, batch_size=16, seed=cfg["seed"] + 1)
+        eval_max_batches = cfg["eval_max_batches"] or None
+        eval_sampler = CorrectorBatchSampler(eval_ds, batch_size=16,
+                                             seed=cfg["seed"] + 1,
+                                             max_batches=eval_max_batches)
         eval_loader = DataLoader(eval_ds, batch_sampler=eval_sampler,
                                  collate_fn=collate_corrector,
                                  num_workers=cfg["num_workers"],
@@ -1024,8 +1086,20 @@ def main(argv=None):
     eps = ds.rel_mse_eps
     k_max_final = cfg["refine_passes_max"] if cfg["multipass"] else 1
     # K=0 is the TeaCache base (v = v_MA, zero passes) — the recovery-table
-    # baseline; K>=1 are the corrector passes.
-    ks_eval = [0] + [k for k in (1, 2, 3) if k <= k_max_final]
+    # baseline; K>=1 are the corrector passes. The eval ladder alternates
+    # between the light [0,1] form (every eval) and the full form (every
+    # eval_full_k_every-th eval) to keep the K-robustness check without the
+    # 3× pass cost on every eval.
+    ks_eval_full = [0] + [k for k in (1, 2, 3) if k <= k_max_final]
+    ks_eval_light = [0] + ([1] if k_max_final >= 1 else [])
+    eval_plan = build_eval_plan(cfg)
+    next_eval = next((s for s in eval_plan if s > step), None)
+    n_evals_done = sum(1 for s in eval_plan if s <= step)
+    if eval_plan:
+        print(f"  Eval plan:      {eval_plan}")
+    else:
+        print(f"  Eval plan:      none (max_steps {cfg['max_steps']} < eval_every "
+              f"{cfg['eval_every']}) — training only")
     ceiling = load_linear_ceiling(data_dir)
     if ceiling is not None:
         print(f"  Linear ceiling: {ceiling:.4f} (1−R², probe) — did-it-learn target "
@@ -1144,18 +1218,21 @@ def main(argv=None):
                 K=k_max_cur,
                 it=f"{timer.steps_per_sec():.2f}/s",
                 rem=format_duration(timer.remaining_seconds(
-                    cfg["max_steps"] - step, cfg["eval_every"])),
+                    cfg["max_steps"] - step,
+                    sum(1 for s in eval_plan if s > step))),
                 refresh=False)
             pbar.update(1)
 
         if step % 50 == 0 or step == 1:
             wall = time.time() - t_start
+            rem_s = timer.remaining_seconds(
+                cfg["max_steps"] - step, sum(1 for s in eval_plan if s > step))
             line = (f"  [train] step {step:>6d}/{cfg['max_steps']}  "
                     f"loss={loss_v:.5f} (ema {loss_ema:.5f}, min {min_loss:.5f})  "
                     f"lr={opt.param_groups[0]['lr']:.2e}  "
                     f"it/s={timer.steps_per_sec():.2f}  "
                     f"elapsed={format_duration(wall)}  "
-                    f"remaining~{format_duration(timer.remaining_seconds(cfg['max_steps'] - step, cfg['eval_every']))}")
+                    f"remaining~{format_duration(rem_s)}")
             emit(line)
             metrics.write({
                 "type": "step", "step": step,
@@ -1166,8 +1243,10 @@ def main(argv=None):
                 "vram_gb": torch.cuda.max_memory_allocated() / (1024 ** 3),
             })
 
-        if step % cfg["eval_every"] == 0 and eval_loader is not None:
+        if step == next_eval and eval_loader is not None:
             t_e0 = time.time()
+            ks_eval = (ks_eval_full if n_evals_done % cfg["eval_full_k_every"] == 0
+                       else ks_eval_light)
             results, by_shape, eval_maps = eval_model(
                 model, eval_loader, lags, ks_eval, device,
                 eps, show_progress=(pbar is not None),
@@ -1216,8 +1295,9 @@ def main(argv=None):
                          "stopping per plan 6h")
                     step = cfg["max_steps"]
                     gate_fired = True
-            # K-robustness + per-lag coverage (report-only warnings)
-            if len(ks_eval) > 1:
+            # K-robustness + per-lag coverage (report-only warnings; needs the
+            # full ladder, so light [0,1] evals skip it)
+            if ks_eval[-1] > 1:
                 r1 = sum(v["rel_mse"] for (kk, _), v in results.items() if kk == 1)
                 r3 = sum(v["rel_mse"] for (kk, _), v in results.items() if kk == max(ks_eval))
                 nk = max(1, sum(1 for (kk, _) in results if kk == 1))
@@ -1257,9 +1337,12 @@ def main(argv=None):
                             wall_s=time.time() - t_start)
             emit(f"      saved corrector-{size}-{step}.safetensors"
                  + (f" (best K1={best:.4f} @ {best_step})" if best is not None else ""))
-            timer.add("eval", time.time() - t_e0)
+            timer.record_eval(time.time() - t_e0)
+            n_evals_done += 1
+            next_eval = (eval_plan[n_evals_done]
+                         if n_evals_done < len(eval_plan) else None)
             for line2 in timer.summary_lines(time.time() - t_start, step,
-                                             cfg["max_steps"], cfg["eval_every"]):
+                                             cfg["max_steps"], eval_plan):
                 emit(line2)
             metrics.write({
                 "type": "eval", "step": step, "k1": k1,
