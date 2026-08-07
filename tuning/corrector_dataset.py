@@ -548,7 +548,12 @@ class CorrectorBatchSampler(Sampler):
                 w = float(self.bucket_weights.get(shape, 1.0))
                 target = int(round(len(rbs) * w))
                 if target > len(rbs):
-                    rbs = rbs + rng.sample(rbs, target - len(rbs))
+                    # Whole-run replication (reps full copies + remainder
+                    # sample): rng.sample requires k <= len(rbs), which the
+                    # old target - len(rbs) k violated for weights > 2
+                    # (e.g. 128x128 at 2.5x crashed every full-mix epoch).
+                    reps, rem = divmod(target, len(rbs))
+                    rbs = rbs * reps + rng.sample(rbs, rem)
                 elif target < len(rbs):
                     rbs = rng.sample(rbs, target)
                 runs_meta.extend((shape, rb) for rb in rbs)
