@@ -292,6 +292,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--rho", type=float, default=None, help="Sophia clip")
     parser.add_argument("--hessian-every", type=int, default=None, help="Sophia k")
+    parser.add_argument("--batch-hessian-fraction", type=float, default=None,
+                        help="Fraction of the batch the Sophia Hessian estimate "
+                             "runs on (0, 1]; subsampling cuts double-backward "
+                             "VRAM ~linearly (config: batch_hessian_fraction)")
     parser.add_argument("--wd", type=float, default=None, help="weight decay")
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--ema-decay", type=float, default=None)
@@ -383,6 +387,7 @@ def resolve_config(args: argparse.Namespace) -> dict:
         "lr": ("lr", 4e-4),
         "rho": ("rho", 0.04),
         "hessian_every": ("hessian_every", 10),
+        "batch_hessian_fraction": ("batch_hessian_fraction", 0.5),
         "wd": ("wd", 0.05),
         "batch_size": ("batch_size", 32),
         "ema_decay": ("ema_decay", 0.9999),
@@ -441,6 +446,8 @@ def resolve_config(args: argparse.Namespace) -> dict:
         raise SystemExit(f"[train_corrector] normalization=perchannel needs "
                          f"--normalization-samples >= 1, got "
                          f"{cfg['normalization_samples']}")
+    cfg["batch_hessian_fraction"] = max(0.0, min(
+        float(cfg["batch_hessian_fraction"]), 1.0))
     rc = rt.get("resolution_curriculum") or {}
     if isinstance(rc, dict):
         cfg["resolution_curriculum"] = dict(rc)
@@ -1576,18 +1583,28 @@ def main(argv=None):
             # the fused SDPA backends (flash / memory-efficient) have no
             # second-order derivative, so build the graph on the math backend
             # (bmm/softmax/matmul — see SophiaG.update_hessian docstring).
+            # The estimate is a stochastic Hutchinson draw EMA'd across steps,
+            # so it runs on a fraction of the batch (batch_hessian_fraction) —
+            # the double-backward graph's VRAM scales ~linearly with it.
             with torch.autocast("cuda", enabled=False), \
                     torch.nn.attention.sdpa_kernel(
                         torch.nn.attention.SDPBackend.MATH):
-                dv = model(batch["x_t"].float(), batch["v_ma"].float(),
-                           batch["prompt"].float(), batch["t_frac"].float(),
-                           batch["prompt_mask"], lag=batch["lag"].float())
-                per_s = per_sample_rel_mse(batch["v_ma"].float() + dv,
-                                           batch["v_true"].float(), eps)
+                n_h = max(1, int(round(batch["x_t"].shape[0]
+                                       * cfg["batch_hessian_fraction"])))
+                hs = slice(0, n_h)
+                dv = model(batch["x_t"][hs].float(), batch["v_ma"][hs].float(),
+                           batch["prompt"][hs].float(), batch["t_frac"][hs].float(),
+                           batch["prompt_mask"][hs], lag=batch["lag"][hs].float())
+                per_s = per_sample_rel_mse(batch["v_ma"][hs].float() + dv,
+                                           batch["v_true"][hs].float(), eps)
                 if lag_scale_t is not None:
-                    per_s = per_s * lag_scale_t[batch["lag"]]
+                    per_s = per_s * lag_scale_t[batch["lag"][hs]]
                 loss_h = per_s.mean()
             opt.update_hessian(loss_h)
+            # The fp32 double-backward graph is only referenced by these
+            # locals; drop them now so it doesn't stay resident across the
+            # training forward/backward of this step and the next hessian step.
+            del loss_h, dv, per_s
             timer.add("hessian", time.time() - t_h0)
             profiler.end("hessian")
 
