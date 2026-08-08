@@ -229,7 +229,10 @@ Both nodes (`TeaCacheAnima`, `TeaCacheAnimaAdvanced`) gain optional inputs:
 
 - `corrector`: `off` | `latent_denoiser` (empty/missing `corrector_model`
   falls back to Mode A with a warning)
-- `corrector_model`: path to a `.safetensors` checkpoint
+- `corrector_model`: dropdown of `.safetensors` checkpoints, populated from
+  `ComfyUI/models/teacache_correctors/` (global) and the repo's `models/`
+  directory (the default `--out` of `train_corrector.py`); legacy workflows
+  with absolute paths still resolve
 - `refine_passes`: K (1–4, default 1)
 - `corrector_trust`: `v_final = v_MA + trust·(v̂ − v_MA)` (default 1.0)
 

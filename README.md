@@ -62,18 +62,23 @@ The `TeaCacheAnima` / `TeaCacheAnimaAdvanced` nodes add TeaCache for the
 Anima (Cosmos-Predict2-2B-Text2Image) model. Besides the TeaCache knobs, both
 nodes expose an optional **latent corrector** (Mode B′):
 
-- `corrector = latent_denoiser` + a `corrector_model` path enables it
+- `corrector = latent_denoiser` + a `corrector_model` selection enables it
   (`off` = standard Mode A, byte-for-byte unchanged; empty/missing model path
   falls back to Mode A with a warning);
 - `refine_passes` (K, default 1) and `corrector_trust` (default 1.0) tune the
   correction strength: `v_final = v_MA + trust·(v̂ − v_MA)`;
 - the info string shows `mode=B(K=…)` vs `mode=A`.
 
-Corrector checkpoints are trained with the tuning toolkit
-(`tuning/train_corrector.py`, see `tuning/README.md` — Latent-Space Refiner
-section) and ship as `.safetensors` files (default output: the repo's
-`models/` directory, e.g. `models/corrector-20m.safetensors`). Point
-`corrector_model` at that file. With a zero-initialized corrector, Mode B′
+`corrector_model` is a dropdown populated from two locations: the global
+`ComfyUI/models/teacache_correctors/` folder and the extension's own
+`models/` directory. Corrector checkpoints are trained with the tuning
+toolkit (`tuning/train_corrector.py`, see `tuning/README.md` — Latent-Space
+Refiner section) and ship as `.safetensors` files — the training default
+output is the extension's `models/` directory (e.g.
+`models/corrector-20m.safetensors`), so freshly trained checkpoints appear
+in the dropdown automatically. Drop files into either location and refresh
+the node to pick them up; workflows store the bare filename, so they are
+portable across machines. With a zero-initialized corrector, Mode B′
 reproduces Mode A exactly, so the feature is safe to try at any time.
 
 ## Installation

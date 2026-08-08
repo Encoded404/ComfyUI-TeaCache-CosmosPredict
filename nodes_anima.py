@@ -31,6 +31,79 @@ _DEFAULT_LPIPS_SCALE = 6.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  Corrector checkpoint discovery (Mode B′)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# The corrector_model widget is a combo populated from two search roots:
+#   ComfyUI/models/teacache_correctors/  (global model dir, dedicated subfolder)
+#   <this extension>/models/             (train_corrector.py's default --out)
+# Resolving by filename keeps workflows portable (no absolute paths).
+
+_CORRECTOR_FOLDER_KEY = "teacache_correctors"
+_CORRECTOR_FOLDERS_REGISTERED = False
+
+
+def _register_corrector_folders() -> None:
+    """Register the corrector checkpoint search roots with ComfyUI.
+
+    Idempotent; silently no-ops outside ComfyUI (tuning harness, tests).
+    Registration order = search precedence: the global models subfolder is
+    checked before the extension-local models/ dir.
+    """
+    global _CORRECTOR_FOLDERS_REGISTERED
+    if _CORRECTOR_FOLDERS_REGISTERED:
+        return
+    _CORRECTOR_FOLDERS_REGISTERED = True
+    try:
+        import folder_paths
+    except ImportError:
+        return
+    global_root = os.path.join(folder_paths.models_dir, "teacache_correctors")
+    os.makedirs(global_root, exist_ok=True)
+    folder_paths.add_model_folder_path(_CORRECTOR_FOLDER_KEY, global_root)
+    folder_paths.add_model_folder_path(
+        _CORRECTOR_FOLDER_KEY, str(Path(__file__).resolve().parent / "models")
+    )
+
+
+def _corrector_model_names() -> List[str]:
+    """Combo options for the corrector_model widget.
+
+    The leading "" means Mode A; the rest are discoverable checkpoint
+    filenames (deduplicated across the registered roots).
+    """
+    _register_corrector_folders()
+    try:
+        import folder_paths
+        names = folder_paths.get_filename_list(_CORRECTOR_FOLDER_KEY)
+    except ImportError:
+        names = []
+    return [""] + list(dict.fromkeys(names))
+
+
+def _resolve_corrector_model(value: str) -> str:
+    """Resolve the corrector_model widget value to an absolute path.
+
+    Prefers folder_paths resolution (bare filenames in either registered
+    root); falls back to the raw value for legacy workflows that saved
+    absolute paths. Returns "" when nothing valid was found.
+    """
+    value = (value or "").strip()
+    if not value:
+        return ""
+    _register_corrector_folders()
+    try:
+        import folder_paths
+        resolved = folder_paths.get_full_path(_CORRECTOR_FOLDER_KEY, value)
+        if resolved:
+            return resolved
+    except ImportError:
+        pass
+    p = Path(value).expanduser()
+    return str(p) if p.exists() else ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  Preset loading
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -401,8 +474,9 @@ class TeaCacheAnima:
                     {"default": "off",
                      "tooltip": "Post-process skip-step velocities with a trained latent corrector (Mode B′). Requires a corrector_model checkpoint."},
                 ),
-                "corrector_model": ("STRING", {"default": "",
-                    "tooltip": "Path to a corrector .safetensors checkpoint (trained by tuning/train_corrector.py). Empty = Mode A."}),
+                "corrector_model": (_corrector_model_names(),
+                    {"default": "",
+                     "tooltip": "Corrector .safetensors checkpoint (Mode B′; trained by tuning/train_corrector.py). Listed from ComfyUI/models/teacache_correctors/ and the extension's models/ dir. Empty = Mode A."}),
                 "refine_passes": ("INT", {"default": 1, "min": 1, "max": 4,
                     "tooltip": "K — iterative refinement passes (inference default 1; trained checkpoints support K ≤ 3)."}),
                 "corrector_trust": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
@@ -451,8 +525,8 @@ class TeaCacheAnima:
         # ── Mode B′ latent corrector (plan Task 5c) ──
         mode_b = False
         if kwargs.get("corrector", "off") == "latent_denoiser":
-            model_path = kwargs.get("corrector_model", "") or ""
-            if not model_path or not Path(model_path).exists():
+            model_path = _resolve_corrector_model(kwargs.get("corrector_model", ""))
+            if not model_path:
                 print(f"  [TeaCacheAnima] ⚠ corrector 'latent_denoiser' without a "
                       f"valid corrector_model — falling back to Mode A")
             else:
@@ -576,8 +650,9 @@ class TeaCacheAnimaAdvanced:
                     {"default": "off",
                      "tooltip": "Post-process skip-step velocities with a trained latent corrector (Mode B′). Requires a corrector_model checkpoint."},
                 ),
-                "corrector_model": ("STRING", {"default": "",
-                    "tooltip": "Path to a corrector .safetensors checkpoint (trained by tuning/train_corrector.py). Empty = Mode A."}),
+                "corrector_model": (_corrector_model_names(),
+                    {"default": "",
+                     "tooltip": "Corrector .safetensors checkpoint (Mode B′; trained by tuning/train_corrector.py). Listed from ComfyUI/models/teacache_correctors/ and the extension's models/ dir. Empty = Mode A."}),
                 "refine_passes": ("INT", {"default": 1, "min": 1, "max": 4,
                     "tooltip": "K — iterative refinement passes (inference default 1; trained checkpoints support K ≤ 3)."}),
                 "corrector_trust": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
@@ -610,8 +685,8 @@ class TeaCacheAnimaAdvanced:
         )
         mode_b = ""
         if kwargs.get("corrector", "off") == "latent_denoiser":
-            model_path = kwargs.get("corrector_model", "") or ""
-            if not model_path or not Path(model_path).exists():
+            model_path = _resolve_corrector_model(kwargs.get("corrector_model", ""))
+            if not model_path:
                 print(f"  [TeaCacheAnimaAdvanced] ⚠ corrector 'latent_denoiser' "
                       f"without a valid corrector_model — falling back to Mode A")
             else:
