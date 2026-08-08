@@ -5,10 +5,13 @@
 //  This ensures the new ComfyUI frontend includes their values in the
 //  prompt payload.
 //
-//  1.  An "overrides" combo (hide/show) toggles the override widgets.
+//  1.  The "overrides" combo (hide/show) toggles the override widgets.
 //  2.  Each dropdown shows conditional sub-widgets (e.g. residual_scale
 //      appears only when residual_strategy="scaled").
-//  3.  Widget state survives workflow save/reload via onSerialize/onConfigure.
+//  3.  The "corrector" switch is separate from the overrides: it is always
+//      visible and toggles the Mode B′ corrector widgets
+//      (corrector_model / refine_passes / corrector_trust).
+//  4.  Widget state survives workflow save/reload via onSerialize/onConfigure.
 
 (function () {
   function resolveApp() {
@@ -33,6 +36,8 @@
 
     // ---- Widget names (must match Python INPUT_TYPES['optional'] keys) ----
     var MAIN_OVERRIDES = ["residual_strategy", "block_mode", "accumulation_type", "step_schedule"];
+    var CORRECTOR_SWITCH = "corrector";
+    var CORRECTOR_WIDGETS = ["corrector_model", "refine_passes", "corrector_trust"];
     var CONDITIONALS = {
       residual_strategy: {
         blended:  "residual_blend",
@@ -46,13 +51,18 @@
         split_fraction: "always_fraction",
       },
     };
-    var ALL_NAMES = new Set(MAIN_OVERRIDES.concat("overrides"));
+    // Everything the overrides toggle controls: main overrides + conditional children.
+    var OVERRIDE_NAMES = MAIN_OVERRIDES.slice();
     for (var p in CONDITIONALS) {
       if (!CONDITIONALS.hasOwnProperty(p)) continue;
       for (var v in CONDITIONALS[p]) {
-        if (CONDITIONALS[p].hasOwnProperty(v)) ALL_NAMES.add(CONDITIONALS[p][v]);
+        if (CONDITIONALS[p].hasOwnProperty(v)) OVERRIDE_NAMES.push(CONDITIONALS[p][v]);
       }
     }
+    // Everything we (de)serialize: overrides + corrector group + the toggle itself.
+    var ALL_NAMES = new Set(
+      OVERRIDE_NAMES.concat(CORRECTOR_SWITCH, CORRECTOR_WIDGETS, "overrides")
+    );
 
     // ---- Helpers ----
     function getWidget(node, name) {
@@ -95,6 +105,21 @@
       }
     }
 
+    // Mode B′ corrector group: the "corrector" switch stays visible at all
+    // times and shows/hides its own sub-widgets, independent of the overrides.
+    function syncCorrector(node, saved) {
+      var dd = getWidget(node, CORRECTOR_SWITCH);
+      if (!dd) return;
+      var on = dd.value === "latent_denoiser";
+      for (var i = 0; i < CORRECTOR_WIDGETS.length; i++) {
+        var name = CORRECTOR_WIDGETS[i];
+        var w = getWidget(node, name);
+        if (!w) continue;
+        w.hidden = !on;
+        if (on && saved && saved[name] !== undefined) w.value = saved[name];
+      }
+    }
+
     function showOver(node, saved) {
       for (var i = 0; i < MAIN_OVERRIDES.length; i++) {
         setHidden(node, MAIN_OVERRIDES[i], false);
@@ -106,8 +131,8 @@
     }
 
     function hideOver(node) {
-      ALL_NAMES.forEach(function(n) {
-        if (n !== "overrides") setHidden(node, n, true);
+      OVERRIDE_NAMES.forEach(function(n) {
+        setHidden(node, n, true);
       });
     }
 
@@ -123,7 +148,7 @@
           if (origCreated) origCreated.call(this);
 
           // Override dropdown callbacks so conditional widgets respond
-          var attachCb = function(n, name) {
+          var attachCb = function(n, name, syncFn) {
             var w = getWidget(n, name);
             if (!w || w._tcHooked) return;
             w._tcHooked = true;
@@ -131,11 +156,12 @@
             w.callback = function(v, canvas, node_) {
               var nn = node_ || n;
               if (orig) orig.call(w, v, canvas, nn);
-              syncCond(nn, {});
+              syncFn(nn, {});
               reflow(nn);
             };
           };
-          for (var i = 0; i < MAIN_OVERRIDES.length; i++) attachCb(this, MAIN_OVERRIDES[i]);
+          for (var i = 0; i < MAIN_OVERRIDES.length; i++) attachCb(this, MAIN_OVERRIDES[i], syncCond);
+          attachCb(this, CORRECTOR_SWITCH, syncCorrector);
 
           // Add the "overrides" toggle at the end
           this.addWidget("combo", "overrides", "hide", function(v, canvas, node) {
@@ -145,8 +171,9 @@
             reflow(n);
           }, { values: ["hide", "show"] });
 
-          // Start with all override widgets hidden
+          // Start with all override widgets hidden, and the corrector group off
           hideOver(this);
+          syncCorrector(this, {});
         };
 
         var origConfigure = nodeType.prototype.onConfigure;
@@ -177,10 +204,15 @@
             } else {
               hideOver(this);
             }
+            // Restore the corrector switch and its sub-widgets
+            var corrW = getWidget(this, CORRECTOR_SWITCH);
+            if (corrW && saved.corrector !== undefined) corrW.value = saved.corrector;
+            syncCorrector(this, saved);
             reflow(this);
           } else {
             // No saved overrides — ensure override widgets stay hidden
             hideOver(this);
+            syncCorrector(this, {});
           }
         };
 
