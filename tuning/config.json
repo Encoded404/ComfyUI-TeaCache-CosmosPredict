@@ -126,6 +126,7 @@
         "loss": "rel_mse",
         "optimizer": "sophia",
         "lr": 4e-4,
+        "batch_hessian_fraction": 0.5,
         "batch_size": 32,
         "max_steps": 60000,
         "eval_every": 500,
