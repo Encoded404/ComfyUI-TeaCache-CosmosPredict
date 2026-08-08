@@ -69,6 +69,7 @@ def _make_control_point(p, target_error=None):
         "cosim_threshold": cfg.get("cosim_threshold", 0.95),
         "block_level": cfg.get("block_level", "unified"),
         "block_level_config_scope": cfg.get("block_level_config_scope", ["*"]),
+        "corrector_trust_map": cfg.get("corrector_trust_map", {}),
     }
 
     if target_error is not None and p.get("threshold_curve"):

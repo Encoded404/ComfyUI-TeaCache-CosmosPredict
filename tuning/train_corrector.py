@@ -19,6 +19,11 @@ pairs from a refiner recording run (``outputs/<ts>/refiner_data``). Supports:
   (per_lag[0], anchors_only);
 - checkpointing: EMA .safetensors per eval + best-by-eval (ladder-only K=1)
   + full-state .pt resume with config-drift warning (plan 6i);
+- resume semantics (plan v4 T6): ``--resume`` is crash-recovery only, valid
+  for a v4 checkpoint from the same config. v3 snapshots (single head) keep
+  hard-failing on the missing per-stratum-head keys — that failure is the
+  desired guard; the single-head → multi-head reconcile exists only in
+  ``load_corrector`` (baseline A/B eval), never in the trainer resume path;
 - live reporting: tqdm progress bar (EMA loss, lr, K, it/s, remaining),
   per-50-step durable log lines, per-eval timing reports (train/eval/hessian
   phases; the ETA projects eval + checkpoint overhead), VRAM peak, and a
@@ -44,8 +49,9 @@ Prototype upgrades (v2 training):
   replayed at every eval (identical K=0 base across evals), and the EMA
   model is what gets evaluated / best-selected (it is what ships);
 - resolution curriculum ramp: stage 1 → full mix interpolates over
-  ``stage2_ramp_fraction`` of the run instead of a hard switch, and
-  ``resolution_weights`` upweight the 1024² buckets;
+  ``stage2_ramp_fraction`` of the run instead of a hard switch (v4: disabled
+  — stationary full mix from step 0), and ``bucket_weights`` upweight the
+  1024² buckets' share of optimizer steps (independent of the curriculum);
 - de-bursted training batches: the epoch's generation runs are merged
   round-robin in windows (``--deburst-windows``, default on) so consecutive
   batches come from different generations while the active window stays in
@@ -63,6 +69,7 @@ Usage:
 
 import argparse
 import json
+import math
 import queue
 import random
 import threading
@@ -250,6 +257,224 @@ def ema_update(model: nn.Module, ema: Dict[str, torch.Tensor], step: int,
                 ema[k].copy_(v)
 
 
+# ── Stratum gradient tracker (plan v4 T2/T5) ──────────────────────────
+
+
+def _shape_label(hw: Tuple[int, int]) -> str:
+    """Canonical stratum label ``HxW`` with H ≤ W.
+
+    rot90 augmentation transposes 64×128 → 128×64 but preserves the area
+    (same stratum, same head); canonicalizing keeps the loss-EMA / grad-norm
+    / cosine keys stable under augmentation.
+    """
+    return f"{min(hw)}x{max(hw)}"
+
+
+class StratumGradTracker:
+    """Per-stratum gradient buffers + EMA reference directions + per-stratum
+    loss EMA (plan v4 T2/T5): one implementation of per-shape gradient
+    accumulation, consumed by the per-step diagnostics and the T5 gradient
+    surgery. Always on: with ``grad_surgery=none`` the combine step writes
+    back the same summed gradient as the v3 accumulation path (bit-close —
+    per-shape buffers are summed in first-seen order).
+
+    Per-step lifecycle (called from the training loop):
+      ``begin_step()`` clears the first-seen shape order;
+      ``record_micro(shape, loss)`` — after each micro ``backward()`` — moves
+      ``p.grad`` into ``buffers[shape]`` (setting ``p.grad = None``) and
+      records the micro loss;
+      ``combine(mode)`` updates the per-shape EMA refs, runs the mode's
+      surgery on the fresh buffers, and writes the summed gradient back into
+      ``p.grad`` (first-seen order — with ``none`` this reproduces today's
+      gradient).
+    """
+
+    def __init__(self, model: nn.Module, device):
+        inner = getattr(model, "_orig_mod", model)
+        self._params = [(name, p) for name, p in inner.named_parameters()
+                        if p.requires_grad]
+        self.device = device
+        self.buffers: Dict[str, Dict[str, torch.Tensor]] = {}
+        self.refs: Dict[str, Dict[str, torch.Tensor]] = {}
+        self.order: List[str] = []
+        self.loss_ema: Dict[str, float] = {}
+        self.last_grad_norms: Dict[str, float] = {}
+
+    def begin_step(self) -> None:
+        self.order = []
+
+    def record_micro(self, shape: Tuple[int, int], loss: Optional[float]) -> None:
+        """Move the micro-batch's grads into the per-shape buffer."""
+        label = _shape_label(shape)
+        buf = self.buffers.get(label)
+        if buf is None:
+            buf = {}
+            self.buffers[label] = buf
+            self.order.append(label)
+        for name, p in self._params:
+            g = p.grad
+            if g is None:
+                continue
+            t = buf.get(name)
+            if t is None:
+                buf[name] = g.detach().clone()
+            else:
+                t.add_(g)
+            p.grad = None
+        if loss is not None and loss == loss:
+            prev = self.loss_ema.get(label)
+            self.loss_ema[label] = loss if prev is None else 0.99 * prev + 0.01 * loss
+
+    def combine(self, mode: str) -> None:
+        """End-of-step combine: EMA refs → surgery → first-seen-order sum.
+
+        ``mode``: ``"none"`` (sum the fresh buffers — today's gradient),
+        ``"pcgrad-ema"`` (conflicts decided from the EMA refs, dead-zone
+        |cos| < 0.1, pairwise projection of the fresh buffers),
+        ``"mgda"`` (min-norm combination over the (S−1)-simplex, 200-point
+        grid per dimension over the Gram matrix).
+        """
+        if not self.order:
+            return
+        # EMA reference directions: ref_s = 0.9·ref_s + 0.1·g_s, only for the
+        # shapes seen this step (maintained regardless of the surgery mode).
+        for label in self.order:
+            buf = self.buffers[label]
+            ref = self.refs.get(label)
+            if ref is None:
+                self.refs[label] = {k: v.detach().clone() for k, v in buf.items()}
+            else:
+                for name, t in buf.items():
+                    r = ref.get(name)
+                    if r is None:
+                        ref[name] = t.detach().clone()
+                    else:
+                        r.mul_(0.9).add_(t, alpha=0.1)
+        # Per-stratum grad norms of the FRESH buffers (eval diagnostics).
+        for label in self.order:
+            buf = self.buffers[label]
+            if buf:
+                self.last_grad_norms[label] = math.sqrt(
+                    sum(float(t.square().sum()) for t in buf.values()))
+        if mode == "pcgrad-ema":
+            self._pcgrad_ema_project()
+        elif mode == "mgda":
+            self._mgda_combine()
+        # Sum in first-seen order into p.grad — with mode "none" this is
+        # today's gradient (identical accumulation order per shape).
+        for name, p in self._params:
+            g = None
+            for label in self.order:
+                t = self.buffers[label].get(name)
+                if t is None:
+                    continue
+                g = t if g is None else g + t
+            p.grad = g
+        self.buffers = {}
+
+    def _dot(self, a: str, b: str) -> float:
+        """Σ_params dot of two per-shape buffers (missing keys = zeros)."""
+        ba, bb = self.buffers[a], self.buffers[b]
+        tot = 0.0
+        for name, t in ba.items():
+            u = bb.get(name)
+            if u is not None:
+                tot += float((t * u).sum())
+        return tot
+
+    def _ref_cosine(self, a: str, b: str) -> Optional[float]:
+        """Cosine of the EMA reference directions (missing keys = zeros)."""
+        ra, rb = self.refs.get(a), self.refs.get(b)
+        if not ra or not rb:
+            return None
+        dot = na2 = nb2 = 0.0
+        for name, t in ra.items():
+            u = rb.get(name)
+            if u is None:
+                na2 += float(t.square().sum())
+                continue
+            dot += float((t * u).sum())
+            na2 += float(t.square().sum())
+            nb2 += float(u.square().sum())
+        for name, u in rb.items():
+            if name not in ra:
+                nb2 += float(u.square().sum())
+        den = math.sqrt(na2 * nb2)
+        if den <= 0:
+            return None
+        return dot / den
+
+    def _project_pair(self, a: str, b: str) -> None:
+        """PCGrad projection of the fresh buffers onto each other's normal
+        plane: g_a ← g_a − (g_a·g_b/‖g_b‖²)·g_b and symmetrically for g_b.
+        Both projections use the ORIGINAL pair — the buffers are mutated in
+        place, so the first buffer is snapshotted (one transient copy of the
+        smaller buffer) before any in-place update."""
+        ba, bb = self.buffers[a], self.buffers[b]
+        a_orig = {name: t.clone() for name, t in ba.items()}
+        for name, ga0 in a_orig.items():
+            gb = bb.get(name)
+            if gb is None:
+                continue
+            dot = float((ga0 * gb).sum())
+            bb2 = float(gb.square().sum())
+            aa2 = float(ga0.square().sum())
+            if bb2 > 0:
+                ba[name].sub_(gb, alpha=dot / bb2)
+            if aa2 > 0:
+                bb[name].sub_(ga0, alpha=dot / aa2)
+
+    def _pcgrad_ema_project(self) -> None:
+        """PCGrad-EMA (plan v4 T5): conflicts decided from the EMA refs with a
+        |cos| < 0.1 dead-zone; only conflicting pairs are projected. The
+        combine then SUMS the projected buffers (no equal-averaging — the
+        deployment sampling mix 63/20/17 is preserved)."""
+        S = len(self.order)
+        for i in range(S):
+            for j in range(i + 1, S):
+                c = self._ref_cosine(self.order[i], self.order[j])
+                if c is None or c >= -0.1:   # dead-zone: no conflict
+                    continue
+                self._project_pair(self.order[i], self.order[j])
+
+    def _mgda_combine(self) -> None:
+        """MGDA min-norm combine (plan v4 T5): ‖Σ λ_s g_s‖² = λᵀGλ over the
+        (S−1)-simplex, grid-searched at 200 points per dimension; the argmin
+        weights reweight the buffers before the first-seen-order sum."""
+        S = len(self.order)
+        if S < 2:
+            return
+        if S > 3:
+            raise NotImplementedError(
+                f"[train_corrector] mgda simplex grid supports S<=3 strata, "
+                f"got S={S}")
+        gram = [[self._dot(self.order[i], self.order[j]) for j in range(S)]
+                for i in range(S)]
+        grid = 200
+        best, best_w = None, None
+        if S == 2:
+            for i in range(grid + 1):
+                w = (i / grid, 1.0 - i / grid)
+                n2 = sum(w[s] * w[t] * gram[s][t]
+                         for s in range(2) for t in range(2))
+                if best is None or n2 < best:
+                    best, best_w = n2, w
+        else:  # S == 3: 200×200 grid over the 2-simplex
+            for i in range(grid + 1):
+                for j in range(grid + 1 - i):
+                    w = (i / grid, j / grid, 1.0 - (i + j) / grid)
+                    n2 = sum(w[s] * w[t] * gram[s][t]
+                             for s in range(3) for t in range(3))
+                    if best is None or n2 < best:
+                        best, best_w = n2, w
+        self.buffers = {
+            label: {name: t * best_w[i] for name, t in buf.items()}
+            for i, (label, buf) in enumerate(
+                [(l, self.buffers[l]) for l in self.order])}
+        if best_w is not None and best is not None:
+            self.last_mgda_norm2 = best
+
+
 # ── Config resolution (plan 1b/6i: config defaults → CLI overrides) ────
 
 
@@ -318,6 +543,16 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--scale-aug", type=int, default=None,
                         help="Round-trip 0.75× random-scale augmentation "
                              "(config: scale_aug)")
+    parser.add_argument("--shape-loss-weights", type=str, default=None,
+                        help="Per-stratum loss weights as JSON, e.g. "
+                             "'{\"64x64\": 1.0, \"64x128\": 1.25, "
+                             "\"128x128\": 2.0}' (config: shape_loss_weights)")
+    parser.add_argument("--grad-surgery", type=str, default=None,
+                        choices=["none", "pcgrad-ema", "mgda"],
+                        help="Cross-stratum gradient surgery mode: 'none' "
+                             "(default), 'pcgrad-ema' (conflicts from the EMA "
+                             "refs, dead-zone |cos| < 0.1), 'mgda' (min-norm "
+                             "over the simplex) (config: grad_surgery)")
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--eval-every", type=int, default=None,
                         help="Initial eval interval (config: eval_every)")
@@ -333,6 +568,34 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--eval-full-k-every", type=int, default=None,
                         help="Every N-th eval runs the full K ladder (1 = "
                              "always; config: eval_full_k_every)")
+    parser.add_argument("--beacon-enabled", type=int, default=None,
+                        help="Frequent cheap fixed-subset eval (config: "
+                             "beacon_enabled)")
+    parser.add_argument("--beacon-every", type=int, default=None,
+                        help="Beacon eval cadence in steps (config: beacon_every)")
+    parser.add_argument("--beacon-max-batches", type=int, default=None,
+                        help="Beacon eval budget, fixed replay (config: "
+                             "beacon_max_batches)")
+    parser.add_argument("--beacon-min-batches-per-shape", type=int, default=None,
+                        help="Beacon eval floor per shape bucket (config: "
+                             "beacon_min_batches_per_shape)")
+    parser.add_argument("--beacon-lr-control", type=int, default=None,
+                        help="Beacon-driven plateau LR decay (config: "
+                             "beacon_lr_control)")
+    parser.add_argument("--beacon-lr-patience", type=int, default=None,
+                        help="Beacon evals without ladder-only-K1 improvement "
+                             "before decaying lr (config: beacon_lr_patience)")
+    parser.add_argument("--beacon-lr-factor", type=float, default=None,
+                        help="LR decay factor on plateau (config: "
+                             "beacon_lr_factor)")
+    parser.add_argument("--beacon-lr-floor", type=float, default=None,
+                        help="LR decay floor (config: beacon_lr_floor)")
+    parser.add_argument("--beacon-select-best", type=int, default=None,
+                        help="Beacon drives best-checkpoint selection "
+                             "(config: beacon_select_best)")
+    parser.add_argument("--beacon-save-state", type=int, default=None,
+                        help="Beacon also saves the full-state checkpoint for "
+                             "crash recovery (config: beacon_save_state)")
     parser.add_argument("--compile", type=int, default=None,
                         help="torch.compile the corrector")
     parser.add_argument("--channels-last", type=int, default=None)
@@ -354,7 +617,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                              "producer-thread data path (0 = off, main-thread "
                              "fetch; config: refiner_training.prefetch_queue)")
     parser.add_argument("--resume", type=str, default=None,
-                        help="Resume from a full-state .pt checkpoint")
+                        help="Resume from a full-state .pt checkpoint "
+                             "(crash recovery only — same-config v4 "
+                             "checkpoints; v3 snapshots hard-fail on the "
+                             "missing per-stratum-head keys, plan v4 T6)")
     parser.add_argument("--out", type=str, default=None,
                         help="Checkpoint output dir (default: <repo>/models)")
     parser.add_argument("--metrics", type=str, default=None,
@@ -409,6 +675,18 @@ def resolve_config(args: argparse.Namespace) -> dict:
         "recovery_eval_batches": ("recovery_eval_batches", 64),
         "num_workers": ("num_workers", 4),
         "prefetch_queue": ("prefetch_queue", 0),
+        "shape_loss_weights": ("shape_loss_weights", {}),
+        "grad_surgery": ("grad_surgery", "none"),
+        "beacon_enabled": ("beacon_enabled", False),
+        "beacon_every": ("beacon_every", 500),
+        "beacon_max_batches": ("beacon_max_batches", 96),
+        "beacon_min_batches_per_shape": ("beacon_min_batches_per_shape", 8),
+        "beacon_lr_control": ("beacon_lr_control", True),
+        "beacon_lr_patience": ("beacon_lr_patience", 6),
+        "beacon_lr_factor": ("beacon_lr_factor", 0.5),
+        "beacon_lr_floor": ("beacon_lr_floor", 2e-5),
+        "beacon_select_best": ("beacon_select_best", True),
+        "beacon_save_state": ("beacon_save_state", True),
     }
     cfg = {}
     for flag, (key, default) in mapping.items():
@@ -473,18 +751,56 @@ def resolve_config(args: argparse.Namespace) -> dict:
             w, h = refiner_data.parse_resolution(str(spec))
         stage1_areas.append(w * h)
     rc["stage1_areas"] = sorted(set(stage1_areas))
-    # Per-shape bucket upweights ("HxW" → multiplier) for the training
-    # sampler. Kept as string keys in the config dict (JSON-serializable for
-    # the checkpoint snapshot); converted to (h, w) tuples at sampler build.
-    resolution_weights = {}
-    for key, value in (rc.get("resolution_weights") or {}).items():
+    # Bucket (per-shape) sampling upweights — the training mix, independent
+    # of the resolution curriculum: they are applied by the sampler whether
+    # or not the curriculum is enabled. Kept as string "HxW" keys in the
+    # config dict (JSON-serializable for the checkpoint snapshot); converted
+    # to (h, w) tuples at sampler build. Legacy configs that still nest them
+    # as ``resolution_curriculum.resolution_weights`` are accepted unchanged.
+    bw_src = rt.get("bucket_weights")
+    if bw_src is None:
+        bw_src = (rt.get("resolution_curriculum") or {}).get("resolution_weights") or {}
+    if not isinstance(bw_src, dict):
+        raise SystemExit(f"[train_corrector] bucket_weights must be a dict, "
+                         f"got {type(bw_src).__name__}")
+    bucket_weights = {}
+    for key, value in bw_src.items():
         try:
             h, w = (int(x) for x in str(key).split("x"))
         except ValueError:
-            raise SystemExit(f"[train_corrector] invalid resolution_weights key "
+            raise SystemExit(f"[train_corrector] invalid bucket_weights key "
                              f"{key!r} (expected 'HxW')")
-        resolution_weights[str(key)] = max(0.0, float(value))
-    rc["resolution_weights"] = resolution_weights
+        bucket_weights[str(key)] = max(0.0, float(value))
+    cfg["bucket_weights"] = bucket_weights
+    rc.pop("resolution_weights", None)  # legacy key — moved to bucket_weights
+    # Per-stratum loss weights (plan v4 T4): string "HxW" keys (H ≤ W —
+    # canonical label; rot90'd batches match via _shape_label), kept as
+    # string keys in the config dict (JSON-serializable for the checkpoint
+    # snapshot). Empty dict = zero behavior change.
+    slw = cfg.get("shape_loss_weights") or {}
+    if isinstance(slw, str):
+        try:
+            slw = json.loads(slw)
+        except json.JSONDecodeError:
+            raise SystemExit(f"[train_corrector] invalid --shape-loss-weights "
+                             f"{slw!r} (expected JSON dict of 'HxW' → float)")
+    if not isinstance(slw, dict):
+        raise SystemExit(f"[train_corrector] shape_loss_weights must be a dict, "
+                         f"got {type(slw).__name__}")
+    slw_parsed = {}
+    for key, value in slw.items():
+        try:
+            h, w = (int(x) for x in str(key).split("x"))
+        except ValueError:
+            raise SystemExit(f"[train_corrector] invalid shape_loss_weights key "
+                             f"{key!r} (expected 'HxW')")
+        slw_parsed[_shape_label((h, w))] = max(0.0, float(value))
+    cfg["shape_loss_weights"] = slw_parsed
+    surgery = str(cfg.get("grad_surgery", "none")).strip().lower()
+    if surgery not in ("none", "pcgrad-ema", "mgda"):
+        raise SystemExit(f"[train_corrector] invalid --grad-surgery {surgery!r} "
+                         f"(none | pcgrad-ema | mgda)")
+    cfg["grad_surgery"] = surgery
     cfg["cache_size"] = max(1, int(cfg["cache_size"]))
     cfg["num_workers"] = max(0, int(cfg["num_workers"]))
     cfg["prefetch_queue"] = max(0, int(cfg["prefetch_queue"]))
@@ -493,6 +809,19 @@ def resolve_config(args: argparse.Namespace) -> dict:
     cfg["eval_interval_cap"] = max(int(cfg["eval_interval_cap"]), 0)
     cfg["eval_max_batches"] = max(int(cfg["eval_max_batches"]), 0)
     cfg["eval_full_k_every"] = max(int(cfg["eval_full_k_every"]), 1)
+    # Beacon eval (plan v4): frequent fixed-subset eval for LR control and
+    # fine-grained best-checkpoint selection. Opt-in — the repo config ships
+    # it enabled; older configs without the keys keep the v3 behavior.
+    cfg["beacon_enabled"] = bool(cfg["beacon_enabled"])
+    cfg["beacon_every"] = max(int(cfg["beacon_every"]), 1)
+    cfg["beacon_max_batches"] = max(int(cfg["beacon_max_batches"]), 0)
+    cfg["beacon_min_batches_per_shape"] = max(int(cfg["beacon_min_batches_per_shape"]), 0)
+    cfg["beacon_lr_control"] = bool(cfg["beacon_lr_control"])
+    cfg["beacon_lr_patience"] = max(int(cfg["beacon_lr_patience"]), 1)
+    cfg["beacon_lr_factor"] = max(0.0, min(float(cfg["beacon_lr_factor"]), 1.0))
+    cfg["beacon_lr_floor"] = max(float(cfg["beacon_lr_floor"]), 0.0)
+    cfg["beacon_select_best"] = bool(cfg["beacon_select_best"])
+    cfg["beacon_save_state"] = bool(cfg["beacon_save_state"])
     cfg["out"] = args.out or str(Path(__file__).resolve().parent.parent / "models")
     cfg["data"] = args.data
     cfg["resume"] = args.resume
@@ -520,7 +849,7 @@ def build_eval_plan(cfg: dict) -> List[int]:
     k = 0
     while True:
         if growth > 1.0:
-            nxt_geom = int(first * growth ** k)
+            nxt_geom = int(round(first * growth ** k))
             if cap > 0 and nxt_geom > cap:
                 step += cap
             else:
@@ -540,7 +869,8 @@ def build_eval_plan(cfg: dict) -> List[int]:
 def compute_train_loss(model, batch, Ks: torch.Tensor, loss_fn, eps: float,
                        stop_grad: bool, multipass: bool,
                        k_max: int,
-                       lag_scale: Optional[torch.Tensor] = None) -> torch.Tensor:
+                       lag_scale: Optional[torch.Tensor] = None,
+                       shape_weights: Optional[Dict[str, float]] = None) -> torch.Tensor:
     """Masked-K on-policy deep-supervised loss (plan 6f, deep-dive §5.4/§6.1).
 
     Pass i supervises the model's own i-th pass output against v_true with
@@ -549,10 +879,18 @@ def compute_train_loss(model, batch, Ks: torch.Tensor, loss_fn, eps: float,
 
     ``lag_scale`` (optional, indexed by lag value) multiplies each sample's
     loss so per-lag gradient mass is not dominated by the hardest lags.
+
+    ``shape_weights`` (optional, plan v4 T4) — per-stratum loss weights keyed
+    ``"HxW"`` (``H ≤ W``) — multiply each sample's loss after the lag scale
+    (composes multiplicatively). Default None = zero behavior change.
     """
     x, v, vt = batch["x_t"], batch["v_ma"].clone(), batch["v_true"]
     prompt, pmask, t = batch["prompt"], batch["prompt_mask"], batch["t_frac"]
     lag = batch["lag"]
+    w_shape = None
+    if shape_weights:
+        w_shape = shape_weights.get(_shape_label(
+            (int(x.shape[-2]), int(x.shape[-1]))))
     total = torch.zeros((), device=x.device, dtype=torch.float32)
     n_active = torch.zeros((), device=x.device)
     for i in range(1, k_max + 1):
@@ -565,6 +903,8 @@ def compute_train_loss(model, batch, Ks: torch.Tensor, loss_fn, eps: float,
         per_sample = loss_fn(v_new, vt[mask], eps)
         if lag_scale is not None:
             per_sample = per_sample * lag_scale[lag[mask]]
+        if w_shape is not None and w_shape != 1.0:
+            per_sample = per_sample * w_shape
         # deep-supervision weight: i / Σ_{j=1}^{K_s} j per sample
         k_s = Ks[mask].float()
         w = i / (k_s * (k_s + 1) / 2)
@@ -1125,13 +1465,54 @@ def _async_save_full_state(snapshot: dict, path, pending: List[threading.Thread]
 def config_drift(snapshot: dict, cfg: dict) -> List[str]:
     keys = ["model_size", "depth", "optimizer", "lr", "batch_size", "loss",
             "max_steps", "refine_passes_max", "multipass",
-            "resolution_curriculum", "accumulate_big_batches", "scale_aug",
-            "recovery_fit_batches", "recovery_eval_batches"]
+            "resolution_curriculum", "bucket_weights",
+            "accumulate_big_batches", "scale_aug",
+            "recovery_fit_batches", "recovery_eval_batches",
+            # plan v4 (T6): everything that changes model behavior/weights —
+            # a v4 run must never silently resume a differently-configured one
+            "normalization", "lag_cond", "res_cond", "lag_loss_normalize",
+            "ema_decay", "wd", "rho", "hessian_every",
+            "batch_hessian_fraction", "shape_loss_weights", "grad_surgery",
+            "eval_schedule_growth", "eval_interval_cap",
+            # beacon: LR control changes the resumed trajectory; the rest of
+            # the beacon keys are decision/IO machinery
+            "beacon_enabled", "beacon_every", "beacon_lr_control",
+            "beacon_lr_patience", "beacon_lr_factor", "beacon_lr_floor"]
     drift = []
     for k in keys:
         if snapshot.get(k) != cfg.get(k):
             drift.append(f"  {k}: checkpoint={snapshot.get(k)!r} current={cfg.get(k)!r}")
     return drift
+
+
+# ── Beacon eval (plan v4: frequent fixed-subset eval + LR control) ─────
+
+
+def _beacon_decay_lr(opt, scheduler, factor: float, floor: float) -> Optional[float]:
+    """Multiplicative LR decay for the beacon's plateau controller.
+
+    Multiplies the optimizer's group lrs AND the attached schedulers'
+    ``base_lrs`` (floored at ``floor``), so the cosine continues from the
+    decayed level: CosineAnnealingLR/LinearLR recompute each step's lr from
+    ``base_lrs``, so scaling only ``param_groups[0]['lr']`` would be undone on
+    the next ``scheduler.step()``. ``base_lrs`` is serialized in the
+    scheduler's state_dict, so decays survive checkpoints.
+
+    Returns the new group-0 lr, or None when there is no scheduler to keep in
+    sync (schedule-free optimizer — constant lr, no beacon decay).
+    """
+    if scheduler is None:
+        return None
+    subs = getattr(scheduler, "schedulers", None) \
+        or getattr(scheduler, "_schedulers", None)
+    subs = list(subs) if subs else [scheduler]
+    for g in opt.param_groups:
+        g["lr"] = max(g["lr"] * factor, floor)
+    for s in subs:
+        bl = getattr(s, "base_lrs", None)
+        if bl:
+            s.base_lrs = [max(b * factor, floor) for b in bl]
+    return opt.param_groups[0]["lr"]
 
 
 # ── Main ──────────────────────────────────────────────────────────────
@@ -1162,6 +1543,20 @@ def main(argv=None):
           f"lag-loss-norm={cfg['lag_loss_normalize']}  de-burst={cfg['deburst_windows']}")
     print(f"  Loss:           {cfg['loss']}   batch={cfg['batch_size']}  "
           f"max_steps={cfg['max_steps']}")
+    print(f"  Strata:         grad_surgery={cfg['grad_surgery']}  "
+          f"shape_loss_weights={cfg['shape_loss_weights'] or 'off'}  "
+          f"bucket_weights={cfg['bucket_weights'] or 'uniform'}")
+    print(f"  Eval cadence:   eval_every={cfg['eval_every']}  "
+          f"growth={cfg['eval_schedule_growth']}  cap={cfg['eval_interval_cap']}")
+    print(f"  Beacon:         {'enabled' if cfg['beacon_enabled'] else 'disabled'}"
+          + (f"  every {cfg['beacon_every']} steps, {cfg['beacon_max_batches']} "
+             f"batches (shape floor {cfg['beacon_min_batches_per_shape']}), "
+             f"lr_control={cfg['beacon_lr_control']} "
+             f"(patience {cfg['beacon_lr_patience']}, factor "
+             f"{cfg['beacon_lr_factor']}, floor {cfg['beacon_lr_floor']:.0e})  "
+             f"select_best={cfg['beacon_select_best']}  "
+             f"save_state={cfg['beacon_save_state']}"
+             if cfg["beacon_enabled"] else ""))
     print(f"  Cache:          {cfg['cache_size']} generations   "
           f"loader workers: {cfg['num_workers']}   "
           f"prefetch queue: {cfg['prefetch_queue']}")
@@ -1196,9 +1591,12 @@ def main(argv=None):
     # stage2_ramp_fraction of the run (no hard switch — hard switches let the
     # 64×64-learned field degrade the 1024² strata it never trained on).
     curriculum = cfg["resolution_curriculum"]
-    # Tuple-keyed view for the sampler (bucket keys are (h, w) tuples).
+    # Tuple-keyed view of the bucket weights for the sampler (bucket keys are
+    # (h, w) tuples). Applied regardless of the curriculum — bucket_weights
+    # is the stationary training mix, the curriculum only schedules the
+    # optional stage-1/ramp.
     res_weights = {}
-    for key, value in (curriculum.get("resolution_weights") or {}).items():
+    for key, value in cfg["bucket_weights"].items():
         h, w = (int(x) for x in key.split("x"))
         res_weights[(h, w)] = value
     sampler = CorrectorBatchSampler(
@@ -1264,6 +1662,30 @@ def main(argv=None):
                                  pin_memory=cfg["num_workers"] > 0)
     except ValueError as e:
         print(f"  ⚠ no eval generations — eval loop and gates skipped ({e})")
+    # Beacon eval (plan v4): a small FIXED replay of the eval set, evaluated
+    # every ``beacon_every`` steps — cheap enough (~3–5 s at 96 batches) for
+    # sub-2k cadence. Reuses eval_model/recovery_rows, so the metric
+    # (ladder-only K1 on the EMA model) is identical to the full eval by
+    # construction; only the sample is smaller. Drives the plateau LR
+    # controller and (optionally) best-checkpoint selection.
+    beacon_loader = None
+    if eval_loader is not None and cfg["beacon_enabled"]:
+        try:
+            beacon_sampler = CorrectorBatchSampler(
+                eval_ds, batch_size=16, seed=cfg["seed"] + 2,
+                max_batches=cfg["beacon_max_batches"] or None,
+                min_batches_per_shape=cfg["beacon_min_batches_per_shape"])
+            beacon_batches = list(beacon_sampler)
+            if beacon_batches:
+                beacon_loader = DataLoader(
+                    eval_ds, batch_sampler=FixedBatchListSampler(beacon_batches),
+                    collate_fn=collate_corrector,
+                    num_workers=cfg["num_workers"],
+                    pin_memory=cfg["num_workers"] > 0)
+                print(f"  Beacon set:     {len(beacon_batches)} fixed batches "
+                      f"({sum(len(b) for b in beacon_batches)} pairs)")
+        except ValueError as e:
+            print(f"  ⚠ beacon eval unavailable ({e}) — beacon disabled")
     # Fit maps for the OOD affine recovery row: drawn from the TRAIN pairs
     # only (never the eval set), balanced per stratum across every generation
     # (see collect_fit_maps), so the affine faces the same distribution
@@ -1288,6 +1710,14 @@ def main(argv=None):
     ema = init_ema(model)
     best = None
     best_step: Optional[int] = None
+    # Beacon eval state (plan v4): the LR controller's view of the fixed
+    # beacon set. Intentionally NOT persisted on resume — a few hundred steps
+    # of controller cold start is fine; the scheduler's base_lrs carry the
+    # actual decays across checkpoints.
+    beacon_best: Optional[float] = None
+    beacon_best_step: Optional[int] = None
+    beacon_stall = 0
+    warmup_end = max(1, int(cfg["max_steps"] * 0.05))
     opt = None
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
     scheduler = None
@@ -1368,6 +1798,10 @@ def main(argv=None):
         model = model.to(memory_format=torch.channels_last)
     model = model.to(device)
     ema = {k: v.to(device) for k, v in ema.items()}
+    # Per-stratum gradient tracker (plan v4 T2/T5): per-shape gradient
+    # buffers + EMA refs + per-stratum loss EMA. Plain object (not an
+    # nn.Module) so its tensors never enter the checkpoint state_dict.
+    tracker = StratumGradTracker(model, device)
     print(f"  Params:         target {ccfg.target_params/1e6:.2f}M → "
           f"{model.num_params()/1e6:.2f}M achieved (depth {ccfg.num_blocks}, "
           f"bottleneck {ccfg.bottleneck_dim}, {ccfg.heads} heads)")
@@ -1612,6 +2046,7 @@ def main(argv=None):
         # up to a full batch so every optimizer step sees ~batch_size samples
         # (equal gradient-noise level across resolutions).
         opt.zero_grad(set_to_none=True)
+        tracker.begin_step()
         n_micro = max(1, cfg["batch_size"] // int(batch["x_t"].shape[0])) \
             if cfg["accumulate_big_batches"] else 1
         micro_losses: List[torch.Tensor] = []
@@ -1646,13 +2081,20 @@ def main(argv=None):
             with torch.autocast("cuda", dtype=torch.float16):
                 loss = compute_train_loss(model, batch, Ks, loss_fn, eps,
                                           cfg["stop_grad"], cfg["multipass"],
-                                          k_max_cur, lag_scale=lag_scale_t)
+                                          k_max_cur, lag_scale=lag_scale_t,
+                                          shape_weights=cfg["shape_loss_weights"])
             profiler.end("fwd")
             micro_losses.append(loss.detach())
             profiler.begin("bwd")
             scaler.scale(loss).backward()
             profiler.end("bwd")
+            # Per-stratum accumulation: move the micro grads into the shape's
+            # buffer (p.grad = None) and record the micro loss (plan v4 T2).
+            tracker.record_micro(batch["x_t"].shape[-2:], float(micro_losses[-1]))
         profiler.begin("opt")
+        # Per-shape buffers → surgery (mode gated) → first-seen-order sum into
+        # p.grad; with grad_surgery=none this is today's gradient.
+        tracker.combine(cfg["grad_surgery"])
         scaler.unscale_(opt)
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         scaler.step(opt)
@@ -1697,9 +2139,12 @@ def main(argv=None):
             wall = time.time() - t_start
             rem_s = timer.remaining_seconds(
                 cfg["max_steps"] - step, sum(1 for s in eval_plan if s > step))
+            strata_loss = "  ".join(
+                f"{l}={v:.5f}" for l, v in sorted(tracker.loss_ema.items()))
             line = (f"  [train] step {step:>6d}/{cfg['max_steps']}  "
                     f"loss={loss_v:.5f} (ema {loss_ema:.5f}, min {min_loss:.5f})  "
-                    f"lr={opt.param_groups[0]['lr']:.2e}  "
+                    + (f"per-shape loss-ema: {strata_loss}  " if strata_loss else "")
+                    + f"lr={opt.param_groups[0]['lr']:.2e}  "
                     f"it/s={timer.steps_per_sec():.2f}  "
                     f"elapsed={format_duration(wall)}  "
                     f"remaining~{format_duration(rem_s)}  "
@@ -1713,7 +2158,114 @@ def main(argv=None):
                 "k_max": k_max_cur, "wall_s": wall,
                 "data_ms": round(data_ms_cur, 1),
                 "gpu_ms": round(gpu_ms_cur, 1),
+                "loss_ema_by_shape": {l: round(v, 6)
+                                      for l, v in sorted(tracker.loss_ema.items())},
                 "vram_gb": torch.cuda.max_memory_allocated() / (1024 ** 3),
+            })
+
+        # ── Beacon eval (plan v4) ──────────────────────────────────────
+        # Frequent, cheap, fixed-subset eval. Jobs: (1) plateau LR control —
+        # decay lr by beacon_lr_factor when ladder-only K1 hasn't improved for
+        # beacon_lr_patience beacon evals (only after warmup; floored); (2)
+        # fine-grained best-checkpoint selection (same ladder-only K1 metric
+        # as the full eval, more frequent samples); (3) the state informer at
+        # sub-2k granularity (metrics JSONL row + terse log line). On a step
+        # that is ALSO a full eval the saves are skipped — the full eval's own
+        # checkpoint block writes the same paths (both async savers use a
+        # fixed .tmp name, so concurrent writers would race).
+        if beacon_loader is not None and step % cfg["beacon_every"] == 0:
+            t_b0 = time.time()
+            ema_model.load_state_dict(ema)
+            results_b, by_shape_b, _, _ = eval_model(
+                ema_model, beacon_loader, lags, [0, 1], device, eps,
+                show_progress=False, eval_map_batches=0)
+            rows_b = recovery_rows(results_b, [0, 1])
+            k1_lad_b = next((r["ladder_only"] for r in rows_b if r["k"] == 1),
+                            None)
+            k1_b = next((r["rel_mse"] for r in rows_b if r["k"] == 1), None)
+            shape_k1 = {f"{h}x{w}": by_shape_b.get((1, (h, w)), {}).get("rel_mse")
+                        for (h, w) in sorted({hw for (_, hw) in by_shape_b},
+                                             key=lambda hw: hw[0] * hw[1])}
+            decayed = False
+            lr_now = opt.param_groups[0]["lr"]
+            if (cfg["beacon_lr_control"] and scheduler is not None
+                    and k1_lad_b is not None and k1_lad_b == k1_lad_b):
+                if beacon_best is None or k1_lad_b < beacon_best:
+                    beacon_best = k1_lad_b
+                    beacon_best_step = step
+                    beacon_stall = 0
+                elif step >= warmup_end:
+                    beacon_stall += 1
+                if (step >= warmup_end
+                        and beacon_stall >= cfg["beacon_lr_patience"]
+                        and lr_now > cfg["beacon_lr_floor"]):
+                    new_lr = _beacon_decay_lr(opt, scheduler,
+                                              cfg["beacon_lr_factor"],
+                                              cfg["beacon_lr_floor"])
+                    if new_lr is not None:
+                        decayed = True
+                        beacon_stall = 0
+                        lr_now = new_lr
+                        emit(f"  [beacon] LR plateau: no ladder-only K1 "
+                             f"improvement for {cfg['beacon_lr_patience']} "
+                             f"beacon evals → lr "
+                             f"{lr_now / cfg['beacon_lr_factor']:.2e} → "
+                             f"{lr_now:.2e}")
+            if step != next_eval:
+                if (cfg["beacon_select_best"] and k1_lad_b is not None
+                        and k1_lad_b == k1_lad_b
+                        and (best is None or k1_lad_b < best)):
+                    best = k1_lad_b
+                    best_step = step
+                    cfg_meta_b = {k: v for k, v in cfg.items()
+                                  if k not in ("data", "resume", "out",
+                                               "compile", "channels_last",
+                                               "metrics", "no_progress")}
+                    cfg_meta_b["lag_cond"] = ccfg.lag_cond
+                    cfg_meta_b["res_cond"] = ccfg.res_cond
+                    best_state = {k: v.detach().to(torch.float16)
+                                  .contiguous().cpu()
+                                  for k, v in ema_model.state_dict().items()}
+                    _async_save_safetensors(
+                        best_state,
+                        out_dir / f"corrector-{size}-best.safetensors",
+                        ccfg, {"config_snapshot": cfg_meta_b,
+                               "best_rel_mse_k1_ladder": k1_lad_b},
+                        pending_saves, emit)
+                if cfg["beacon_save_state"]:
+                    _async_save_full_state(
+                        {"model": _snapshot_cpu(model.state_dict()),
+                         "ema": _snapshot_cpu(ema),
+                         "optimizer": _snapshot_cpu(opt.state_dict()),
+                         "scaler": _snapshot_cpu(scaler.state_dict()),
+                         "scheduler": _snapshot_cpu(scheduler.state_dict())
+                         if scheduler is not None else None,
+                         "step": step, "best": best, "best_step": best_step,
+                         "wall_s": time.time() - t_start,
+                         "config_snapshot": cfg},
+                        out_dir / f"corrector-{size}-train.pt",
+                        pending_saves, emit)
+            lad_s = f"{k1_lad_b:.4f}" if k1_lad_b is not None else "  -  "
+            row_parts = [f"  [beacon] step {step}",
+                         f"K1={k1_b:.4f}" if k1_b is not None else "K1=  -  ",
+                         f"lad={lad_s}"]
+            if beacon_best is not None:
+                row_parts.append(f"best={beacon_best:.4f}@{beacon_best_step}")
+            row_parts.append(f"stall={beacon_stall}  lr={lr_now:.2e}")
+            row_parts += [f"{k}={v:.4f}" for k, v in sorted(shape_k1.items())
+                          if v is not None]
+            if decayed:
+                row_parts.append("decayed")
+            emit("  ".join(row_parts))
+            metrics.write({
+                "type": "beacon", "step": step,
+                "k1": k1_b, "k1_lad": k1_lad_b,
+                "per_shape": shape_k1,
+                "beacon_best": beacon_best,
+                "beacon_best_step": beacon_best_step,
+                "stall": beacon_stall, "decayed": decayed,
+                "lr": lr_now,
+                "wall_ms": round((time.time() - t_b0) * 1000, 1),
             })
 
         if step == next_eval and eval_loader is not None:
@@ -1939,6 +2491,27 @@ def main(argv=None):
             for line2 in timer.summary_lines(time.time() - t_start, step,
                                              cfg["max_steps"], eval_plan):
                 emit(line2)
+            # Per-stratum diagnostics (plan v4 T2): loss EMAs, last-step grad
+            # norms (unscaled — the buffers hold scaler-scaled grads), and
+            # EMA'd cross-stratum cosines from the refs. These drive the T5
+            # surgery gate (sustained negative EMA cosine between 64×64 and
+            # either big shape).
+            strata_diag = {}
+            for label in sorted(tracker.loss_ema):
+                strata_diag[f"loss_ema_{label}"] = round(tracker.loss_ema[label], 6)
+            scale_v = float(scaler.get_scale()) if hasattr(scaler, "get_scale") else 1.0
+            for label in sorted(tracker.last_grad_norms):
+                strata_diag[f"grad_norm_{label}"] = round(
+                    tracker.last_grad_norms[label] / max(scale_v, 1e-12), 6)
+            ref_labels = sorted(tracker.refs)
+            for i, a in enumerate(ref_labels):
+                for b in ref_labels[i + 1:]:
+                    c = tracker._ref_cosine(a, b)
+                    if c is not None:
+                        strata_diag[f"cos_{a}_{b}"] = round(c, 6)
+            if strata_diag:
+                emit("      strata: " + "  ".join(
+                    f"{k}={v}" for k, v in sorted(strata_diag.items())))
             metrics.write({
                 "type": "eval", "step": step, "k1": k1,
                 "timing": timing,
@@ -1977,6 +2550,7 @@ def main(argv=None):
                 "affine_oob": affine_oob_json(affine) if affine is not None else None,
                 "best_k1_ladder": best, "best_step": best_step,
                 "gate_fired": gate_fired,
+                **strata_diag,
             })
 
     # ── Final (plan 6i) ────────────────────────────────────────────────

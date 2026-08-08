@@ -9,7 +9,9 @@ Small 2D UNet mapping ``(x_t ⊕ v_prev) → Δv̂`` on the 16-channel image lat
       — 9-way adaLN (shift/scale/gate × self-attn, cross-attn(prompt), MLP);
         gates zero-init → blocks are identity at init
     Decoder: pixel-shuffle upsample + skip-concat + RepBlock (×2)
-    Output: conv 3×3 64→16, weights AND bias zero-initialized
+    Output: per-stratum heads (plan v4 T1) — one GroupNorm + conv 3×3 64→16
+      per normalization stratum (S = number of spatial-area strata, 1 if no
+      stats), weights AND bias zero-initialized
       ⇒ Δv̂ = 0 at init ⇒ Mode B′ ≡ Mode A exactly (Task 7 sanity gate)
 
 RepBlocks are GroupNorm branch-sum blocks (deep-dive §3.1 variant (b)): the
@@ -604,11 +606,20 @@ class CorrectorUNet2D(nn.Module):
         self.up1 = UpBlock(c1, c0)                           # → c0 @ H
         self.dec1 = RepBlock(c0 + c0, c0)                    # skip from enc0
 
-        # Zero-init output head: Δv̂ = 0 at init ⇒ Mode B′ ≡ Mode A exactly
-        self.head_gn = nn.GroupNorm(_gn_groups(c0), c0)
-        self.head_conv = nn.Conv2d(c0, cfg.out_channels, 3, 1, 1)
-        nn.init.zeros_(self.head_conv.weight)
-        nn.init.zeros_(self.head_conv.bias)
+        # Zero-init per-stratum output heads (plan v4 T1): one head per
+        # normalization stratum (S = number of spatial-area strata, 1 with no
+        # or legacy stats). Δv̂ = 0 at init ⇒ Mode B′ ≡ Mode A exactly, per
+        # head. GroupNorm is per-sample, so a head trained at any batch size
+        # is numerically identical at any other — the strata's different batch
+        # sizes (÷4 for >64×64) do not interact with the head choice.
+        num_strata = len((cfg.normalization_stats or {}).get("areas", [])) or 1
+        self.head_gns = nn.ModuleList(
+            [nn.GroupNorm(_gn_groups(c0), c0) for _ in range(num_strata)])
+        self.head_convs = nn.ModuleList(
+            [nn.Conv2d(c0, cfg.out_channels, 3, 1, 1) for _ in range(num_strata)])
+        for hc in self.head_convs:
+            nn.init.zeros_(hc.weight)
+            nn.init.zeros_(hc.bias)
 
         # Input normalization (perchannel option, plan 6d) — per resolution
         # stratum: normalization_stats = {"areas": [...], "mean": [[32ch]×S],
@@ -646,22 +657,35 @@ class CorrectorUNet2D(nn.Module):
 
     # ── forward ────────────────────────────────────────────────────────
 
-    def _norm_stats(self, x: torch.Tensor):
-        """Per-stratum (mean, std) views selected by the batch's spatial area.
+    def _norm_idx(self, x: torch.Tensor) -> int:
+        """Stratum index for the batch's spatial area (plan v4 T1).
 
-        Pure function of the input shape (no module state) so it compiles and
-        stays correct for rotated/scaled batch layouts (area is preserved by
-        rot90). Single-stratum (legacy) stats always match.
+        One lookup, three uses in ``forward``: input normalization, head
+        selection, output unnormalization. Nearest-area argmin over the stats
+        strata; 0 for single-stratum (legacy) or absent stats. Pure function
+        of the input shape (no module state) so it stays correct for
+        rotated/scaled batch layouts — rot90 preserves the area, so the
+        stratum (and head) is stable under augmentation.
+        """
+        if self._norm_mean is None or self._norm_std is None \
+                or self._norm_areas.numel() <= 1:
+            return 0
+        area = int(x.shape[-2]) * int(x.shape[-1])
+        return int((self._norm_areas - area).abs().argmin())
+
+    def _norm_stats(self, s: int):
+        """Per-stratum (mean, std) views for stratum index ``s`` (from
+        :func:`_norm_idx`). Pure function of the index (no module state) so
+        it compiles and stays correct for rotated/scaled batch layouts.
+        Single-stratum (legacy) stats always match.
         """
         if self._norm_mean is None or self._norm_std is None:
             return None
         if self._norm_areas.numel() <= 1:
             return (self._norm_mean.view(1, -1, 1, 1),
                     self._norm_std.view(1, -1, 1, 1))
-        area = int(x.shape[-2]) * int(x.shape[-1])
-        idx = (self._norm_areas - area).abs().argmin()
-        return (self._norm_mean.index_select(0, idx).view(1, -1, 1, 1),
-                self._norm_std.index_select(0, idx).view(1, -1, 1, 1))
+        return (self._norm_mean[s:s + 1].view(1, -1, 1, 1),
+                self._norm_std[s:s + 1].view(1, -1, 1, 1))
 
     def _normalize_input(self, x: torch.Tensor, ns) -> torch.Tensor:
         if ns is None:
@@ -694,7 +718,8 @@ class CorrectorUNet2D(nn.Module):
         if t.ndim == 2:
             t = t[:, 0]
         x = torch.cat([x_t, v_prev], dim=1).float()
-        ns = self._norm_stats(x)
+        s = self._norm_idx(x)                 # one lookup, three uses
+        ns = self._norm_stats(s)
         x = self._normalize_input(x, ns)
 
         skips = []
@@ -732,7 +757,7 @@ class CorrectorUNet2D(nn.Module):
         x = torch.cat([x, skips[0]], dim=1)
         x = self.dec1(x)
 
-        out = self.head_conv(F.silu(self.head_gn(x)))
+        out = self.head_convs[s](F.silu(self.head_gns[s](x)))
         out = self._unnormalize_output(out, ns)
         return out.to(v_prev.dtype)
 
@@ -822,6 +847,12 @@ def load_corrector(path) -> CorrectorUNet2D:
     accepted: the conditioning embedders are zero-initialized and the flags
     downgraded, so an old artifact behaves exactly as trained (conditioning
     contributes nothing) and a warning is printed.
+
+    v3-style single-head artifacts (plan v4 T1.5) are accepted for baseline
+    A/B eval only: the loaded single head is duplicated into every
+    per-stratum slot with a warning. This reconcile lives ONLY here — the
+    trainer resume path keeps hard-failing on v3 snapshots (that failure is
+    the v4 resume guard).
     """
     import safetensors.torch as st
     path = str(Path(path).expanduser())
@@ -857,10 +888,33 @@ def load_corrector(path) -> CorrectorUNet2D:
             print(f"  [corrector] ⚠ {Path(path).name}: pre-conditioning "
                   f"checkpoint (no lag/res conditioning) — embedders "
                   f"zero-initialized, conditioning disabled")
-        elif missing:
-            raise RuntimeError(
-                f"[corrector] {Path(path).name}: missing keys {sorted(missing)}"
-            )
+        else:
+            # v3 single-head → per-stratum heads (plan v4 T1.5): the missing
+            # keys are exactly the new head slots and the old single head is
+            # among the unexpected keys → duplicate the loaded head into all
+            # slots. Baseline A/B eval only; the trainer resume path does not
+            # use this reconcile (a v3 snapshot must keep hard-failing there).
+            head_missing = {k for k in missing
+                            if k.startswith("head_gns.")
+                            or k.startswith("head_convs.")}
+            old_head = {"head_gn.weight", "head_gn.bias",
+                        "head_conv.weight", "head_conv.bias"}
+            if set(missing) == head_missing and head_missing \
+                    and old_head <= set(unexpected):
+                with torch.no_grad():
+                    for s in range(len(model.head_gns)):
+                        model.head_gns[s].weight.copy_(data["head_gn.weight"])
+                        model.head_gns[s].bias.copy_(data["head_gn.bias"])
+                        model.head_convs[s].weight.copy_(data["head_conv.weight"])
+                        model.head_convs[s].bias.copy_(data["head_conv.bias"])
+                print(f"  [corrector] ⚠ {Path(path).name}: v3 single-head "
+                      f"checkpoint — head duplicated into all "
+                      f"{len(model.head_gns)} per-stratum slot(s) "
+                      f"(baseline A/B only)")
+            else:
+                raise RuntimeError(
+                    f"[corrector] {Path(path).name}: missing keys {sorted(missing)}"
+                )
     if unexpected:
         print(f"  [corrector] ⚠ {Path(path).name}: unexpected keys "
               f"{sorted(unexpected)} ignored")

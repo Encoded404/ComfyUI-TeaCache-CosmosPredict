@@ -70,6 +70,10 @@ class TeacacheConfig:
     refine_passes: int = 1              # K, 1-4 (inference default 1)
     corrector_trust: float = 1.0        # v_final = v_MA + trust·(v̂ − v_MA)
     corrector_model_path: str = ""      # .safetensors path (empty = Mode A)
+    # Per-(area, t-region) trust multipliers (plan v4 T7), e.g.
+    # {"128x128:late": 0.0}: v_final = v_MA + trust·mult·(v̂ − v_MA).
+    # Region names: early/mid/late (thirds of the schedule). Absent keys = 1.0.
+    corrector_trust_map: Dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self):
         if isinstance(self.signal_scale, dict):
@@ -111,6 +115,7 @@ class TeacacheConfig:
             "refine_passes": self.refine_passes,
             "corrector_trust": self.corrector_trust,
             "corrector_model_path": self.corrector_model_path,
+            "corrector_trust_map": self.corrector_trust_map,
         }
 
     @classmethod
@@ -142,6 +147,7 @@ class TeacacheConfig:
             refine_passes=int(d.get("refine_passes", 1)),
             corrector_trust=float(d.get("corrector_trust", 1.0)),
             corrector_model_path=d.get("corrector_model_path", ""),
+            corrector_trust_map=d.get("corrector_trust_map") or {},
         )
 
     @classmethod
@@ -159,7 +165,7 @@ class TeacacheConfig:
             "cross_feed_enabled", "cross_feed_strength",
             "cosim_threshold", "block_level", "block_level_config_scope",
             "correction_mode", "refine_passes", "corrector_trust",
-            "corrector_model_path",
+            "corrector_model_path", "corrector_trust_map",
         ]:
             if f"tc_{key}" in to:
                 d[key] = to[f"tc_{key}"]

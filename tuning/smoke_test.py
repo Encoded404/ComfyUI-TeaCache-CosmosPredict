@@ -599,7 +599,8 @@ def _run_corrector_smoke(unet, clip, vae, tcfg, steps: int = 30):
     # Live corrector: output shape/dtype sane and (when skips occur) different.
     corr = CorrectorUNet2D(CorrectorConfig.for_size("tiny"))
     with torch.no_grad():
-        corr.head_conv.weight.normal_(0, 0.02)
+        for hc in corr.head_convs:
+            hc.weight.normal_(0, 0.02)
     tmp = Path(tempfile.gettempdir()) / "smoke_corrector.safetensors"
     save_corrector(corr, tmp, corr.cfg)
     lat_c, _t, ts_c, cs_c, _d, slots_c = run_single_teacache(
@@ -764,7 +765,8 @@ def _run_estimator_test():
 
 def _run_corrector_solver_test():
     """CPU-only: size-target parser, width/depth solver, profile invariants."""
-    from .corrector import CorrectorConfig, parse_param_target, estimate_corrector_flops
+    from .corrector import (CorrectorConfig, CorrectorUNet2D, parse_param_target,
+                            estimate_corrector_flops)
 
     assert parse_param_target("50M") == 50e6
     assert parse_param_target("1.5b") == 1.5e9

@@ -409,7 +409,10 @@ def _apply_corrector(self, out, x_orig, crossattn_emb, cond_or_uncond, b,
     Runs after the final layer + unpatchify on skip steps only. The corrector
     (set on the diffusion model by the node) maps (x_t, v_MA, lag) → Δv̂; the
     blend ``v_final = v_MA + trust·(v̂ − v_MA)`` defaults to full correction
-    (trust=1). No new state, no feedback loop — the input is always the
+    (trust=1). An optional ``corrector_trust_map`` (plan v4 T7) multiplies
+    trust per (latent shape, t-region), e.g. {"128x128:late": 0.0} gates the
+    corrector off on late 1024² skip steps; absent map = today's scalar
+    behavior. No new state, no feedback loop — the input is always the
     deterministic Mode-A output. The per-slot lag (steps since the last full
     run) is read from ``teacache_state[k]["lag"]`` — exactly the skip age the
     corrector was trained on (lag ≥ 1 whenever this hook runs).
@@ -419,7 +422,11 @@ def _apply_corrector(self, out, x_orig, crossattn_emb, cond_or_uncond, b,
         return out
     K = max(1, int(cfg.refine_passes))
     trust = float(cfg.corrector_trust)
+    trust_map = getattr(cfg, "corrector_trust_map", None) or {}
     t = torch.tensor([current_percent], dtype=torch.float32, device=out.device)
+    # t-region for the per-(area, region) trust map (plan v4 T7): thirds of
+    # the schedule, same region split as the training eval slices.
+    t_region = ("early", "mid", "late")[min(2, int(3 * current_percent))]
     collect = bool(getattr(self, "_tc_collect_stats", False))
     if collect:
         if not hasattr(self, "_tc_corr_slot_stats"):
@@ -432,7 +439,11 @@ def _apply_corrector(self, out, x_orig, crossattn_emb, cond_or_uncond, b,
         lag_t = torch.tensor([lag], dtype=torch.float32, device=out.device)
         v_hat = corr.refine(x_slot, v_slot, p, t.expand(x_slot.shape[0]), K,
                             lag=lag_t.expand(x_slot.shape[0]))
-        v_final = v_slot + trust * (v_hat - v_slot)
+        trust_eff = trust
+        if trust_map:
+            hw = f"{int(x_slot.shape[-2])}x{int(x_slot.shape[-1])}"
+            trust_eff = trust * float(trust_map.get(f"{hw}:{t_region}", 1.0))
+        v_final = v_slot + trust_eff * (v_hat - v_slot)
         out[i * b : (i + 1) * b, :, 0] = v_final.to(out.dtype)
         if collect:
             # diagnostic only (validate.py per-slot report, plan Task 7)
