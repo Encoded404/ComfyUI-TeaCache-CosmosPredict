@@ -2662,64 +2662,71 @@ def main(argv=None):
     # (lag ≥ 1 only — the deployed skip-step regime), report the K1 rel-MSE
     # effect with and without the gains, and embed the gains + strength into
     # the saved checkpoint config so inference applies them via refine().
+    # An optional calibration must never fail a finished training run: the
+    # calibrator returns None when data is insufficient, and anything that
+    # throws here is logged and skipped, with the checkpoint saved un-gained.
     if cfg["calibrate_gains"] > 0 and eval_loader is not None:
-        ema_model.load_state_dict(ema)
-        gains = calibrate_gain_calibration(
-            ema_model, eval_loader, n_samples=cfg["calibrate_gains"],
-            device=device, K=1, verbose=True)
-        if gains is None:
-            print("  [calibrate] ⚠ calibration skipped (too few lag≥1 eval "
-                  "pairs) — checkpoint saved without gains")
-        else:
-            ccfg.gain_calibration = gains
-            ccfg.gain_calibration_strength = cfg["gain_strength"]
-            # Quick K1 with/without gains on the same pairs the gains were
-            # fit on, using the same per-sample rel-MSE as the loss/eval.
-            base_k1: Dict[int, List[float]] = {}
-            gcal_k1: Dict[int, List[float]] = {}
-            g = torch.tensor(gains, device=device).view(1, -1, 1, 1)
-            s = float(ccfg.gain_calibration_strength)
-            n_cal = 0
-            ema_model.eval()
-            with torch.no_grad():
-                for batch in eval_loader:
-                    if n_cal >= cfg["calibrate_gains"]:
-                        break
-                    x = batch["x_t"].to(device)
-                    v0 = batch["v_ma"].to(device)
-                    vt = batch["v_true"].to(device)
-                    t = batch["t_frac"].to(device)
-                    lag = batch["lag"].to(device).float()
-                    m = lag != 0
-                    if not m.any():
-                        continue
-                    x, v0, vt, t, lag = x[m], v0[m], vt[m], t[m], lag[m]
-                    prompt, pmask = batch.get("prompt"), batch.get("prompt_mask")
-                    if prompt is not None:
-                        prompt, pmask = prompt.to(device)[m], pmask.to(device)[m]
-                    with torch.autocast(device.type, dtype=torch.float16):
-                        v = v0
-                        for _ in range(1):
-                            v = v + ema_model(x, v, prompt, t, pmask, lag=lag)
-                        base_ps = per_sample_rel_mse(v, vt, eps)
-                        vg = v * (1.0 - s + s * g)
-                        gcal_ps = per_sample_rel_mse(vg, vt, eps)
-                    for j, lg in enumerate(lag.tolist()):
-                        base_k1.setdefault(lg, []).append(base_ps[j].item())
-                        gcal_k1.setdefault(lg, []).append(gcal_ps[j].item())
-                    n_cal += int(x.shape[0])
-            def _mean(d, lag):
-                v = d.get(lag)
-                return sum(v) / len(v) if v else float("nan")
-            print("  [calibrate] K1 rel-MSE by lag: base → with gains")
-            for lg in sorted(set(base_k1) | set(gcal_k1)):
-                b, c = _mean(base_k1, lg), _mean(gcal_k1, lg)
-                print(f"    d={lg:2d}: {b:.4f} → {c:.4f} "
-                      f"({100 * (b - c) / b:+.1f}%)" if b == b else f"    d={lg:2d}: n/a")
-            pooled_b = sum(sum(v) for v in base_k1.values()) / sum(len(v) for v in base_k1.values())
-            pooled_c = sum(sum(v) for v in gcal_k1.values()) / sum(len(v) for v in gcal_k1.values())
-            print(f"    pooled: {pooled_b:.4f} → {pooled_c:.4f} "
-                  f"({100 * (pooled_b - pooled_c) / pooled_b:+.1f}%)")
+        try:
+            ema_model.load_state_dict(ema)
+            gains = calibrate_gain_calibration(
+                ema_model, eval_loader, n_samples=cfg["calibrate_gains"],
+                device=device, K=1, verbose=True)
+            if gains is None:
+                print("  [calibrate] ⚠ calibration skipped (too few lag≥1 eval "
+                      "pairs) — checkpoint saved without gains")
+            else:
+                ccfg.gain_calibration = gains
+                ccfg.gain_calibration_strength = cfg["gain_strength"]
+                # Quick K1 with/without gains on the same pairs the gains were
+                # fit on, using the same per-sample rel-MSE as the loss/eval.
+                base_k1: Dict[int, List[float]] = {}
+                gcal_k1: Dict[int, List[float]] = {}
+                g = torch.tensor(gains, device=device).view(1, -1, 1, 1)
+                s = float(ccfg.gain_calibration_strength)
+                n_cal = 0
+                ema_model.eval()
+                with torch.no_grad():
+                    for batch in eval_loader:
+                        if n_cal >= cfg["calibrate_gains"]:
+                            break
+                        x = batch["x_t"].to(device)
+                        v0 = batch["v_ma"].to(device)
+                        vt = batch["v_true"].to(device)
+                        t = batch["t_frac"].to(device)
+                        lag = batch["lag"].to(device).float()
+                        m = lag != 0
+                        if not m.any():
+                            continue
+                        x, v0, vt, t, lag = x[m], v0[m], vt[m], t[m], lag[m]
+                        prompt, pmask = batch.get("prompt"), batch.get("prompt_mask")
+                        if prompt is not None:
+                            prompt, pmask = prompt.to(device)[m], pmask.to(device)[m]
+                        with torch.autocast(device.type, dtype=torch.float16):
+                            v = v0
+                            for _ in range(1):
+                                v = v + ema_model(x, v, prompt, t, pmask, lag=lag)
+                            base_ps = per_sample_rel_mse(v, vt, eps)
+                            vg = v * (1.0 - s + s * g)
+                            gcal_ps = per_sample_rel_mse(vg, vt, eps)
+                        for j, lg in enumerate(lag.tolist()):
+                            base_k1.setdefault(lg, []).append(base_ps[j].item())
+                            gcal_k1.setdefault(lg, []).append(gcal_ps[j].item())
+                        n_cal += int(x.shape[0])
+                def _mean(d, lag):
+                    v = d.get(lag)
+                    return sum(v) / len(v) if v else float("nan")
+                print("  [calibrate] K1 rel-MSE by lag: base → with gains")
+                for lg in sorted(set(base_k1) | set(gcal_k1)):
+                    b, c = _mean(base_k1, lg), _mean(gcal_k1, lg)
+                    print(f"    d={lg:2d}: {b:.4f} → {c:.4f} "
+                          f"({100 * (b - c) / b:+.1f}%)" if b == b else f"    d={lg:2d}: n/a")
+                pooled_b = sum(sum(v) for v in base_k1.values()) / sum(len(v) for v in base_k1.values())
+                pooled_c = sum(sum(v) for v in gcal_k1.values()) / sum(len(v) for v in gcal_k1.values())
+                print(f"    pooled: {pooled_b:.4f} → {pooled_c:.4f} "
+                      f"({100 * (pooled_b - pooled_c) / pooled_b:+.1f}%)")
+        except Exception as e:
+            print(f"  [calibrate] ⚠ gain calibration failed "
+                  f"({type(e).__name__}: {e}) — checkpoint saved without gains")
     elif cfg["calibrate_gains"] > 0:
         print("  [calibrate] ⚠ --calibrate-gains requested but no eval set "
               "exists — skipping (check data split)")

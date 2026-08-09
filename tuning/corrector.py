@@ -1058,7 +1058,7 @@ def calibrate_gain_calibration(model: "CorrectorUNet2D", batches, n_samples: int
                 prompt = prompt.to(device)[lag_mask]
             if pmask is not None:
                 pmask = pmask.to(device)[lag_mask]
-            with torch.autocast(device, dtype=torch.float16):
+            with torch.autocast(device.type, dtype=torch.float16):
                 v_hat = model.refine(x, v, prompt, t, K, pmask, lag=lag)
             sums += (v_hat.float() ** 2).sum(dim=(0, 2, 3))
             sums_true += (vt.float() ** 2).sum(dim=(0, 2, 3))
