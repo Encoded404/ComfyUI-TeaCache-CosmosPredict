@@ -528,6 +528,83 @@ def _sweep_pareto_config(idx_and_cfg: tuple) -> tuple:
     return idx, skip, err, sp, best_t, curve
 
 
+# ── Step-multiplier table worker (module-level for pickling) ────────
+
+_worker_sm_anchor_data: list = []
+_worker_sm_base_sd: Optional[SimData] = None
+_worker_sm_base_steps: int = 30
+_worker_sm_skip_base: bool = False
+_worker_sm_sweep_values: list = []
+_worker_sm_scoring: dict = {}
+
+
+def _init_sm_worker(anchor_data, base_sd, base_steps, skip_base,
+                    sweep_values, scoring_config):
+    """Called once per worker process to share read-only step-mult data."""
+    global _worker_sm_anchor_data, _worker_sm_base_sd, _worker_sm_base_steps
+    global _worker_sm_skip_base, _worker_sm_sweep_values, _worker_sm_scoring
+    _worker_sm_anchor_data = anchor_data
+    _worker_sm_base_sd = base_sd
+    _worker_sm_base_steps = base_steps
+    _worker_sm_skip_base = skip_base
+    _worker_sm_sweep_values = sweep_values
+    _worker_sm_scoring = scoring_config
+
+
+def _compute_step_mult_table(cfg, E, base_steps, anchor_data,
+                             base_sd, skip_base, sweep_values,
+                             scoring_config) -> tuple:
+    """Compute one Pareto entry's step-multiplier table.
+
+    *T_base* is the base-step-count threshold that reproduces accumulated
+    error *E*: either re-swept on *base_sd*, or — when *skip_base* is set —
+    taken directly from the config's Pareto-sweep threshold (valid because
+    the base data is identical to the data the Pareto sweep ran on).
+
+    *anchor_data* is the memoized list of (n, SimData, estimated) triples,
+    shared across all tables.
+
+    Returns (T_base, points, n_measured, n_estimated).
+    """
+    if skip_base:
+        T_base = cfg.rel_l1_thresh
+    else:
+        _best, base_curve = _sweep_threshold_curve(
+            base_sd, cfg, sweep_values, scoring_config,
+        )
+        T_base = _find_closest_on_curve(base_curve, E)[0]
+
+    points = [[base_steps, 1.0]]
+    n_measured = 0
+    n_estimated = 0
+    for n, sub, estimated in anchor_data:
+        _sub_best, curve = _sweep_threshold_curve(
+            sub, cfg, sweep_values, scoring_config,
+        )
+        ratio = _find_closest_on_curve(curve, E)[0] / T_base
+        points.append([n, ratio])
+        if estimated:
+            n_estimated += 1
+        else:
+            n_measured += 1
+    return T_base, points, n_measured, n_estimated
+
+
+def _sm_table(idx_and_cfg: tuple) -> tuple:
+    """Compute one Pareto entry's step-mult table in a worker process.
+    Returns (idx, points, n_measured, n_estimated)."""
+    idx, cfg, E = idx_and_cfg
+    global _worker_sm_anchor_data, _worker_sm_base_sd, _worker_sm_base_steps
+    global _worker_sm_skip_base, _worker_sm_sweep_values, _worker_sm_scoring
+
+    _T_base, points, n_measured, n_estimated = _compute_step_mult_table(
+        cfg, E, _worker_sm_base_steps, _worker_sm_anchor_data,
+        _worker_sm_base_sd, _worker_sm_skip_base,
+        _worker_sm_sweep_values, _worker_sm_scoring,
+    )
+    return idx, points, n_measured, n_estimated
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  Data loading
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1245,11 +1322,15 @@ def optimize(configs: List[TeacacheConfig],
     if use_parallel:
         n_workers = min(os.cpu_count() or 4, 16)
         chunksz = max(50, min(5000, total // (n_workers * 10)))
-        print(f"  [parallel] {n_workers} workers × {total} configs, "
+        print(f"  [sim] mode: parallel — {n_workers} workers × {total} configs, "
               f"chunksize={chunksz} ({iter_count//1_000_000}M entry-iterations, "
               f"~{total/(n_workers*chunksz):.0f} rounds)")
+    else:
+        print(f"  [sim] mode: serial — single-threaded, {total} configs × "
+              f"{holdout_sd.n_entries} entries = {iter_count:,} entry-iterations "
+              f"(parallel requires >10M)")
 
-        indexed = list(enumerate(unique_signal_configs))
+    if use_parallel:
         results_list = [None] * total
         done_count = 0
         last_log = 0
@@ -1453,9 +1534,16 @@ def optimize(configs: List[TeacacheConfig],
           f"[{pareto_range[0]:.3f}..{pareto_range[1]:.1f}] × {n_ps} configs")
 
     use_parallel_ps = n_ps * pareto_count > 5000
+    n_workers = min(os.cpu_count() or 4, 16)
+    if use_parallel_ps:
+        print(f"  [pareto] mode: parallel — {n_workers} workers, "
+              f"{n_ps * pareto_count:,} simulations total")
+    else:
+        print(f"  [pareto] mode: serial — single-threaded "
+              f"({n_ps * pareto_count:,} simulations, "
+              f"parallel requires >5000)")
 
     if use_parallel_ps:
-        n_workers = min(os.cpu_count() or 4, 16)
         indexed = [(i, r.config) for i, r in enumerate(pareto)]
         done = 0
         best_overall_sp = 1.0
@@ -1524,6 +1612,16 @@ def optimize(configs: List[TeacacheConfig],
     # resampling + step-spacing amplitude correction).  Anchors beyond the
     # largest recorded step count are omitted — the runtime clamps to the
     # remaining table endpoints and never extrapolates.
+    #
+    # Optimizations over the original serial implementation:
+    #   - Anchor datasets (filtered/resampled SimData) are memoized once and
+    #     shared across all tables; workers receive them read-only.
+    #   - Tables run in parallel workers (same spawn-pool pattern as the
+    #     Pareto sweep) when the workload is large.
+    #   - When the base-step-count data is identical to the data the Pareto
+    #     sweep ran on (holdout_sd), the base sweep is redundant: the Pareto
+    #     sweep already found the exact threshold (rel_l1_thresh) reproducing
+    #     E, so the pareto_threshold_count-threshold base re-sweep is skipped.
     base_steps = int(tcfg.sampling.get("default_steps", 30))
     anchors = derive_step_anchors(opt.get("step_count_variants", []), base_steps)
     base_sd = sim_data.filter_by_step_count(base_steps)
@@ -1532,40 +1630,104 @@ def optimize(configs: List[TeacacheConfig],
               f"skipping step-multiplier tables")
     else:
         t_mult_start = time_mod.time()
+        n_ps = len(pareto)
+
+        # ── 9a. Memoize per-anchor datasets (once, shared across tables) ──
+        anchor_data = []
+        skipped_anchors = []
+        for n in anchors:
+            if n == base_steps:
+                continue
+            sub = sim_data.filter_by_step_count(n)
+            estimated = sub.n_entries == 0
+            if estimated:
+                sub = sim_data.resample_to_step_count(n)
+            if sub.n_entries == 0:
+                skipped_anchors.append(n)
+                continue
+            anchor_data.append((n, sub, estimated))
+
+        # ── 9b. Skip the base re-sweep when it is redundant ─────────────
+        # base_sd and holdout_sd are both filtered views of sim_data's
+        # (immutable) GroupData objects, so identity comparison is exact.
+        skip_base_sweep = (
+            frozenset(id(g) for g in base_sd.groups)
+            == frozenset(id(g) for g in holdout_sd.groups)
+        )
+
+        n_sweeps = len(anchor_data) + (0 if skip_base_sweep else 1)
+        n_sims = n_ps * n_sweeps * pareto_count
+        print(f"  [step_mults] {n_ps} tables × {n_sweeps} sweeps × "
+              f"{pareto_count} thresholds = {n_sims:,} simulations "
+              f"over anchors {anchors}")
+        if skip_base_sweep:
+            print(f"  [step_mults] base data identical to holdout — reusing "
+                  f"Pareto-sweep threshold (T_base = rel_l1_thresh), "
+                  f"skipping {pareto_count}-threshold base re-sweep")
+        measured_anchors = [n for n, _s, est in anchor_data if not est]
+        est_anchors = [n for n, _s, est in anchor_data if est]
+        if measured_anchors:
+            print(f"  [step_mults] measured anchors: {measured_anchors}")
+        if est_anchors:
+            print(f"  [step_mults] estimated anchors (resampled): {est_anchors}")
+        if skipped_anchors:
+            print(f"  [step_mults] no data at anchors {skipped_anchors} — "
+                  f"omitted from tables")
+
         n_tables = 0
         n_measured = 0
         n_estimated = 0
-        for i, r in enumerate(pareto):
-            _best, base_curve = _sweep_threshold_curve(
-                base_sd, r.config, sweep_values, scoring_config,
-            )
-            E = r.accumulated_error
-            T_base = _find_closest_on_curve(base_curve, E)[0]
-            points = [[base_steps, 1.0]]
-            for n in anchors:
-                if n == base_steps:
-                    continue
-                sub = sim_data.filter_by_step_count(n)
-                estimated = False
-                if sub.n_entries == 0:
-                    sub = sim_data.resample_to_step_count(n)
-                    estimated = True
-                if sub.n_entries == 0:
-                    continue
-                _sub_best, curve = _sweep_threshold_curve(
-                    sub, r.config, sweep_values, scoring_config,
+
+        if n_ps > 0 and n_sims > 5000:
+            n_workers = min(os.cpu_count() or 4, 16)
+            indexed = [(i, r.config, r.accumulated_error)
+                       for i, r in enumerate(pareto)]
+            print(f"  [step_mults] mode: parallel — {n_workers} workers, "
+                  f"{n_sims:,} simulations total")
+            done = 0
+            import multiprocessing as mp
+            ctx = mp.get_context("spawn")
+            with ctx.Pool(
+                processes=n_workers,
+                initializer=_init_sm_worker,
+                initargs=(anchor_data, base_sd, base_steps, skip_base_sweep,
+                          sweep_values, scoring_config),
+            ) as pool:
+                for idx, points, n_meas, n_est in pool.imap_unordered(
+                    _sm_table, indexed, chunksize=1
+                ):
+                    r = pareto[idx]
+                    r.step_mults = {"base": base_steps, "points": sorted(points)}
+                    n_measured += n_meas
+                    n_estimated += n_est
+                    n_tables += 1
+                    done += 1
+                    elapsed = time_mod.time() - t_mult_start
+                    eta = elapsed / done * (n_ps - done) if done > 0 else 0
+                    print(f"\r  [step_mults] {done:>3d}/{n_ps} tables  "
+                          f"elapsed={elapsed:.0f}s  ETA={eta:.0f}s      ",
+                          end="", flush=True)
+            print()
+        else:
+            print(f"  [step_mults] mode: serial — single-threaded "
+                  f"({n_sims:,} simulations, parallel requires >5000)")
+            for i, r in enumerate(pareto):
+                _T_base, points, n_meas, n_est = _compute_step_mult_table(
+                    r.config, r.accumulated_error,
+                    base_steps, anchor_data, base_sd, skip_base_sweep,
+                    sweep_values, scoring_config,
                 )
-                ratio = _find_closest_on_curve(curve, E)[0] / T_base
-                points.append([n, ratio])
-                if estimated:
-                    n_estimated += 1
-                else:
-                    n_measured += 1
-            r.step_mults = {"base": base_steps, "points": sorted(points)}
-            n_tables += 1
-            if (i + 1) % 10 == 0 or (i + 1) == len(pareto):
-                print(f"\r  [step_mults] {i+1}/{len(pareto)} tables", end="", flush=True)
-        print()
+                r.step_mults = {"base": base_steps, "points": sorted(points)}
+                n_measured += n_meas
+                n_estimated += n_est
+                n_tables += 1
+                elapsed = time_mod.time() - t_mult_start
+                eta = elapsed / (i + 1) * (n_ps - i - 1) if i > 0 else 0
+                print(f"\r  [step_mults] {i+1:>3d}/{n_ps} tables  "
+                      f"elapsed={elapsed:.0f}s  ETA={eta:.0f}s      ",
+                      end="", flush=True)
+            print()
+
         print(f"  [step_mults] {n_tables} tables over anchors {anchors} "
               f"({n_measured} measured, {n_estimated} estimated) "
               f"in {time_mod.time() - t_mult_start:.1f}s")
