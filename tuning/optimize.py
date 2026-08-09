@@ -1331,6 +1331,7 @@ def optimize(configs: List[TeacacheConfig],
               f"(parallel requires >10M)")
 
     if use_parallel:
+        indexed = list(enumerate(unique_signal_configs))
         results_list = [None] * total
         done_count = 0
         last_log = 0
