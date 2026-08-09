@@ -223,6 +223,161 @@ python -m tuning.distill_corrector --teacher models/corrector-20m.safetensors \
 # → models/corrector-5m-turbo.safetensors (K_recommended=1)
 ```
 
+### Grain-reduction training knobs
+
+Two training-side knobs target the measured failure modes of the 30M model
+(grain-like high-frequency residual error, and systematic per-channel
+under-prediction of velocity energy). Shipped defaults (config.json) are the
+"smooth, not overtaking" values — each knob alone stays well below the main
+loss in influence:
+
+| knob | default | meaning |
+|---|---|---|
+| `spectral_penalty` | `0.01` | spectral (grain) penalty weight λ |
+| `spectral_mode` | `fraction` | `fraction` \| `absolute` normalization |
+| `calibrate_gains` | `2048` | post-training gain calibration on N eval pairs |
+| `gain_strength` | `0.5` | blend s of the calibrated gains at inference |
+
+- **Spectral penalty** — `--spectral-penalty <λ>`: adds
+  `λ · ‖HP(v̂ − v_true)‖²/‖v̂ − v_true‖²` per training sample (differentiable
+  2×2 pooled high-pass). This is the exact metric the refiner verifier's
+  spectral grain test measures — the 30M corrector's residual error carries
+  3–17× the high-frequency share of the latent signal itself, which decodes
+  as grain. The `fraction` mode is scale-invariant (it tilts the error's
+  spectral shape without competing with the main loss on magnitude —
+  "if you must be wrong, be wrong softly"); `absolute` also penalizes HF
+  error energy relative to the target.
+  **Scale guide** (measured on real pairs): the typical per-sample rel-MSE
+  is ≈ 0.06 and the spectral fraction ≈ 0.64, so the penalty adds roughly
+  `λ · 10×` percent to the main loss — λ=0.01 ≈ +10% (gentle tilt, the
+  shipped default), λ=0.05 ≈ +50% (already substantial; pair it with the
+  verifier's spectral + LPIPS/DISTS no-regression gates, since
+  overcorrection reads as blur, not grain).
+- **Per-channel gain calibration** — `--calibrate-gains <N>`: after
+  training, calibrates 16 energy-matching scales g_c = ‖v_true_c‖/‖v̂_c‖ on
+  N eval pairs (lag ≥ 1 only — the deployed skip-step regime; anchors are
+  excluded because the corrector never runs on fresh steps), reports the K1
+  rel-MSE with/without the gains per lag, and embeds the gains + strength
+  into the saved checkpoint. At inference `refine()` applies
+  `v̂′ = v̂ · (1 − s + s·g)` with `--gain-strength` (config `gain_strength`).
+  The 30M model under-predicts per-channel energy by ~1–14% (gains ≈
+  1.01–1.07); measured effect on rel-MSE is neutral (the loss already
+  optimizes scale) — the value is perceptual/spectral, A/B-able via the
+  verifier on calibrated vs uncalibrated checkpoints.
+  **N guide**: the gains are energy ratios over a channel-wise sum — 2k
+  pairs (the shipped default) is comfortably stable and costs a few seconds
+  at training end; 256–512 is enough for a rough estimate, 8k+ gives
+  diminishing returns. `--gain-strength` is the safety dial: `s=0` disables
+  the calibration entirely (byte-identical to uncalibrated behavior),
+  `s=1` fully applies the energy matching, `s=0.5` (default) applies half —
+  meaningfully compensating the under-prediction while staying conservative
+  against the calibration's own sampling noise and against over-amplifying
+  noise in the low-energy channels.
+  **Composition with trust**: the gains are applied inside `refine()` to the
+  refined velocity **before** the deployment trust blend
+  (`v_final = v_MA + trust·(v̂′ − v_MA)`), so at `trust < 1` the calibration
+  is attenuated together with the correction — the two compose exactly only
+  at trust = 1.
+
+### Optimizer & convergence findings (why 96K steps, and how to need fewer)
+
+The shipped 30M model trained for 96K steps (Sophia, lr 4e-4, warmup 5% +
+cosine to 96K). Its own eval curve shows the two costs of that recipe: the
+best ladder K1 was reached at **step 72K** (0.2816) and the final 96K eval
+lands on it (0.2823) — **the last ~25% of the run bought nothing**, because
+(a) cosine-to-96K had already annealed the LR to ~15% of peak by step 72K,
+and (b) Sophia at 4e-4 moves conservatively. Both are fixable without any
+architecture change.
+
+#### Evidence: optimizer A/B on a matched-architecture task
+
+A synthetic but *learnable* teacher task was built to compare optimizers on
+this exact model family (fresh `CorrectorUNet2D` student per run, same
+warmup/cosine machinery, same per-sample rel-MSE loss, same lag set, fp16
+autocast; teacher = fixed random 1×1-conv correction scaled by (t, lag) +
+tanh nonlinearity, so the task generalizes). Held-out rel-MSE:
+
+| optimizer | ~500 steps | ~1000 steps | ~2000 steps | notes |
+|---|---|---|---|---|
+| sophia lr 4e-4 *(current)* | 0.622 | 0.616 | — | barely moves on this task |
+| sophia lr 1e-3 | 0.56 | 0.542 | — | better, still slow |
+| adamw lr 4e-4 | 0.409 | 0.353 | — | solid baseline |
+| schedulefree lr 4e-4 | 0.490 | 0.433 | — | lags tuned cosine (as the paper predicts) |
+| ademamix lr 4e-4 | 0.371 | 0.305 | — | ~1.2–1.5× over AdamW, stable |
+| ademamix lr 1e-3 | 0.24 | 0.221 | nan | faster but diverges long-horizon |
+| muon lr 0.02 adjusted | 0.104 | **0.066** | nan | fastest, unstable late |
+| **muon lr 0.01 adjusted** | 0.13 | 0.062 | **0.0615** | fast **and** stable |
+| muon lr 0.005 adjusted | 0.15 | ~0.07 | 0.0632 | same plateau, slightly slower start |
+
+Takeaways, in order of confidence:
+
+1. **Muon (`--optimizer muon --muon-lr 0.01`) is the step-efficiency winner**:
+   ~5× better held-out error at 1000 steps than the current Sophia@4e-4
+   recipe, stable to 2000 steps. This matches the published Muon study
+   (arXiv 2509.24406, exactly the 30M–200M scale): "reaches the target loss
+   with 48–52% of the training compute of AdamW", with extra data-efficiency
+   at large batch sizes (pair with `--batch-size 64` and the existing
+   `accumulate_big_batches`). Expect the 72K-best quality in roughly
+   **25–35K steps (2.5–3× fewer)**.
+2. **Muon is LR-sensitive**: 0.02 diverged (nan) at ~1500 steps in the A/B.
+   The `use_adjusted_lr` rule (Kimi-K2 per-dimension scaling, on by default)
+   is what makes 0.005–0.01 stable. Start at 0.01, drop to 0.005 if the
+   beacon looks hot. The trainer wires Muon as two param groups (2D matrices
+   → Muon with Newton–Schulz; biases/norms/1D → AdamW with decoupled decay).
+3. **AdEMAMix (`--optimizer ademamix`, lr 4e-4) is the safe fallback**:
+   consistently ahead of AdamW at every step and — per the paper
+   (arXiv 2409.03137) — ~2× data-efficient with *slower forgetting*, which
+   matters because the training corpus is small and replayed ~20×. Do **not**
+   raise its lr to 1e-3 (diverged at 2000 steps in the A/B).
+4. **Shorten the schedule**: with either optimizer, `--max-steps 40000–48000`
+   recovers the wasted cosine tail. The 96K curve was flat after 72K because
+   the LR was already in the noise floor; a 48K cosine spends the same budget
+   while the model still has room to move. (WSD's river-valley analysis —
+   arXiv 2410.05192 — explains exactly this plateau-and-cooldown shape.)
+5. **Sophia at 4e-4 is conservative, not bad**: it trained the shipped model
+   fine; the A/B just says its per-step efficiency at that LR is low. If you
+   stay on Sophia, raise lr to ~1e-3 (2e-3 diverged) before concluding
+   anything about the optimizer.
+
+#### Recommended run recipe (faster convergence)
+
+```bash
+python -m tuning.train_corrector --data outputs/<ts>/refiner_data \
+    --optimizer muon --muon-lr 0.01 \
+    --max-steps 40000 --batch-size 64 \
+    --beacon-every 500 --beacon-lr-patience 3 \
+    --spectral-penalty 0.01 --calibrate-gains 2048 --gain-strength 0.5
+```
+
+- Muon converges fast but late runs can still go hot — the beacon is the
+  stability watchdog: keep its frequency (every 500 steps, the default) and
+  halve the patience (6 → 3) so an LR cut happens at ~1.5K steps of plateau
+  instead of ~3K. The beacon reduces LR on plateaus; it is not the primary
+  schedule (the cosine is).
+- Keep `--eval-every 2000`-ish so the Muon run is watched closely; the
+  geometric eval schedule can stay on top of it.
+- If anything looks unstable, first drop `--muon-lr` to 0.005 (stability
+  costs almost nothing at the 2000-step horizon in the A/B).
+
+#### Not yet implemented (larger levers)
+
+- **Deployed-weighted pair sampling**: weight training pairs by the measured
+  `P(skip ∧ lag ∧ region)` from the verifier's skip logs (conservative
+  control points skip at lag-1 only; max-error control points reach lag 24,
+  beyond the trained ladder of 16 — and the current `lag_weights`
+  [2.5, 1.5, 1.0, 0.5, 0.25, 0.125] — the 30M run's; the config.json default
+  is [2.0, 1.5, 1.25, 1.0, 0.5, 0.25] — actually *down-weight* the hard lags).
+  Making every step
+  count toward the deployed metric is a task-level win on top of the
+  optimizer gains.
+- **DAgger-style on-policy refresh**: record new generations *with the
+  corrector active in the loop* and train on the states it actually visits.
+  Fixes the off-policy distribution shift (today's corpus was recorded with
+  the base model only) and mines the model's own hard cases. Highest ceiling,
+  needs an iteration loop around the existing recording infra.
+- **Lag curriculum**: introduce lags 8/16 after ~50% of steps (classic
+  easy→hard); pairs well with any of the optimizers above.
+
 ### Inference knobs (plan Task 5)
 
 Both nodes (`TeaCacheAnima`, `TeaCacheAnimaAdvanced`) gain optional inputs:
@@ -256,6 +411,58 @@ the **sanity gate** (zero-init Mode B′ ≡ Mode A bitwise) and the **shipping
 gate** (Mode B′ ≥ Mode A LPIPS in ≥70% of cells AND ≥5% better on the
 aggressive half of the threshold curve). Only a passing shipping gate makes
 Mode B′ a default for new users — until then it is an opt-in experimental toggle.
+
+### Verifier split: base TeaCache vs refiner
+
+`validate.py` is the **base TeaCache** verifier (skip rates, speedup, image
+metrics vs baselines). The **refiner side** has its own suite:
+
+```bash
+python -m tuning.verify_refiner --comfy-dir /path/to/ComfyUI \
+    --corrector models/corrector-30m-96000.safetensors \
+    --config-errors 0.020,0.054 --out-dir refiner_verify
+```
+
+Per prompt (built-in in-distribution + OOD set — logo / flat illustration /
+poster / line-art / low-poly, or `--prompts` JSON) × control point it runs
+baseline / Mode A / Mode B′ (plus optional trust-map A/B and
+`--sanity-zero-init`), and one full-model recording per prompt. It reports:
+
+- **velocity level** (from the recording): per-(t-region, lag) K0/K1 rel-MSE
+  ladder, per-channel recovery + uniformity (the "14 good, 2 bad" gate;
+  flags channels < 50% recovery), d=0 anchor perturbation (diagnostic — the
+  corrector never runs on fresh steps in deployment, but a future pipeline
+  change could expose it), and the spectral grain test (HF share of the K1
+  residual vs the velocity signal, per region).
+- **deployed-weighted recovery**: the Mode-A skip log (exact per-step lag
+  decisions, instrumented with both `current_percent` and `tc_current_percent`
+  — an easy wiring bug that silently pins the hook to the early region) × the
+  recording's per-(region, lag) errors → the expected per-skip-step error of
+  A vs B′. This is the number that matches what users see; pooled ladder
+  rel-MSE overstates it at aggressive control points. Also reports the max
+  deployed lag vs the checkpoint's trained ladder (the 30M corpus ladder is
+  [1, 2, 3, 4, 8, 16] while max-error deployment reaches lag 24; deployed
+  lags between recorded ladder entries use the next recorded lag at or above
+  them — error grows with lag — and beyond the deepest recorded lag they
+  plateau there). The recording ladder defaults to the checkpoint's own
+  trained ladder (read from its embedded `config_snapshot`); override with
+  `--record-lags`.
+- **pixel level**: full pyiqa suite A-vs-base and B′-vs-base, with a
+  no-regression gate on LPIPS/DISTS/VIF vs Mode A, the final-latent spectral
+  test, optional per-channel LPIPS ablation (`--perceptual-channel-ablation`),
+  and baseline/A/B′ comparison PNGs (`--png`).
+- **harness self-tests**: the corrector-alive probe (a zero-delta corrector
+  fails it — the A/B latent-divergence check alone cannot detect a dead
+  corrector once gain calibration is embedded, since the gains rescale the
+  latent even for a zero-output model), the A/B latent-divergence wiring
+  check, and `--sanity-zero-init` (a fresh zero-init corrector must reproduce
+  Mode A byte-for-byte).
+
+Known results for the shipped 30M checkpoint (512², 30 steps, cfg 5.5):
+in-dist prompts pass the mid control point clean (≈76% deployed-weighted
+recovery, no perceptual regressions) but regress LPIPS/DISTS at the max-error
+control point; the OOD set regresses all 8 metrics at the conservative control
+point — OOD style drift is a real gate, not noise.
 
 ---
 

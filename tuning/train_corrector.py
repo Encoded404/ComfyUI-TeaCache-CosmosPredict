@@ -84,7 +84,8 @@ import torch.nn as nn
 from .config_types import TuningConfig
 from . import refiner_data
 from .corrector import (CorrectorConfig, CorrectorUNet2D, FULL_STEP_FLOP_512,
-                        estimate_corrector_flops, save_corrector)
+                        calibrate_gain_calibration, estimate_corrector_flops,
+                        save_corrector, spectral_penalty_term)
 from .corrector_dataset import (CorrectorBatchSampler, CorrectorDataset,
                                 FixedBatchListSampler, augment_batch,
                                 collect_fit_maps, collate_corrector)
@@ -478,6 +479,18 @@ class StratumGradTracker:
 # ── Config resolution (plan 1b/6i: config defaults → CLI overrides) ────
 
 
+def _str2bool(v):
+    """Argparse type for boolean knobs: accepts true/false/1/0/yes/no/on/off."""
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off"):
+        return False
+    raise argparse.ArgumentTypeError(f"invalid boolean value {v!r}")
+
+
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the latent corrector")
     parser.add_argument("--data", required=True, help="Path to a refiner_data dir")
@@ -513,8 +526,15 @@ def parse_args(argv=None) -> argparse.Namespace:
                              "past the family ceiling) or 1-8 "
                              "(default: refiner_training.depth)")
     parser.add_argument("--optimizer", type=str, default=None,
-                        choices=["adamw", "sophia", "ademamix", "schedulefree"])
+                        choices=["adamw", "sophia", "ademamix", "schedulefree", "muon"])
     parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--muon-lr", type=float, default=None,
+                        help="Muon group learning rate (config: muon_lr; "
+                             "Kimi-K2-style; 0.005-0.01 stable on the corrector A/B)")
+    parser.add_argument("--muon-adjusted-lr", type=_str2bool, default=None,
+                        help="Apply the Kimi-K2 per-dimension LR adjustment "
+                             "lr*sqrt(max_dim)/sqrt(dim) (config: "
+                             "muon_adjusted_lr; default true)")
     parser.add_argument("--rho", type=float, default=None, help="Sophia clip")
     parser.add_argument("--hessian-every", type=int, default=None, help="Sophia k")
     parser.add_argument("--batch-hessian-fraction", type=float, default=None,
@@ -526,6 +546,27 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--ema-decay", type=float, default=None)
     parser.add_argument("--loss", type=str, default=None,
                         choices=["rel_mse", "mse", "mse_l1", "charbonnier"])
+    parser.add_argument("--spectral-penalty", type=float, default=None,
+                        help="Spectral (grain) penalty weight λ ≥ 0 on the pass "
+                             "error's high-frequency share (config: "
+                             "spectral_penalty; default 0.01, 0 = off). Trains the corrector "
+                             "to keep residual error spectrally flat instead of "
+                             "grain-like.")
+    parser.add_argument("--spectral-mode", type=str, default=None,
+                        choices=["fraction", "absolute"],
+                        help="Spectral penalty normalization: 'fraction' "
+                             "(error HF share; scale-invariant, default) or "
+                             "'absolute' (HF error / target energy) "
+                             "(config: spectral_mode)")
+    parser.add_argument("--calibrate-gains", type=int, default=None,
+                        help="Post-training per-channel gain calibration on N "
+                             "eval pairs (config: calibrate_gains; default 2048, 0 = off). "
+                             "Embeds the 16 scales + strength into the saved "
+                             "checkpoint config.")
+    parser.add_argument("--gain-strength", type=float, default=None,
+                        help="Blend strength s ∈ [0,1] for the calibrated "
+                             "per-channel gains at inference: v̂' = v̂·(1−s+s·g) "
+                             "(config: gain_strength; default 0.5, 1 = full, 0 = off)")
     parser.add_argument("--lag-weights", type=str, default=None,
                         help="Per-lag resampling weights, e.g. '1,1,1,1,1' "
                              "(record_lags order)")
@@ -650,6 +691,8 @@ def resolve_config(args: argparse.Namespace) -> dict:
         "model_size": ("model_size", "20m"),
         "depth": ("depth", "auto"),
         "optimizer": ("optimizer", "sophia"),
+        "muon_lr": ("muon_lr", 0.01),
+        "muon_adjusted_lr": ("muon_adjusted_lr", True),
         "lr": ("lr", 4e-4),
         "rho": ("rho", 0.04),
         "hessian_every": ("hessian_every", 10),
@@ -658,6 +701,10 @@ def resolve_config(args: argparse.Namespace) -> dict:
         "batch_size": ("batch_size", 32),
         "ema_decay": ("ema_decay", 0.9999),
         "loss": ("loss", "rel_mse"),
+        "spectral_penalty": ("spectral_penalty", 0.01),
+        "spectral_mode": ("spectral_mode", "fraction"),
+        "calibrate_gains": ("calibrate_gains", 2048),
+        "gain_strength": ("gain_strength", 0.5),
         "lag_weights": ("lag_weights", [2.0, 1.5, 1.25, 1.0, 0.5, 0.25]),
         "normalization": ("normalization", "none"),
         "normalization_samples": ("normalization_samples", 128),
@@ -705,6 +752,15 @@ def resolve_config(args: argparse.Namespace) -> dict:
     cfg["lag_loss_normalize"] = bool(cfg["lag_loss_normalize"])
     cfg["deburst_windows"] = bool(cfg["deburst_windows"])
     cfg["deburst_window_runs"] = max(2, int(cfg["deburst_window_runs"]))
+    cfg["muon_lr"] = float(cfg["muon_lr"])
+    cfg["muon_adjusted_lr"] = bool(cfg["muon_adjusted_lr"])
+    cfg["spectral_penalty"] = max(0.0, float(cfg["spectral_penalty"]))
+    cfg["spectral_mode"] = str(cfg["spectral_mode"])
+    if cfg["spectral_mode"] not in ("fraction", "absolute"):
+        raise SystemExit(f"[train_corrector] invalid --spectral-mode "
+                         f"{cfg['spectral_mode']!r} (fraction|absolute)")
+    cfg["calibrate_gains"] = max(0, int(cfg["calibrate_gains"]))
+    cfg["gain_strength"] = min(1.0, max(0.0, float(cfg["gain_strength"])))
     cfg["eval_min_batches_per_shape"] = max(0, int(cfg["eval_min_batches_per_shape"]))
     cfg["k_curriculum"] = bool(cfg["k_curriculum"])
     cfg["stop_grad"] = bool(cfg["stop_grad"])
@@ -870,7 +926,9 @@ def compute_train_loss(model, batch, Ks: torch.Tensor, loss_fn, eps: float,
                        stop_grad: bool, multipass: bool,
                        k_max: int,
                        lag_scale: Optional[torch.Tensor] = None,
-                       shape_weights: Optional[Dict[str, float]] = None) -> torch.Tensor:
+                       shape_weights: Optional[Dict[str, float]] = None,
+                       spectral_penalty: float = 0.0,
+                       spectral_mode: str = "fraction") -> torch.Tensor:
     """Masked-K on-policy deep-supervised loss (plan 6f, deep-dive §5.4/§6.1).
 
     Pass i supervises the model's own i-th pass output against v_true with
@@ -883,6 +941,14 @@ def compute_train_loss(model, batch, Ks: torch.Tensor, loss_fn, eps: float,
     ``shape_weights`` (optional, plan v4 T4) — per-stratum loss weights keyed
     ``"HxW"`` (``H ≤ W``) — multiply each sample's loss after the lag scale
     (composes multiplicatively). Default None = zero behavior change.
+
+    ``spectral_penalty`` (λ ≥ 0, default 0 = off) adds a per-sample spectral
+    term on the pass error e = v_new − v_true:
+      per_sample += λ · spectral_penalty_term(e, v_true, mode=spectral_mode)
+    The ``fraction`` mode (default) penalizes the high-frequency share of the
+    error — the grain signature measured on the 30M corrector (residual HF
+    fractions 3–17× the latent signal's) — without fighting the main loss on
+    magnitude; ``absolute`` mode normalizes by the target's energy instead.
     """
     x, v, vt = batch["x_t"], batch["v_ma"].clone(), batch["v_true"]
     prompt, pmask, t = batch["prompt"], batch["prompt_mask"], batch["t_frac"]
@@ -901,6 +967,10 @@ def compute_train_loss(model, batch, Ks: torch.Tensor, loss_fn, eps: float,
                    lag=lag[mask].float())
         v_new = v[mask] + dv
         per_sample = loss_fn(v_new, vt[mask], eps)
+        if spectral_penalty:
+            e = v_new - vt[mask]
+            per_sample = per_sample + spectral_penalty * spectral_penalty_term(
+                e, vt[mask], mode=spectral_mode)
         if lag_scale is not None:
             per_sample = per_sample * lag_scale[lag[mask]]
         if w_shape is not None and w_shape != 1.0:
@@ -1694,6 +1764,10 @@ def main(argv=None):
     lags = sorted(set(lag for _, _, _, lag in ds.pairs))
     if 0 not in lags:
         lags = [0] + lags
+    # Persist the actual training ladder (d=0 anchor excluded) in the
+    # checkpoint's config_snapshot — the verifier reads it back instead of
+    # inferring the ladder from the lag_weights count.
+    cfg["trained_lags"] = [lag for lag in lags if lag != 0]
 
     # ── Model ─────────────────────────────────────────────────────────
     try:
@@ -1782,6 +1856,22 @@ def main(argv=None):
         opt = po.ScheduleFreeAdamW(model.parameters(), lr=cfg["lr"],
                                    weight_decay=cfg["wd"], warmup_steps=max(1, cfg["max_steps"] // 20))
         opt.train()
+    elif cfg["optimizer"] == "muon":
+        # Kimi-K2-style Muon: 2D matrices get orthogonalized momentum
+        # (Newton-Schulz), everything else (biases/norms/1D) AdamW with
+        # decoupled decay. use_adjusted_lr applies the per-dimension
+        # lr_scaled = lr*sqrt(max_dim)/sqrt(dim) rule from Kimi-K2.
+        import pytorch_optimizer as po
+        muon_p = [p for p in model.parameters() if p.ndim >= 2]
+        adamw_p = [p for p in model.parameters() if p.ndim < 2]
+        opt = po.Muon([
+            {"params": muon_p, "use_muon": True, "lr": cfg["muon_lr"],
+             "weight_decay": cfg["wd"],
+             "use_adjusted_lr": cfg["muon_adjusted_lr"]},
+            {"params": adamw_p, "use_muon": False, "lr": cfg["lr"],
+             "weight_decay": cfg["wd"]},
+        ], momentum=0.95, nesterov=True, ns_steps=5,
+           weight_decouple=True, adamw_lr=cfg["lr"], adamw_wd=cfg["wd"])
     else:
         raise SystemExit(f"[train_corrector] unknown optimizer {cfg['optimizer']!r}")
 
@@ -2082,7 +2172,9 @@ def main(argv=None):
                 loss = compute_train_loss(model, batch, Ks, loss_fn, eps,
                                           cfg["stop_grad"], cfg["multipass"],
                                           k_max_cur, lag_scale=lag_scale_t,
-                                          shape_weights=cfg["shape_loss_weights"])
+                                          shape_weights=cfg["shape_loss_weights"],
+                                          spectral_penalty=cfg["spectral_penalty"],
+                                          spectral_mode=cfg["spectral_mode"])
             profiler.end("fwd")
             micro_losses.append(loss.detach())
             profiler.begin("bwd")
@@ -2552,6 +2644,73 @@ def main(argv=None):
                 "gate_fired": gate_fired,
                 **strata_diag,
             })
+
+    # ── Post-training per-channel gain calibration (plan: grain reduction) ──
+    # Optional: calibrate energy-matching per-channel gains on eval pairs
+    # (lag ≥ 1 only — the deployed skip-step regime), report the K1 rel-MSE
+    # effect with and without the gains, and embed the gains + strength into
+    # the saved checkpoint config so inference applies them via refine().
+    if cfg["calibrate_gains"] > 0 and eval_loader is not None:
+        ema_model.load_state_dict(ema)
+        gains = calibrate_gain_calibration(
+            ema_model, eval_loader, n_samples=cfg["calibrate_gains"],
+            device=device, K=1, verbose=True)
+        if gains is None:
+            print("  [calibrate] ⚠ calibration skipped (too few lag≥1 eval "
+                  "pairs) — checkpoint saved without gains")
+        else:
+            ccfg.gain_calibration = gains
+            ccfg.gain_calibration_strength = cfg["gain_strength"]
+            # Quick K1 with/without gains on the same pairs the gains were
+            # fit on, using the same per-sample rel-MSE as the loss/eval.
+            base_k1: Dict[int, List[float]] = {}
+            gcal_k1: Dict[int, List[float]] = {}
+            g = torch.tensor(gains, device=device).view(1, -1, 1, 1)
+            s = float(ccfg.gain_calibration_strength)
+            n_cal = 0
+            ema_model.eval()
+            with torch.no_grad():
+                for batch in eval_loader:
+                    if n_cal >= cfg["calibrate_gains"]:
+                        break
+                    x = batch["x_t"].to(device)
+                    v0 = batch["v_ma"].to(device)
+                    vt = batch["v_true"].to(device)
+                    t = batch["t_frac"].to(device)
+                    lag = batch["lag"].to(device).float()
+                    m = lag != 0
+                    if not m.any():
+                        continue
+                    x, v0, vt, t, lag = x[m], v0[m], vt[m], t[m], lag[m]
+                    prompt, pmask = batch.get("prompt"), batch.get("prompt_mask")
+                    if prompt is not None:
+                        prompt, pmask = prompt.to(device)[m], pmask.to(device)[m]
+                    with torch.autocast(device.type, dtype=torch.float16):
+                        v = v0
+                        for _ in range(1):
+                            v = v + ema_model(x, v, prompt, t, pmask, lag=lag)
+                        base_ps = per_sample_rel_mse(v, vt, eps)
+                        vg = v * (1.0 - s + s * g)
+                        gcal_ps = per_sample_rel_mse(vg, vt, eps)
+                    for j, lg in enumerate(lag.tolist()):
+                        base_k1.setdefault(lg, []).append(base_ps[j].item())
+                        gcal_k1.setdefault(lg, []).append(gcal_ps[j].item())
+                    n_cal += int(x.shape[0])
+            def _mean(d, lag):
+                v = d.get(lag)
+                return sum(v) / len(v) if v else float("nan")
+            print("  [calibrate] K1 rel-MSE by lag: base → with gains")
+            for lg in sorted(set(base_k1) | set(gcal_k1)):
+                b, c = _mean(base_k1, lg), _mean(gcal_k1, lg)
+                print(f"    d={lg:2d}: {b:.4f} → {c:.4f} "
+                      f"({100 * (b - c) / b:+.1f}%)" if b == b else f"    d={lg:2d}: n/a")
+            pooled_b = sum(sum(v) for v in base_k1.values()) / sum(len(v) for v in base_k1.values())
+            pooled_c = sum(sum(v) for v in gcal_k1.values()) / sum(len(v) for v in gcal_k1.values())
+            print(f"    pooled: {pooled_b:.4f} → {pooled_c:.4f} "
+                  f"({100 * (pooled_b - pooled_c) / pooled_b:+.1f}%)")
+    elif cfg["calibrate_gains"] > 0:
+        print("  [calibrate] ⚠ --calibrate-gains requested but no eval set "
+              "exists — skipping (check data split)")
 
     # ── Final (plan 6i) ────────────────────────────────────────────────
     for t in pending_saves:

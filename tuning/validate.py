@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Phase 3: End-to-end validation of top configurations.
+"""Phase 3: End-to-end validation of top configurations — BASE TeaCache side.
+
+This module verifies the TeaCache configurations themselves (skip rates,
+wall-clock speedup, image quality vs precomputed baselines). The latent
+CORRECTOR (Mode B′) has its own verification suite — ``tuning/verify_refiner.py``
+(deployed-weighted recovery, per-channel uniformity, spectral grain tests,
+OOD prompts, trust-map A/B, harness self-tests) — run that for refiner-side
+gates. This is the verifier split: base TeaCache here, refiner there.
 
 Loads Pareto-optimal configurations from Phase 2, selects them by uniform
 sampling across the error range (not just the knee), and measures real
@@ -14,6 +21,8 @@ Usage:
     python -m tuning.validate --comfy-dir /path/to/ComfyUI \
         --pareto outputs/optimization/pareto_frontier.json \
         [--num-error-samples 8] [--quick] [--thorough] [--extra-sweep]
+    python -m tuning.verify_refiner --comfy-dir /path/to/ComfyUI \
+        --corrector models/corrector-30m-96000.safetensors   # refiner side
 """
 
 import argparse

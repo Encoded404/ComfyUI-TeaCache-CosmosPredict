@@ -284,6 +284,13 @@ class CorrectorConfig:
     folded: bool = False                 # RepBlocks fused (export-time)
     target_params: float = 0.0           # requested size target (0 = fixed-dim config)
     achieved_params: int = 0             # measured at construction (solver closed form)
+    # Per-channel gain calibration (plan: post-hoc energy matching). List of
+    # 16 scales g_c applied to the final refined velocity:
+    #   v̂' = v̂ · (1 − s + s·g)  with s = gain_calibration_strength ∈ [0, 1]
+    # (s = 0 disables the calibration at inference; s = 1 fully applies it).
+    # Calibrated with calibrate_gain_calibration(); travels in the checkpoint.
+    gain_calibration: Optional[List[float]] = None
+    gain_calibration_strength: float = 0.5   # matches the shipped config.json default
 
     @classmethod
     def for_size(cls, size: str = "20m", depth="auto",
@@ -318,6 +325,8 @@ class CorrectorConfig:
             "folded": self.folded,
             "target_params": self.target_params,
             "achieved_params": self.achieved_params,
+            "gain_calibration": self.gain_calibration,
+            "gain_calibration_strength": self.gain_calibration_strength,
         }
 
     @classmethod
@@ -768,10 +777,24 @@ class CorrectorUNet2D(nn.Module):
 
         Passes are trained on-policy with deep supervision (plan 4b/6f);
         at inference K is fixed per run (default 1). No stopping rules.
+        A post-hoc per-channel gain calibration (config ``gain_calibration``)
+        is applied once to the final velocity when present:
+        ``v̂' = v̂·(1 − s + s·g)`` with s = ``gain_calibration_strength``
+        (s = 0 disables it, byte-identical to uncalibrated behavior). The
+        deployment hook blends it as ``v_final = v_MA + trust·(v̂' − v_MA)`` —
+        the calibration is applied BEFORE the blend, so at trust < 1 it is
+        attenuated together with the correction (the two compose exactly
+        only at trust = 1).
         """
         v = v_prev
         for _ in range(K):
             v = v + self(x_t, v, prompt, t, prompt_mask, lag=lag)
+        g = self.cfg.gain_calibration
+        if g:
+            s = float(self.cfg.gain_calibration_strength or 0.0)
+            if s > 0.0:
+                gt = torch.tensor(g, dtype=v.dtype, device=v.device)
+                v = v * (1.0 - s + s * gt).view(1, -1, 1, 1)
         return v
 
     # ── Export ─────────────────────────────────────────────────────────
@@ -921,3 +944,133 @@ def load_corrector(path) -> CorrectorUNet2D:
     model.eval()
     _CORRECTOR_CACHE[key] = model
     return model
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Spectral penalty + per-channel gain calibration (plan: grain reduction)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def high_pass(e: torch.Tensor, scale: int = 2) -> torch.Tensor:
+    """Differentiable high-pass of a velocity/error field.
+
+    ``high = e − low`` where ``low`` is the ``scale×scale`` pooled low-pass
+    (avg-pool + bilinear upsample). Mirrors the 2×2-pooled high-frequency
+    measure used by the verifier's spectral grain test, so the training
+    penalty and the shipped metric measure the same thing.
+    """
+    low = F.interpolate(
+        F.avg_pool2d(e, scale, scale),
+        size=(e.shape[-2], e.shape[-1]), mode="bilinear", align_corners=False,
+    )
+    return e - low
+
+
+def spectral_penalty_term(e: torch.Tensor, ref: Optional[torch.Tensor] = None,
+                          mode: str = "fraction", eps: float = 1e-8,
+                          scale: int = 2) -> torch.Tensor:
+    """Per-sample spectral penalty on an error field ``e`` (B, C, H, W).
+
+    ``mode="fraction"`` (default): the share of the error's energy sitting in
+    the high-frequency band, ‖HP(e)‖²/‖e‖². Scale-invariant — it pushes the
+    error's spectral shape toward the signal's without fighting the main loss
+    on magnitude (the grain signature measured on the 30M corrector: residual
+    HF fractions 3–17× the latent signal's).
+
+    ``mode="absolute"``: ‖HP(e)‖²/‖ref‖² with ``ref`` = the target field —
+    also penalizes how much high-frequency error exists relative to the
+    target's energy (fights magnitude in the HF band only).
+    """
+    hp = high_pass(e, scale=scale)
+    hpe = (hp ** 2).sum(dim=(1, 2, 3))
+    if mode == "absolute":
+        if ref is None:
+            raise ValueError("spectral_penalty_term: mode='absolute' needs ref")
+        den = (ref ** 2).sum(dim=(1, 2, 3)).clamp_min(eps)
+    else:
+        den = (e ** 2).sum(dim=(1, 2, 3)).clamp_min(eps)
+    return hpe / den
+
+
+def high_freq_fraction(e: torch.Tensor, scale: int = 2,
+                       eps: float = 1e-12) -> float:
+    """HF energy share ‖e − low(e)‖²/‖e‖² of a velocity/error field.
+
+    Layout-robust: accepts (C, H, W), (B, C, H, W), (B, C, 1, H, W) or any
+    (1, …, H, W) — leading singleton dims are stripped, and anything still
+    beyond 4 dims is flattened into the batch dim. Uses the same 2×2-pooled
+    bilinear low-pass as :func:`high_pass`, so this is exactly the spectral
+    share the training penalty optimizes (the verifier imports this instead
+    of duplicating the measure).
+    """
+    e = e.float()
+    while e.dim() > 4 and e.shape[0] == 1:
+        e = e.squeeze(0)
+    if e.dim() == 3:
+        e = e.unsqueeze(0)
+    if e.dim() > 4:
+        e = e.reshape(-1, *e.shape[-3:])
+    low = high_pass(e, scale=scale)
+    return float(((e - low) ** 2).sum() / (e ** 2).sum().clamp_min(eps))
+
+
+def calibrate_gain_calibration(model: "CorrectorUNet2D", batches, n_samples: int = 1024,
+                               device: str = "cuda", min_energy: float = 1e-8,
+                               K: int = 1, verbose: bool = True) -> Optional[List[float]]:
+    """Calibrate per-channel output gains on real pairs: g_c = ‖v_true_c‖/‖v̂_c‖.
+
+    ``batches`` is an iterable of dicts with keys ``x_t``, ``v_ma``, ``v_true``,
+    ``t_frac``, ``lag`` (and optionally ``prompt``/``prompt_mask`` — omitted
+    prompts use the 0-token identity form, matching the probe path). Lag-0
+    anchors are excluded (the gain targets deployed skip steps, lag ≥ 1).
+
+    The gains are energy-matching scales for the *refined* velocity
+    (``refine`` with K passes), which is exactly what deployment consumes;
+    the 30M corrector systematically under-predicts per-channel energy
+    (gains ≈ 1.02–1.06, mean ≈ 1.03, measured on real 512² pairs — the
+    trainer's calibration printout reports the per-run values), and this
+    closes that gap post-hoc. Returns the 16 scales — set them on
+    ``model.cfg.gain_calibration`` to activate. Returns None (with a
+    warning) when fewer than 8 valid lag≥1 pairs are available — an
+    optional calibration must not fail a finished training run.
+    """
+    model.eval()
+    sums = torch.zeros(model.cfg.out_channels, device=device)
+    sums_true = torch.zeros(model.cfg.out_channels, device=device)
+    seen = 0
+    with torch.no_grad():
+        for batch in batches:
+            if seen >= n_samples:
+                break
+            x = batch["x_t"].to(device)
+            v = batch["v_ma"].to(device)
+            vt = batch["v_true"].to(device)
+            t = batch["t_frac"].to(device)
+            lag = batch["lag"].to(device).float()
+            lag_mask = lag != 0
+            if not lag_mask.any():
+                continue
+            x, v, vt, t, lag = x[lag_mask], v[lag_mask], vt[lag_mask], \
+                t[lag_mask], lag[lag_mask]
+            prompt = batch.get("prompt")
+            pmask = batch.get("prompt_mask")
+            if prompt is not None:
+                prompt = prompt.to(device)[lag_mask]
+            if pmask is not None:
+                pmask = pmask.to(device)[lag_mask]
+            with torch.autocast(device, dtype=torch.float16):
+                v_hat = model.refine(x, v, prompt, t, K, pmask, lag=lag)
+            sums += (v_hat.float() ** 2).sum(dim=(0, 2, 3))
+            sums_true += (vt.float() ** 2).sum(dim=(0, 2, 3))
+            seen += int(x.shape[0])
+    if seen < 8:
+        print(f"  [calibrate] ⚠ only {seen} valid (lag≥1) pairs — need at "
+              "least 8 for a stable calibration; skipping (no gains embedded)")
+        return None
+    gains = (sums_true / sums.clamp_min(min_energy)).sqrt().tolist()
+    if verbose:
+        print(f"  [calibrate] per-channel gains ({seen} pairs, K={K}):")
+        print("    " + " ".join(f"{g:.4f}" for g in gains))
+        print(f"    mean {sum(gains)/len(gains):.4f}  "
+              f"min {min(gains):.4f}  max {max(gains):.4f}")
+    return gains
