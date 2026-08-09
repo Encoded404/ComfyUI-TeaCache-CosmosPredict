@@ -41,6 +41,9 @@ _DEFAULT_LPIPS_SCALE = 6.0
 
 _CORRECTOR_FOLDER_KEY = "teacache_correctors"
 _CORRECTOR_FOLDERS_REGISTERED = False
+# Subdirs of the search roots to hide from the widget (e.g. unrelated model
+# folders co-located in the extension models/ dir).
+_CORRECTOR_EXCLUDED_SUBDIRS = ("cogvideox",)
 
 
 def _register_corrector_folders() -> None:
@@ -70,7 +73,9 @@ def _corrector_model_names() -> List[str]:
     """Combo options for the corrector_model widget.
 
     The leading "" means Mode A; the rest are discoverable checkpoint
-    filenames (deduplicated across the registered roots).
+    filenames (deduplicated across the registered roots). Entries under
+    _CORRECTOR_EXCLUDED_SUBDIRS are hidden from the widget (display-only;
+    resolution is unaffected).
     """
     _register_corrector_folders()
     try:
@@ -78,6 +83,8 @@ def _corrector_model_names() -> List[str]:
         names = folder_paths.get_filename_list(_CORRECTOR_FOLDER_KEY)
     except ImportError:
         names = []
+    excluded = tuple(d + os.path.sep for d in _CORRECTOR_EXCLUDED_SUBDIRS)
+    names = [n for n in names if not n.lower().startswith(excluded)]
     return [""] + list(dict.fromkeys(names))
 
 
