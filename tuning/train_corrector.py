@@ -1478,7 +1478,9 @@ def _snapshot_cpu(obj):
         return obj.detach().cpu()
     if isinstance(obj, dict):
         return {k: _snapshot_cpu(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
+    if isinstance(obj, tuple):
+        return tuple(_snapshot_cpu(v) for v in obj)
+    if isinstance(obj, list):
         return [_snapshot_cpu(v) for v in obj]
     return obj
 
@@ -1903,6 +1905,16 @@ def main(argv=None):
     # built from the reconciled model above).
     if sd is not None:
         opt.load_state_dict(sd["optimizer"])
+        # Checkpoints saved before _snapshot_cpu preserved tuples round-tripped
+        # Muon's ns_coeffs as lists (e.g. [[3.4445, -4.7750, 2.0315]]), which
+        # get_newton_schulz_weights rejects on the first step. Restore tuples;
+        # idempotent for already-correct values.
+        for g in opt.param_groups:
+            v = g.get("ns_coeffs")
+            if v is None or isinstance(v, str):
+                continue
+            g["ns_coeffs"] = ([tuple(v)] if v and isinstance(v[0], (int, float))
+                              else [tuple(c) for c in v])
         scaler.load_state_dict(sd["scaler"])
         if scheduler is not None and sd.get("scheduler"):
             scheduler.load_state_dict(sd["scheduler"])
