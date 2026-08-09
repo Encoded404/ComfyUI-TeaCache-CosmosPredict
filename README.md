@@ -288,9 +288,9 @@ Quick settings table:
 
 | Scenario | Setting |
 |---|---|
-| Default character / detailed stylized art, quality ≤ 88 | Mode B′, K=1, trust 1.0 |
+| Default character / detailed stylized art, Realism-leaning or hair/detail-heavy prompts, quality ≤ 88 | Mode B′, K=1, trust 0.75-1.0 |
 | Quality > 88 (aggressive speedup) | Refiner won't help — cap at ~88 |
-| Realism-leaning or hair/detail-heavy prompts | Mode B′ with trust 0.5–0.75 |
+| Quality < 50-60 | Mode B′ with trust 0.5–0.75 |
 | Simple / flat / hard-shading styles | `corrector = off` (Mode A) |
 | Any artist tag (trained or not) | Mode B′ behaves consistently |
 
